@@ -46,7 +46,7 @@ public enum FileConflictPolicy: String, CaseIterable, Identifiable {
 }
 
 public struct PendingTransferConflict: Identifiable {
-    public let id = UUID()
+    public let id: UUID
     public let sourceURLs: [URL]
     public let destinationDirectory: URL
     public let conflictingNames: [String]
@@ -113,6 +113,8 @@ public enum FileHistoryAction {
 }
 
 struct FileOperationIO {
+    var resolveEntryPath: (URL) -> String
+    var resolveDirectoryPath: (URL) -> String
     var exists: (URL) -> Bool
     var createDirectory: (URL) throws -> Void
     var move: (URL, URL) throws -> Void
@@ -122,6 +124,8 @@ struct FileOperationIO {
     var removeEmptyDirectory: (URL) -> Void
 
     static let live = FileOperationIO(
+        resolveEntryPath: { FileTransferPaths.entryPath($0) },
+        resolveDirectoryPath: { $0.resolvingSymlinksInPath().standardizedFileURL.path },
         exists: { (try? FileManager.default.attributesOfItem(atPath: $0.path)) != nil },
         createDirectory: { try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: false) },
         move: { try FileManager.default.moveItem(at: $0, to: $1) },
@@ -181,11 +185,42 @@ enum SafeArchivePublication {
     }
 }
 
+/// Resolve traversed parent directories, but not the entry itself: copying a
+/// symbolic link copies the link, not the directory it happens to point at.
+/// These checks prevent stable aliases from bypassing containment checks. They
+/// are not filesystem locks against another process retargeting a link mid-copy.
+enum FileTransferPaths {
+    private static func contains(_ path: String, within ancestor: String) -> Bool {
+        path == ancestor || path.hasPrefix(ancestor == "/" ? "/" : ancestor + "/")
+    }
+
+    static func entryPath(_ url: URL) -> String {
+        url.deletingLastPathComponent().resolvingSymlinksInPath()
+            .appendingPathComponent(url.lastPathComponent).standardizedFileURL.path
+    }
+
+    static func destinationIsInsideSource(_ directory: URL, source: URL, io: FileOperationIO = .live) -> Bool {
+        let sourcePath = io.resolveEntryPath(source)
+        let destinationPath = io.resolveDirectoryPath(directory)
+        return contains(destinationPath, within: sourcePath)
+    }
+
+    static func sameEntry(_ lhs: URL, _ rhs: URL, io: FileOperationIO = .live) -> Bool {
+        io.resolveEntryPath(lhs) == io.resolveEntryPath(rhs)
+    }
+
+    static func sourceIsInsideTarget(_ source: URL, target: URL, io: FileOperationIO = .live) -> Bool {
+        let sourcePath = io.resolveEntryPath(source)
+        let targetPath = io.resolveEntryPath(target)
+        return contains(sourcePath, within: targetPath)
+    }
+}
+
 enum SafeFileReplacement {
     /// Fully prepare the incoming item before touching the destination. The staging
     /// directory is on the destination volume, so installation is a local move.
     static func replace(source: URL, target: URL, isMove: Bool, io: FileOperationIO = .live) throws -> [FileHistoryAction] {
-        guard !source.standardizedFileURL.path.hasPrefix(target.standardizedFileURL.path + "/") else {
+        guard !FileTransferPaths.sourceIsInsideTarget(source, target: target, io: io) else {
             throw FileOperationFailure(message: "Nie można zastąpić folderu zawierającego plik źródłowy.")
         }
         let stagingDirectory = target.deletingLastPathComponent()
@@ -330,6 +365,7 @@ public final class FileOperationsManager: ObservableObject {
     /// Used to detect whether the internal cut/copy clipboard is still current.
     private var clipboardChangeCount: Int = -1
     private var transferCancellation: TransferCancellationFlag?
+    private var preflightRequestID: UUID?
 
     private let fileIO: FileOperationIO
     private let reloadVisiblePanes: @MainActor () -> Void
@@ -539,6 +575,8 @@ public final class FileOperationsManager: ObservableObject {
     /// Drag & drop: moves within the same volume, copies across volumes (Finder semantics).
     /// Holding Option forces a copy.
     public func handleDropURLs(_ urls: [URL], into destinationDirectory: URL, copyInsteadOfMove: Bool = false) {
+        // Keep the UI-only cheap lexical filter. Alias resolution belongs to the
+        // background preflight, including for slow or disconnected volumes.
         let destPath = destinationDirectory.standardizedFileURL.path
         let validURLs = urls.filter {
             let p = $0.standardizedFileURL.path
@@ -554,70 +592,96 @@ public final class FileOperationsManager: ObservableObject {
         )
     }
 
-    /// Copies or moves files on a background task, reporting progress in `activeTransfer`.
-    /// - Parameter copyAcrossVolumes: when `true`, a move whose source lives on another volume becomes a copy.
+    /// Returns a stable request identity immediately; conflict discovery and all
+    /// filesystem preflight run off MainActor while the mutation gate is held.
+    @discardableResult
     public func performTransfer(
         sourceURLs: [URL],
         into destinationDirectory: URL,
         isMove: Bool,
         explicitPolicy: FileConflictPolicy? = nil,
         copyAcrossVolumes: Bool = false,
+        requestID: UUID = UUID(),
         completion: (@MainActor ([URL]) -> Void)? = nil
-    ) {
-        guard !isBusy else {
-            lastStatusMessage = "Poczekaj na zakończenie bieżącej operacji"
-            return
+    ) -> UUID? {
+        guard !sourceURLs.isEmpty, canStartMutation() else { return nil }
+        guard pendingConflict == nil else {
+            lastStatusMessage = "Najpierw rozstrzygnij oczekujący konflikt"
+            return nil
         }
         let io = fileIO
         let policy = explicitPolicy ?? defaultConflictPolicy
-        let destPath = destinationDirectory.standardizedFileURL.path
-
-        // Never copy/move a folder into itself or one of its own subfolders.
-        var validSources: [URL] = []
-        var rejectedNested = 0
-        for src in sourceURLs {
-            let srcPath = src.standardizedFileURL.path
-            if destPath == srcPath || destPath.hasPrefix(srcPath + "/") {
-                rejectedNested += 1
-                continue
-            }
-            validSources.append(src)
-        }
-        guard !validSources.isEmpty else {
-            if rejectedNested > 0 {
-                lastStatusMessage = "Nie można umieścić folderu wewnątrz samego siebie"
-            }
-            return
-        }
-
-        // Check for conflicts if policy == .ask
-        if policy == .ask {
-            var conflicts: [String] = []
-            for src in validSources {
-                let dst = destinationDirectory.appendingPathComponent(src.lastPathComponent)
-                if dst.standardizedFileURL.path != src.standardizedFileURL.path && io.exists(dst) {
-                    conflicts.append(src.lastPathComponent)
-                }
-            }
-            if !conflicts.isEmpty {
-                pendingConflict = PendingTransferConflict(
-                    sourceURLs: validSources,
-                    destinationDirectory: destinationDirectory,
-                    conflictingNames: conflicts,
-                    isMove: isMove,
-                    copyAcrossVolumes: copyAcrossVolumes,
-                    completion: completion
-                )
-                return
-            }
-        }
-
-        let total = validSources.count
         let clipboardSnapshot = isMove && clipboardMode == .cut && NSPasteboard.general.changeCount == clipboardChangeCount
             ? CutClipboardSnapshot(changeCount: clipboardChangeCount) : nil
-        let title = isMove ? "Przenoszenie" : "Kopiowanie"
         let flag = TransferCancellationFlag()
+        preflightRequestID = requestID
         transferCancellation = flag
+        activeTransfer = TransferProgressInfo(title: "Sprawdzanie transferu", currentFile: "",
+                                              completedCount: 0, totalCount: sourceURLs.count, isCancellable: true)
+        Task.detached(priority: .userInitiated) { [self] in
+            var validSources: [URL] = []
+            var rejectedNested = 0
+            var conflicts: [String] = []
+            for source in sourceURLs {
+                if flag.isCancelled { break }
+                if FileTransferPaths.destinationIsInsideSource(destinationDirectory, source: source, io: io) {
+                    rejectedNested += 1
+                    continue
+                }
+                validSources.append(source)
+                if policy == .ask {
+                    let target = destinationDirectory.appendingPathComponent(source.lastPathComponent)
+                    if !FileTransferPaths.sameEntry(target, source, io: io) && io.exists(target) {
+                        conflicts.append(source.lastPathComponent)
+                    }
+                }
+            }
+            let preparedSources = validSources
+            let preparedConflicts = conflicts
+            let preparedRejected = rejectedNested
+            await MainActor.run {
+                guard self.preflightRequestID == requestID else { return }
+                self.preflightRequestID = nil
+                if flag.isCancelled || preparedSources.isEmpty {
+                    self.activeTransfer = nil
+                    self.transferCancellation = nil
+                    self.lastStatusMessage = flag.isCancelled
+                        ? "Anulowano przygotowanie transferu"
+                        : "Nie można umieścić folderu wewnątrz samego siebie"
+                } else if !preparedConflicts.isEmpty {
+                    self.pendingConflict = PendingTransferConflict(
+                        id: requestID, sourceURLs: preparedSources, destinationDirectory: destinationDirectory,
+                        conflictingNames: preparedConflicts, isMove: isMove,
+                        copyAcrossVolumes: copyAcrossVolumes, completion: completion)
+                    self.activeTransfer = nil
+                    self.transferCancellation = nil
+                } else {
+                    self.executePreparedTransfer(sourceURLs: preparedSources, into: destinationDirectory,
+                        isMove: isMove, policy: policy, copyAcrossVolumes: copyAcrossVolumes,
+                        rejectedNested: preparedRejected, clipboardSnapshot: clipboardSnapshot,
+                        flag: flag, completion: completion)
+                }
+            }
+        }
+        return requestID
+    }
+
+    /// Closing the initiating sheet may cancel its pending preflight/conflict,
+    /// but never another sheet's request or a transfer already writing files.
+    public func cancelPendingTransferRequest(_ requestID: UUID) {
+        if preflightRequestID == requestID { transferCancellation?.cancel() }
+        if pendingConflict?.id == requestID { pendingConflict = nil }
+    }
+
+    private func executePreparedTransfer(
+        sourceURLs validSources: [URL], into destinationDirectory: URL,
+        isMove: Bool, policy: FileConflictPolicy, copyAcrossVolumes: Bool,
+        rejectedNested: Int, clipboardSnapshot: CutClipboardSnapshot?,
+        flag: TransferCancellationFlag, completion: (@MainActor ([URL]) -> Void)?
+    ) {
+        let io = fileIO
+        let total = validSources.count
+        let title = isMove ? "Przenoszenie" : "Kopiowanie"
         activeTransfer = TransferProgressInfo(
             title: title,
             currentFile: validSources[0].lastPathComponent,
@@ -626,7 +690,7 @@ public final class FileOperationsManager: ObservableObject {
             isCancellable: total > 1
         )
 
-        Task.detached(priority: .userInitiated) { [self, validSources, rejectedNested] in
+        Task.detached(priority: .userInitiated) { [self] in
             var resultURLs: [URL] = []
             var copiedURLs: [URL] = []
             var movedPairs: [(from: URL, to: URL)] = []
@@ -652,10 +716,15 @@ public final class FileOperationsManager: ObservableObject {
                     await MainActor.run { self.activeTransfer = info }
                 }
 
+                // Recheck after conflict-sheet delay and immediately before IO.
+                guard !FileTransferPaths.destinationIsInsideSource(destinationDirectory, source: src, io: io) else {
+                    errors.append("\(src.lastPathComponent): folder docelowy znajduje się wewnątrz źródła")
+                    continue
+                }
                 let doMove = isMove && (!copyAcrossVolumes || Self.isSameVolume(src, destinationDirectory))
                 var targetURL = destinationDirectory.appendingPathComponent(src.lastPathComponent)
                 var replacesExisting = false
-                if targetURL.standardizedFileURL.path == src.standardizedFileURL.path {
+                if FileTransferPaths.sameEntry(targetURL, src, io: io) {
                     if doMove { skipped += 1; continue }
                     targetURL = Self.uniqueURL(for: targetURL)
                 } else if io.exists(targetURL) {

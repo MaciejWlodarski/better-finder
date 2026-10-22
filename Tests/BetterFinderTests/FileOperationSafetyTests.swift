@@ -80,6 +80,11 @@ struct FileOperationSafetyTests {
     }
 
     static func runAll() async throws -> Int {
+        try await testTransferPreflightStaysResponsiveAndOwned()
+        try await testTransferRejectsSymlinkedDescendant()
+        try await testTransferThroughParentAliasUsesSameEntryRules()
+        try await testCopyingSymbolicLinkDoesNotFollowItsLeaf()
+        try testReplacementRejectsAliasedAncestor()
         try testDanglingNamesAndExclusiveCreation()
         try await testDanglingTransferAndTrashRestore()
         try await testBusyGateDuringTransfer()
@@ -98,10 +103,166 @@ struct FileOperationSafetyTests {
         try testBoundedGitInspectionAndDriverNames()
         try testGitRenameRecordPairs()
         #if BETTERFINDER_TESTING
-        return 15
+        return 20
         #else
-        return 14
+        return 19
         #endif
+    }
+
+    private static func testTransferPreflightStaysResponsiveAndOwned() async throws {
+        for mode in 0..<4 {
+            let f = try Fixture()
+            let source = f.sourceDirectory.appendingPathComponent("item.txt")
+            let target = f.destination.appendingPathComponent("item.txt")
+            try f.write("incoming", to: source)
+            try f.write("existing", to: target)
+            let control = Control()
+            control.fail = true
+            let continuation = Control()
+            defer { continuation.release.signal() }
+            defer { control.release.signal() }
+            var io = f.io
+            let resolve = io.resolveEntryPath
+            io.resolveEntryPath = { url in
+                if control.fail {
+                    control.fail = false
+                    try? control.hold()
+                } else if continuation.fail {
+                    continuation.fail = false
+                    try? continuation.hold()
+                }
+                return resolve(url)
+            }
+            let manager = f.manager(io)
+            var request: UUID?
+            if mode == 2 {
+                manager.handleDropURLs([source], into: f.destination, copyInsteadOfMove: true)
+            } else {
+                request = manager.performTransfer(sourceURLs: [source], into: f.destination,
+                                                  isMove: false, explicitPolicy: .ask)
+                try expect(request != nil)
+            }
+            // Admission/progress are synchronous, but filesystem resolution is not.
+            try expect(manager.isBusy && manager.activeTransfer?.isCancellable == true)
+            try await entered(control)
+            try expect(!control.ranOnMain)
+            try expect(manager.createFile(named: "must-not-start", in: f.destination) == nil)
+            if mode == 0 || mode == 3 {
+                manager.cancelPendingTransferRequest(UUID()) // Another sheet cannot cancel this request.
+            } else if let request {
+                manager.cancelPendingTransferRequest(request) // Closing the initiating sheet.
+            } else {
+                manager.cancelActiveTransfer() // Drop preparation can also be cancelled.
+            }
+            control.release.signal()
+            try await idle(manager)
+            try expect(manager.undoStack.isEmpty)
+            try expect((try? f.text(source)) == "incoming" && (try? f.text(target)) == "existing")
+            if (mode == 0 || mode == 3), let request {
+                try expect(manager.pendingConflict?.id == request)
+                let rejected = manager.performTransfer(sourceURLs: [source], into: f.destination, isMove: false)
+                try expect(rejected == nil && manager.pendingConflict?.id == request)
+                // Policy selection dismisses only the conflict sheet, then the
+                // initiating comparison closes while continuation is resolving.
+                let conflict = manager.pendingConflict!
+                manager.pendingConflict = nil
+                continuation.fail = true
+                let continued = manager.performTransfer(
+                    sourceURLs: conflict.sourceURLs, into: conflict.destinationDirectory,
+                    isMove: conflict.isMove, explicitPolicy: .overwrite,
+                    copyAcrossVolumes: conflict.copyAcrossVolumes, requestID: conflict.id)
+                try expect(continued == request)
+                try await entered(continuation)
+                if mode == 0 { manager.cancelPendingTransferRequest(request) }
+                continuation.release.signal()
+                try await idle(manager)
+                try expect(manager.pendingConflict == nil)
+                try expect(manager.undoStack.count == (mode == 0 ? 0 : 1))
+                try expect((try? f.text(source)) == "incoming")
+                try expect((try? f.text(target)) == (mode == 0 ? "existing" : "incoming"))
+            } else {
+                try expect(manager.pendingConflict == nil)
+            }
+        }
+    }
+
+    private static func testTransferRejectsSymlinkedDescendant() async throws {
+        let f = try Fixture()
+        let folder = f.sourceDirectory.appendingPathComponent("tree", isDirectory: true)
+        let nested = folder.appendingPathComponent("nested", isDirectory: true)
+        try f.fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        let alias = f.root.appendingPathComponent("destination-alias")
+        try f.fm.createSymbolicLink(at: alias, withDestinationURL: nested)
+        let marker = folder.appendingPathComponent("keep.txt")
+        try f.write("original", to: marker)
+        var io = f.io
+        io.copy = { _, _ in throw RegressionFailure(description: "Nested copy must not reach IO") }
+        io.move = { _, _ in throw RegressionFailure(description: "Nested move must not reach IO") }
+        let manager = f.manager(io)
+        for isMove in [false, true] {
+            manager.performTransfer(sourceURLs: [folder], into: alias, isMove: isMove, explicitPolicy: .overwrite)
+            try await idle(manager)
+            try expect(!manager.isBusy && manager.pendingConflict == nil && manager.undoStack.isEmpty)
+            try expect(manager.lastStatusMessage == "Nie można umieścić folderu wewnątrz samego siebie")
+        }
+        try expect((try? f.text(marker)) == "original")
+        try expect((try? f.fm.contentsOfDirectory(atPath: nested.path)) == [])
+        try expect(FileTransferPaths.destinationIsInsideSource(nested, source: URL(fileURLWithPath: "/")))
+        // A common string prefix is not containment.
+        let sibling = f.sourceDirectory.appendingPathComponent("tree-other", isDirectory: true)
+        try expect(!FileTransferPaths.destinationIsInsideSource(sibling, source: folder))
+    }
+
+    private static func testTransferThroughParentAliasUsesSameEntryRules() async throws {
+        let f = try Fixture()
+        let source = f.sourceDirectory.appendingPathComponent("item.txt")
+        try f.write("original", to: source)
+        let alias = f.root.appendingPathComponent("parent-alias")
+        try f.fm.createSymbolicLink(at: alias, withDestinationURL: f.sourceDirectory)
+        let manager = f.manager()
+        manager.performTransfer(sourceURLs: [source], into: alias, isMove: true, explicitPolicy: .ask)
+        try await idle(manager)
+        try expect(manager.pendingConflict == nil && manager.undoStack.isEmpty)
+        try expect((try? f.text(source)) == "original")
+        manager.performTransfer(sourceURLs: [source], into: alias, isMove: false, explicitPolicy: .overwrite)
+        try await idle(manager)
+        try expect((try? f.text(source)) == "original")
+        let copy = f.sourceDirectory.appendingPathComponent("item 1.txt")
+        try expect((try? f.text(copy)) == "original")
+        try expect(manager.undoStack.count == 1)
+        try expect((try? f.fm.contentsOfDirectory(atPath: f.trash.path)) == [])
+    }
+
+    private static func testCopyingSymbolicLinkDoesNotFollowItsLeaf() async throws {
+        let f = try Fixture()
+        let linked = f.sourceDirectory.appendingPathComponent("folder-link")
+        try f.fm.createSymbolicLink(at: linked, withDestinationURL: f.destination)
+        let manager = f.manager()
+        manager.performTransfer(sourceURLs: [linked], into: f.destination, isMove: false, explicitPolicy: .keepBoth)
+        try await idle(manager)
+        let copy = f.destination.appendingPathComponent("folder-link")
+        try expect((try? f.fm.destinationOfSymbolicLink(atPath: copy.path)) == f.destination.path)
+        try expect(manager.undoStack.count == 1)
+    }
+
+    private static func testReplacementRejectsAliasedAncestor() throws {
+        let f = try Fixture()
+        let ancestor = f.sourceDirectory.appendingPathComponent("tree", isDirectory: true)
+        try f.fm.createDirectory(at: ancestor, withIntermediateDirectories: false)
+        let original = ancestor.appendingPathComponent("tree")
+        try f.write("must survive", to: original)
+        let alias = f.root.appendingPathComponent("ancestor-alias")
+        try f.fm.createSymbolicLink(at: alias, withDestinationURL: ancestor)
+        let sourceThroughAlias = alias.appendingPathComponent("tree")
+        var rejected = false
+        do {
+            _ = try SafeFileReplacement.replace(source: sourceThroughAlias, target: ancestor, isMove: true, io: f.io)
+        } catch is FileOperationFailure {
+            rejected = true
+        }
+        try expect(rejected)
+        try expect((try? f.text(original)) == "must survive")
+        try expect((try? f.fm.contentsOfDirectory(atPath: f.trash.path)) == [])
     }
 
     private static func testDanglingNamesAndExclusiveCreation() throws {
@@ -137,6 +298,7 @@ struct FileOperationSafetyTests {
         try f.fm.createSymbolicLink(atPath: target.path, withDestinationPath: "/missing-bf-fixture-\(UUID())")
         let manager = f.manager()
         manager.performTransfer(sourceURLs: [source], into: f.destination, isMove: false, explicitPolicy: .ask)
+        try await idle(manager)
         try expect(manager.pendingConflict?.conflictingNames == ["item.txt"])
         manager.pendingConflict = nil
         manager.performTransfer(sourceURLs: [source], into: f.destination, isMove: false, explicitPolicy: .keepBoth)

@@ -654,7 +654,12 @@ private struct FolderComparisonContentView: View {
                 return fileOps.pendingConflict
             },
             set: { value in
-                if value == nil { cancelOwnedConflict() }
+                // Policy selection clears pendingConflict before continuing with
+                // the same request ID. Its sheet dismissal must not cancel that
+                // accepted continuation; closing this comparison still does.
+                if value == nil, fileOps.pendingConflict?.id == ownedConflictID {
+                    cancelOwnedConflict()
+                }
             }
         )
     }
@@ -821,25 +826,22 @@ private struct FolderComparisonContentView: View {
     }
 
     private func copyDifferences(leftToRight: Bool) {
-        guard !isComparing, compareDiagnostic == nil, comparedContext == comparisonContext,
+        guard !isComparing, !fileOps.isBusy, compareDiagnostic == nil, comparedContext == comparisonContext,
               fileOps.pendingConflict == nil,
               let token = compareToken, token.canPublish(active: compareToken, rootPath: leftPane.currentURL.path) else { return }
         let candidates = FolderComparison.copyCandidates(entries, leftToRight: leftToRight)
         let destination = leftToRight ? rightPane.currentURL : leftPane.currentURL
-        fileOps.performTransfer(sourceURLs: candidates, into: destination, isMove: false, explicitPolicy: .ask) { _ in
+        ownedConflictID = fileOps.performTransfer(sourceURLs: candidates, into: destination, isMove: false, explicitPolicy: .ask) { _ in
             guard token.canPublish(active: self.compareToken, rootPath: self.leftPane.currentURL.path) else { return }
             self.leftPane.reloadDirectory()
             self.rightPane.reloadDirectory()
             self.computeDiff()
         }
-        // performTransfer creates a conflict synchronously, before any file mutation.
-        ownedConflictID = fileOps.pendingConflict?.id
+        // Retain ownership before asynchronous filesystem preflight can publish.
     }
 
     private func cancelOwnedConflict() {
-        if let id = ownedConflictID, fileOps.pendingConflict?.id == id {
-            fileOps.pendingConflict = nil
-        }
+        if let id = ownedConflictID { fileOps.cancelPendingTransferRequest(id) }
         ownedConflictID = nil
     }
 
@@ -940,12 +942,10 @@ public struct ConflictResolutionSheetView: View {
             isMove: c.isMove,
             explicitPolicy: policy,
             copyAcrossVolumes: c.copyAcrossVolumes,
+            requestID: c.id,
             completion: c.completion
         )
-        AppState.shared.activeTab.reloadDirectory()
-        if AppState.shared.isDualPane {
-            AppState.shared.rightPane.reloadDirectory()
-        }
+        // The manager and completion refresh panes after mutation, not here.
     }
 }
 

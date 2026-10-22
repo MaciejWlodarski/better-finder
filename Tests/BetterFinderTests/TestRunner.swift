@@ -1,7 +1,8 @@
 import Foundation
 
-struct RegressionFailure: Error, CustomStringConvertible {
+struct RegressionFailure: LocalizedError, CustomStringConvertible {
     let description: String
+    var errorDescription: String? { description }
 }
 
 func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath, line: UInt = #line) throws {

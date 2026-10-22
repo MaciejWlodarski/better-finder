@@ -10,7 +10,18 @@ public struct InspectorPreviewView: View {
 
     @ViewState private var textPreviewLines: [(Int, String)] = []
     @ViewState private var posixPermissionsString: String = "—"
-    @ViewState private var currentModeBits: UInt16 = 0o644
+    @ViewState private var currentModeBits: UInt16 = 0
+    @ViewState private var permissionSnapshot: PosixPermissionSnapshot?
+    @ViewState private var permissionError: String?
+    @ViewState private var permissionRequestID = UUID()
+    @ViewState private var permissionReadOperation: Operation?
+    private static let permissionMetadataQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.betterfinder.permission-metadata"
+        queue.maxConcurrentOperationCount = 2
+        queue.qualityOfService = .utility
+        return queue
+    }()
     @ViewState private var showChmodEditor: Bool = false
     @ViewState private var sha256Hash: String? = nil
     @ViewState private var md5Hash: String? = nil
@@ -180,6 +191,12 @@ public struct InspectorPreviewView: View {
                                 Text(posixPermissionsString)
                                     .font(FinderUI.detailFont.monospaced())
                                     .textSelection(.enabled)
+                                if let permissionError {
+                                    Text(permissionError)
+                                        .font(FinderUI.detailFont)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
                             }
 
                             if showChmodEditor {
@@ -261,6 +278,9 @@ public struct InspectorPreviewView: View {
                     hashErrorMessage = nil
                     loadPreviewAndMetadata(for: item)
                 }
+                .onChange(of: activeTab.id) { _, _ in
+                    loadPermissions(for: item)
+                }
                 .onChange(of: activeTab.directoryRevision) { _, _ in
                     hashRequestID = UUID()
                     isComputingHash = false
@@ -275,6 +295,9 @@ public struct InspectorPreviewView: View {
                     }
                 }
                 .onDisappear {
+                    permissionReadOperation?.cancel()
+                    permissionRequestID = UUID()
+                    permissionSnapshot = nil
                     hashRequestID = UUID()
                     isComputingHash = false
                     sha256Hash = nil
@@ -376,11 +399,11 @@ public struct InspectorPreviewView: View {
                 .font(FinderUI.detailFont.weight(.semibold))
                 .foregroundStyle(.secondary)
             HStack(spacing: FinderUI.compactSpacing) {
-                Button("644") { applyChmod(0o644, for: item) }
+                Button("644") { applyChmod(.ordinaryMode(0o644), for: item) }
                     .help("rw-r--r--: zapis właściciela, odczyt dla wszystkich")
-                Button("755") { applyChmod(0o755, for: item) }
+                Button("755") { applyChmod(.ordinaryMode(0o755), for: item) }
                     .help("rwxr-xr-x: zapis właściciela, odczyt i wykonanie dla wszystkich")
-                Button("700") { applyChmod(0o700, for: item) }
+                Button("700") { applyChmod(.ordinaryMode(0o700), for: item) }
                     .help("rwx------: dostęp tylko dla właściciela")
             }
             .buttonStyle(.bordered)
@@ -394,7 +417,8 @@ public struct InspectorPreviewView: View {
         }
         .padding(FinderUI.rowSpacing)
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
-        .disabled(fileOps.isBusy)
+        .disabled(fileOps.isBusy || permissionSnapshot == nil)
+        .help("Zmienia zwykłe uprawnienia; zachowuje aktualne bity sticky, setuid i setgid")
     }
 
     private func chmodBitGroup(label: String, rBit: UInt16, wBit: UInt16, xBit: UInt16, item: FileItem) -> some View {
@@ -412,8 +436,7 @@ public struct InspectorPreviewView: View {
     private func chmodBitButton(_ title: String, permission: String, group: String, bit: UInt16, item: FileItem) -> some View {
         let isSet = (currentModeBits & bit) != 0
         return Button {
-            let newMode = isSet ? (currentModeBits & ~bit) : (currentModeBits | bit)
-            applyChmod(newMode, for: item)
+            applyChmod(.bit(bit, enabled: !isSet), for: item)
         } label: {
             Text(title)
                 .font(FinderUI.detailFont.monospaced().weight(.semibold))
@@ -435,12 +458,55 @@ public struct InspectorPreviewView: View {
         .accessibilityAddTraits(isSet ? .isSelected : [])
     }
 
-    private func applyChmod(_ mode: UInt16, for item: FileItem) {
-        let requestedMode = mode & 0o777
-        guard !activeTab.actionItems(for: item).isEmpty,
-              fileOps.setPosixPermissions(requestedMode, for: item) else { return }
-        currentModeBits = requestedMode
-        posixPermissionsString = String(format: "%@ (%03o)", Self.formatModeBits(currentModeBits), currentModeBits)
+    private func applyChmod(_ change: PosixPermissionChange, for item: FileItem) {
+        guard !activeTab.actionItems(for: item).isEmpty, let snapshot = permissionSnapshot else { return }
+        let requestID = permissionRequestID
+        let tabID = activeTab.id
+        let revision = activeTab.directoryRevision
+        permissionError = nil
+        let accepted = fileOps.updatePosixPermissions(change, for: item, expectedIdentity: snapshot.identity) { updated, error in
+            guard self.permissionRequestID == requestID, self.activeTab.id == tabID,
+                  self.activeTab.directoryRevision == revision,
+                  self.activeTab.primarySelectedItem?.path == item.path else { return }
+            self.permissionError = error
+            if let updated {
+                self.permissionSnapshot = updated
+                self.currentModeBits = updated.mode
+                self.posixPermissionsString = PosixPermissionChange.format(updated.mode)
+            }
+        }
+        if !accepted { permissionError = fileOps.lastStatusMessage ?? "Inna operacja jest w toku." }
+    }
+
+    private func loadPermissions(for item: FileItem) {
+        permissionReadOperation?.cancel()
+        permissionRequestID = UUID()
+        let requestID = permissionRequestID
+        let tabID = activeTab.id
+        let revision = activeTab.directoryRevision
+        permissionSnapshot = nil
+        permissionError = nil
+        currentModeBits = 0
+        posixPermissionsString = "Odczytywanie…"
+        let operation = BlockOperation {
+            var snapshot: PosixPermissionSnapshot?
+            var failure: String?
+            do { snapshot = try PosixPermissionSnapshot.read(item.url) }
+            catch { failure = error.localizedDescription }
+            let result = snapshot
+            let error = failure
+            Task { @MainActor in
+                guard self.permissionRequestID == requestID, self.activeTab.id == tabID,
+                      self.activeTab.directoryRevision == revision,
+                      self.activeTab.primarySelectedItem?.path == item.path else { return }
+                self.permissionSnapshot = result
+                self.permissionError = error
+                self.currentModeBits = result?.mode ?? 0
+                self.posixPermissionsString = result.map { PosixPermissionChange.format($0.mode) } ?? "—"
+            }
+        }
+        permissionReadOperation = operation
+        Self.permissionMetadataQueue.addOperation(operation)
     }
 
     // MARK: - Checksums Section (SHA-256 / MD5)
@@ -659,14 +725,7 @@ public struct InspectorPreviewView: View {
             folderSizes.requestSizeIfNeeded(for: item.path)
         }
 
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: item.path),
-           let perms = attrs[.posixPermissions] as? NSNumber {
-            let mode = perms.uint16Value & 0o777
-            currentModeBits = mode
-            posixPermissionsString = String(format: "%@ (%03o)", Self.formatModeBits(mode), mode)
-        } else {
-            posixPermissionsString = "—"
-        }
+        loadPermissions(for: item)
 
         guard !item.isDirectory && item.size > 0 && item.size <= 2 * 1024 * 1024 else {
             textPreviewLines = []
@@ -697,18 +756,5 @@ public struct InspectorPreviewView: View {
         textPreviewLines = numbered
     }
 
-    private static func formatModeBits(_ mode: UInt16) -> String {
-        let chars: [Character] = [
-            (mode & 0o400) != 0 ? "r" : "-",
-            (mode & 0o200) != 0 ? "w" : "-",
-            (mode & 0o100) != 0 ? "x" : "-",
-            (mode & 0o040) != 0 ? "r" : "-",
-            (mode & 0o020) != 0 ? "w" : "-",
-            (mode & 0o010) != 0 ? "x" : "-",
-            (mode & 0o004) != 0 ? "r" : "-",
-            (mode & 0o002) != 0 ? "w" : "-",
-            (mode & 0o001) != 0 ? "x" : "-"
-        ]
-        return String(chars)
-    }
+
 }

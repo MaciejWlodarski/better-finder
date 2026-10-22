@@ -169,6 +169,8 @@ public struct FileHistoryAction {
 
 struct FileOperationIO {
     var identity: (URL) throws -> FileEntryIdentity
+    var readPermissions: (URL) throws -> UInt16
+    var writePermissions: (URL, UInt16) throws -> Void
     var resolveEntryPath: (URL) -> String
     var resolveDirectoryPath: (URL) -> String
     var exists: (URL) -> Bool
@@ -181,6 +183,16 @@ struct FileOperationIO {
 
     static let live = FileOperationIO(
         identity: FileEntryIdentity.read,
+        readPermissions: { url in
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let mode = attributes[.posixPermissions] as? NSNumber else {
+                throw FileOperationFailure(message: "Nie można odczytać uprawnień elementu.")
+            }
+            return mode.uint16Value & 0o7777
+        },
+        writePermissions: { url, mode in
+            try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: mode)], ofItemAtPath: url.path)
+        },
         resolveEntryPath: { FileTransferPaths.entryPath($0) },
         resolveDirectoryPath: { $0.resolvingSymlinksInPath().standardizedFileURL.path },
         exists: { (try? FileManager.default.attributesOfItem(atPath: $0.path)) != nil },
@@ -201,6 +213,55 @@ struct FileOperationIO {
             _ = url.path.withCString { rmdir($0) }
         }
     )
+}
+
+struct PosixPermissionSnapshot: Sendable {
+    let identity: FileEntryIdentity
+    let mode: UInt16
+
+    static func read(_ url: URL, io: FileOperationIO = .live) throws -> Self {
+        let identity = try io.identity(url)
+        guard identity.type == UInt32(S_IFREG) || identity.type == UInt32(S_IFDIR) else {
+            throw FileOperationFailure(message: "Edytor nie zmienia uprawnień dowiązań ani specjalnych wpisów.")
+        }
+        let mode = try io.readPermissions(url)
+        guard try io.identity(url) == identity else {
+            throw FileOperationFailure(message: "Element zmienił się podczas odczytu uprawnień.")
+        }
+        return Self(identity: identity, mode: mode)
+    }
+}
+
+enum PosixPermissionChange: Sendable {
+    case bit(UInt16, enabled: Bool)
+    case ordinaryMode(UInt16)
+
+    func applying(to current: UInt16) throws -> UInt16 {
+        switch self {
+        case .bit(let bit, let enabled):
+            guard bit != 0, bit & (bit - 1) == 0, bit & ~0o777 == 0 else {
+                throw FileOperationFailure(message: "Nieprawidłowy bit uprawnień.")
+            }
+            return enabled ? current | bit : current & ~bit
+        case .ordinaryMode(let mode):
+            guard mode & ~0o777 == 0 else {
+                throw FileOperationFailure(message: "Preset może zmieniać tylko zwykłe bity uprawnień.")
+            }
+            return (current & ~0o777) | mode
+        }
+    }
+
+    static func format(_ mode: UInt16) -> String {
+        let chars: [Character] = [
+            mode & 0o400 != 0 ? "r" : "-", mode & 0o200 != 0 ? "w" : "-",
+            mode & 0o4000 != 0 ? (mode & 0o100 != 0 ? "s" : "S") : (mode & 0o100 != 0 ? "x" : "-"),
+            mode & 0o040 != 0 ? "r" : "-", mode & 0o020 != 0 ? "w" : "-",
+            mode & 0o2000 != 0 ? (mode & 0o010 != 0 ? "s" : "S") : (mode & 0o010 != 0 ? "x" : "-"),
+            mode & 0o004 != 0 ? "r" : "-", mode & 0o002 != 0 ? "w" : "-",
+            mode & 0o1000 != 0 ? (mode & 0o001 != 0 ? "t" : "T") : (mode & 0o001 != 0 ? "x" : "-")
+        ]
+        return String(format: "%@ (%04o)", String(chars), mode & 0o7777)
+    }
 }
 
 struct FileOperationFailure: LocalizedError {
@@ -1360,18 +1421,41 @@ public final class FileOperationsManager: ObservableObject {
 
     // MARK: - POSIX Permissions (chmod) & Checksums (SHA-256 / MD5)
 
+    /// The inspector changes only the requested ordinary bits. Read fresh mode
+    /// on the worker, never replay special bits from an old UI snapshot.
     @discardableResult
-    public func setPosixPermissions(_ mode: UInt16, for item: FileItem) -> Bool {
+    func updatePosixPermissions(_ change: PosixPermissionChange, for item: FileItem,
+                                expectedIdentity: FileEntryIdentity,
+                                completion: @escaping @MainActor (PosixPermissionSnapshot?, String?) -> Void) -> Bool {
         guard beginMutation(title: "Zmiana uprawnień") else { return false }
-        defer { activeTransfer = nil }
-        do {
-            try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: mode)], ofItemAtPath: item.path)
-            lastStatusMessage = String(format: "Zmieniono uprawnienia %@ na %03o", item.name, mode & 0o777)
-            return true
-        } catch {
-            lastStatusMessage = "Błąd chmod: \(error.localizedDescription)"
-            return false
+        let io = fileIO
+        Task.detached(priority: .userInitiated) { [self] in
+            var updated: PosixPermissionSnapshot?
+            var failure: String?
+            do {
+                let current = try PosixPermissionSnapshot.read(item.url, io: io)
+                guard current.identity == expectedIdentity else {
+                    throw FileOperationFailure(message: "Nie zmieniono uprawnień: pod ścieżką znajduje się inny obiekt.")
+                }
+                let requested = try change.applying(to: current.mode)
+                try io.writePermissions(item.url, requested)
+                let actual = try PosixPermissionSnapshot.read(item.url, io: io)
+                guard actual.identity == expectedIdentity else {
+                    throw FileOperationFailure(message: "Element zmienił się podczas zapisu uprawnień; odśwież inspektor.")
+                }
+                updated = actual
+            } catch { failure = error.localizedDescription }
+            let finalSnapshot = updated
+            let finalFailure = failure
+            await MainActor.run {
+                self.activeTransfer = nil
+                if let finalSnapshot {
+                    self.lastStatusMessage = "Zmieniono uprawnienia \(item.name): \(PosixPermissionChange.format(finalSnapshot.mode))"
+                } else { self.lastStatusMessage = finalFailure ?? "Nie zmieniono uprawnień." }
+                completion(finalSnapshot, finalFailure)
+            }
         }
+        return true
     }
 
     /// Streams the file in 1 MB chunks so even multi-GB files can be hashed without loading them into RAM.

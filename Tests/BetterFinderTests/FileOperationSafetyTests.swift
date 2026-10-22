@@ -80,6 +80,9 @@ struct FileOperationSafetyTests {
     }
 
     static func runAll() async throws -> Int {
+        try await testPermissionEditsPreserveFreshUnrequestedBits()
+        try await testPermissionEditsRefuseUnsafeEntriesAndMasks()
+        try await testPermissionWorkStaysResponsiveAndGated()
         try await testHistoryRejectsReplacementEntries()
         try await testHistoryAcceptsEditsToSameEntry()
         try await testHistoryRejectsReplacedSymlinkAndRedoEntry()
@@ -110,10 +113,127 @@ struct FileOperationSafetyTests {
         try testBoundedGitInspectionAndDriverNames()
         try testGitRenameRecordPairs()
         #if BETTERFINDER_TESTING
-        return 27
+        return 30
         #else
-        return 26
+        return 29
         #endif
+    }
+
+    private static func editPermissions(_ manager: FileOperationsManager, _ item: FileItem,
+                                        identity: FileEntryIdentity, change: PosixPermissionChange) async -> (PosixPermissionSnapshot?, String?) {
+        await withCheckedContinuation { continuation in
+            if !manager.updatePosixPermissions(change, for: item, expectedIdentity: identity, completion: { snapshot, error in
+                continuation.resume(returning: (snapshot, error))
+            }) { continuation.resume(returning: (nil, "Busy")) }
+        }
+    }
+
+    private static func testPermissionEditsPreserveFreshUnrequestedBits() async throws {
+        for initial in [UInt16(0o1777), 0o2750, 0o4755] {
+            let f = try Fixture()
+            let url = f.sourceDirectory.appendingPathComponent("permissions")
+            if initial == 0o1777 { try f.fm.createDirectory(at: url, withIntermediateDirectories: false) }
+            else { try f.write("inert fixture, never executed", to: url) }
+            try f.io.writePermissions(url, initial)
+            let snapshot = try PosixPermissionSnapshot.read(url)
+            // External edits after the inspector loaded must survive a one-bit click.
+            let fresh = (initial ^ 0o1000) ^ 0o020
+            try f.io.writePermissions(url, fresh)
+            let manager = f.manager()
+            let (result, error) = await editPermissions(manager, f.item(url), identity: snapshot.identity,
+                                                       change: .bit(0o004, enabled: true))
+            try expect(error == nil && result?.mode == (fresh | 0o004))
+            let actual = try f.io.readPermissions(url)
+            try expect(actual == (fresh | 0o004))
+            let (preset, presetError) = await editPermissions(manager, f.item(url), identity: snapshot.identity,
+                                                             change: .ordinaryMode(0o644))
+            try expect(presetError == nil && preset?.mode == ((fresh & 0o7000) | 0o644))
+            try expect(manager.undoStack.isEmpty) // Permission editor never offered undo.
+        }
+        try expect(PosixPermissionChange.format(0o1777) == "rwxrwxrwt (1777)")
+        try expect(PosixPermissionChange.format(0o7644) == "rwSr-Sr-T (7644)")
+        let cleared = try PosixPermissionChange.bit(0o100, enabled: false).applying(to: 0o4755)
+        try expect(cleared == 0o4655)
+    }
+
+    private static func testPermissionEditsRefuseUnsafeEntriesAndMasks() async throws {
+        let f = try Fixture()
+        let url = f.sourceDirectory.appendingPathComponent("original")
+        try f.write("original", to: url)
+        try f.io.writePermissions(url, 0o644)
+        let original = try PosixPermissionSnapshot.read(url)
+        let manager = f.manager()
+        for invalid in [PosixPermissionChange.bit(0, enabled: true), .bit(0o3, enabled: true),
+                        .bit(0o4000, enabled: true), .ordinaryMode(0o1777)] {
+            let (updated, error) = await editPermissions(manager, f.item(url), identity: original.identity, change: invalid)
+            try expect(updated == nil && error != nil)
+            let actual = try f.io.readPermissions(url)
+            try expect(actual == 0o644)
+        }
+        try f.fm.moveItem(at: url, to: f.sourceDirectory.appendingPathComponent("saved-original"))
+        try f.write("replacement", to: url)
+        try f.io.writePermissions(url, 0o600)
+        let (replacement, replacementError) = await editPermissions(manager, f.item(url), identity: original.identity,
+                                                                    change: .ordinaryMode(0o777))
+        try expect(replacement == nil && replacementError != nil)
+        let replacementMode = try f.io.readPermissions(url)
+        try expect(replacementMode == 0o600)
+        let link = f.sourceDirectory.appendingPathComponent("link")
+        try f.fm.createSymbolicLink(at: link, withDestinationURL: url)
+        let linkIdentity = try FileEntryIdentity.read(link)
+        let (linked, linkError) = await editPermissions(manager, f.item(link), identity: linkIdentity, change: .ordinaryMode(0o777))
+        try expect(linked == nil && linkError != nil)
+        let targetMode = try f.io.readPermissions(url)
+        try expect(targetMode == 0o600)
+        var unknownIO = f.io
+        unknownIO.identity = { _ in throw RegressionFailure(description: "Unknown identity") }
+        let unknownManager = f.manager(unknownIO)
+        let (unknown, unknownError) = await editPermissions(unknownManager, f.item(url), identity: original.identity,
+                                                           change: .ordinaryMode(0o777))
+        try expect(unknown == nil && unknownError != nil)
+    }
+
+    private static func testPermissionWorkStaysResponsiveAndGated() async throws {
+        for blockRead in [true, false] {
+            let f = try Fixture()
+            let url = f.sourceDirectory.appendingPathComponent("permissions")
+            try f.write("fixture", to: url)
+            try f.io.writePermissions(url, 0o644)
+            let snapshot = try PosixPermissionSnapshot.read(url)
+            let control = Control()
+            defer { control.release.signal() }
+            var io = f.io
+            if blockRead {
+                io.readPermissions = { url in
+                    if !control.didEnter { try control.hold() }
+                    return try FileOperationIO.live.readPermissions(url)
+                }
+            } else {
+                io.writePermissions = { url, mode in
+                    try control.hold()
+                    try FileOperationIO.live.writePermissions(url, mode)
+                }
+            }
+            let manager = f.manager(io)
+            var completed = false
+            var error: String?
+            try expect(manager.updatePosixPermissions(.bit(0o100, enabled: true), for: f.item(url),
+                expectedIdentity: snapshot.identity, completion: { result, failure in
+                    completed = result != nil
+                    error = failure
+                }))
+            try expect(manager.isBusy && !completed)
+            try await entered(control)
+            try expect(!control.ranOnMain && !completed)
+            try expect(manager.createFile(named: "must-not-exist", in: f.destination) == nil)
+            try expect(!manager.updatePosixPermissions(.ordinaryMode(0o777), for: f.item(url),
+                expectedIdentity: snapshot.identity, completion: { _, _ in }))
+            control.release.signal()
+            try await idle(manager)
+            try expect(completed && error == nil)
+            let actual = try f.io.readPermissions(url)
+            try expect(actual == 0o744)
+        }
     }
 
     private static func testHistoryRejectsReplacementEntries() async throws {
@@ -577,7 +697,9 @@ struct FileOperationSafetyTests {
         try expect(!f.io.exists(f.destination.appendingPathComponent("a copy.txt")))
         try expect(manager.createFile(named: "new.txt", in: f.destination) == nil)
         try expect(manager.createFolder(named: "new-folder", in: f.destination) == nil)
-        try expect(!manager.setPosixPermissions(0o777, for: f.item(copiedA)))
+        let copiedIdentity = try FileEntryIdentity.read(copiedA)
+        try expect(!manager.updatePosixPermissions(.ordinaryMode(0o777), for: f.item(copiedA),
+            expectedIdentity: copiedIdentity, completion: { _, _ in }))
         manager.moveToTrash([f.item(copiedA)])
         manager.toggleTag(.red, for: [f.item(copiedA)])
         manager.clearTags(for: [f.item(copiedA)])

@@ -92,6 +92,8 @@ struct FileOperationSafetyTests {
         try await testHistoryDoesNotBlockMainActor()
         try await testPartialHistoryIdentity()
         try testTrashValidationAbortsBatch()
+        try await testStandaloneCompressedFiles()
+        try await testInvalidCompressedInputAndOccupiedOutput()
         try await testZipOperandsPreserveSources()
         try await testArchivePublicationRacePreservesRival()
         try await testArchivePublicationFailurePreservesOwnedStaging()
@@ -103,9 +105,9 @@ struct FileOperationSafetyTests {
         try testBoundedGitInspectionAndDriverNames()
         try testGitRenameRecordPairs()
         #if BETTERFINDER_TESTING
-        return 20
+        return 22
         #else
-        return 19
+        return 21
         #endif
     }
 
@@ -467,6 +469,61 @@ struct FileOperationSafetyTests {
         }
         try expect(!f.io.exists(urls[0]) && f.io.exists(urls[1]) && f.io.exists(urls[2]))
         try expect(manager.undoStack.count == 1 && manager.lastStatusMessage?.contains("Retained copy changed") == true)
+    }
+
+    private static func testStandaloneCompressedFiles() async throws {
+        let f = try Fixture()
+        let payload = Data("Zażółć 🐈\nnot a tar archive\n".utf8)
+        let fixtures: [(String, String, Bool)] = [
+            ("payload.gz", "H4sIAAAAAAACA4tKPLrn8OajTUfaFT7Mn9DBlZdfopCoUJJYpJBYlJyRWZbKBQA/WygPIgAAAA==", false),
+            ("payload.bz2", "QlpoOTFBWSZTWULBZOkAAANT7IAQQAAAECphlQAQwEAAiAQOAEAAIAAxQaNGgyA0KBpoNNAMgYIhxIQdOR1sN6sOhom+KoKilb4u5IpwoSCFgsnS", false),
+            ("payload.xz", "/Td6WFoAAATm1rRGAgAhARYAAAB0L+WjAQAhWmHFvMOzxYLEhyDwn5CICm5vdCBhIHRhciBhcmNoaXZlCgAAAE0wOvIKTyMQAAE6IrYqT9AftvN9AQAAAAAEWVo=", false),
+            ("empty.gz", "H4sIAAAAAAACAwMAAAAAAAAAAAA=", true),
+            ("empty.bz2", "QlpoORdyRThQkAAAAAA=", true),
+            ("empty.xz", "/Td6WFoAAATm1rRGAAAAABzfRCEftvN9AQAAAAAEWVo=", true)
+        ]
+        for (index, fixture) in fixtures.enumerated() {
+            let (name, encoded, empty) = fixture
+            // Filename metacharacters must remain data, including a leading '-'.
+            let basename = "-\(index) space ' $() " + name
+            let source = f.sourceDirectory.appendingPathComponent(basename)
+            let compressed = Data(base64Encoded: encoded)!
+            try compressed.write(to: source)
+            let manager = f.manager()
+            manager.extractArchive(f.item(source))
+            try await idle(manager)
+            let outputName = source.deletingPathExtension().lastPathComponent
+            let published = f.sourceDirectory.appendingPathComponent(outputName, isDirectory: true)
+            let output = try Data(contentsOf: published.appendingPathComponent(outputName))
+            try expect(output == (empty ? Data() : payload))
+            try expect((try? Data(contentsOf: source)) == compressed)
+            try expect(manager.undoStack.count == 1)
+            manager.undoLastOperation()
+            try await idle(manager)
+            try expect(!f.io.exists(published) && f.io.exists(source))
+        }
+    }
+
+    private static func testInvalidCompressedInputAndOccupiedOutput() async throws {
+        let f = try Fixture()
+        let source = f.sourceDirectory.appendingPathComponent("broken.gz")
+        let bytes = Data([0x1f, 0x8b, 0x08, 0x00, 0x00])
+        try bytes.write(to: source)
+        let manager = f.manager()
+        manager.extractArchive(f.item(source))
+        try await idle(manager)
+        try expect(manager.undoStack.isEmpty)
+        try expect(!f.io.exists(f.sourceDirectory.appendingPathComponent("broken")))
+        try expect((try? Data(contentsOf: source)) == bytes)
+        let occupied = f.destination.appendingPathComponent("rival.txt")
+        try f.write("untouched", to: occupied)
+        var rejected = false
+        do {
+            _ = try FileOperationsManager.decompressSingleFile(from: source, to: occupied)
+        } catch {
+            rejected = true
+        }
+        try expect(rejected && (try? f.text(occupied)) == "untouched")
     }
 
     private static func testZipOperandsPreserveSources() async throws {

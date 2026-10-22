@@ -1225,7 +1225,8 @@ public final class FileOperationsManager: ObservableObject {
                     status = Self.runProcess("/usr/bin/tar", arguments: ["-xf", item.path, "-C", stagedURL.path], in: parentDir, environment: environment)
                 } else if ext == "gz" || ext == "bz2" || ext == "xz" {
                     let outName = item.url.deletingPathExtension().lastPathComponent
-                    status = Self.runProcess("/bin/sh", arguments: ["-c", "/usr/bin/tar -xOf \"$0\" > \"$1\"", item.path, stagedURL.appendingPathComponent(outName).path], in: parentDir, environment: environment)
+                    status = try Self.decompressSingleFile(from: item.url,
+                                                           to: stagedURL.appendingPathComponent(outName))
                 } else {
                     status = Self.runProcess("/usr/bin/ditto", arguments: ["-x", "-k", item.path, stagedURL.path], in: parentDir, environment: environment)
                 }
@@ -1256,6 +1257,33 @@ public final class FileOperationsManager: ObservableObject {
                 self.reloadVisiblePanes()
             }
         }
+    }
+
+    /// Apple's gzip supports gzip, bzip2 and xz streams. Unlike tar, it does
+    /// not require an archive container around the decompressed bytes. Stream
+    /// directly to an exclusively created file inside our private staging tree;
+    /// never interpolate filenames into a shell or modify the compressed input.
+    nonisolated static func decompressSingleFile(from source: URL, to output: URL) throws -> Int32 {
+        let descriptor = output.path.withCString {
+            Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        }
+        guard descriptor >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+        process.arguments = ["-d", "-c", "--", source.path]
+        process.currentDirectoryURL = source.deletingLastPathComponent()
+        process.environment = archiveProcessEnvironment()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = handle
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        try handle.close()
+        return process.terminationStatus
     }
 
     // MARK: - POSIX Permissions (chmod) & Checksums (SHA-256 / MD5)

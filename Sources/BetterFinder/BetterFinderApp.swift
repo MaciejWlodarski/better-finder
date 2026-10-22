@@ -52,7 +52,7 @@ struct BetterFinderApp: App {
                     } else if appState.tabs.count > 1 {
                         appState.closeTab(appState.activeTabId)
                     } else {
-                        NSApp.keyWindow?.performClose(nil)
+                        NSApp?.keyWindow?.performClose(nil)
                     }
                 }
                 .keyboardShortcut("w", modifiers: [.command])
@@ -61,14 +61,14 @@ struct BetterFinderApp: App {
             // Undo / Redo File Operations
             CommandGroup(replacing: .undoRedo) {
                 Button(fileOps.undoLabel) {
-                    if isEditingText { NSApp.keyWindow?.firstResponder?.undoManager?.undo() }
+                    if isEditingText { NSApp?.keyWindow?.firstResponder?.undoManager?.undo() }
                     else { fileOps.undoLastOperation() }
                 }
                 .keyboardShortcut("z", modifiers: [.command])
                 .disabled(!isEditingText && (!fileOps.canUndo || fileOps.isBusy))
 
                 Button(fileOps.redoLabel) {
-                    if isEditingText { NSApp.keyWindow?.firstResponder?.undoManager?.redo() }
+                    if isEditingText { NSApp?.keyWindow?.firstResponder?.undoManager?.redo() }
                     else { fileOps.redoLastOperation() }
                 }
                 .keyboardShortcut("z", modifiers: [.command, .shift])
@@ -262,19 +262,12 @@ struct BetterFinderApp: App {
         }
     }
 
-    private var canUseFileCommands: Bool {
-        guard let window = NSApp.keyWindow else { return false }
-        return !isEditingText && !(window is NSPanel) && window.attachedSheet == nil && window.sheetParent == nil
-    }
+    private var canUseFileCommands: Bool { FinderCommandRouting.canUseFileCommands }
 
-    private var isEditingText: Bool {
-        NSApp.keyWindow?.firstResponder is NSTextView || NSApp.keyWindow?.firstResponder is NSTextField
-    }
+    private var isEditingText: Bool { FinderCommandRouting.isEditingText }
 
     private func routeTextAction(_ action: Selector) -> Bool {
-        guard isEditingText, let responder = NSApp.keyWindow?.firstResponder else { return false }
-        _ = NSApp.sendAction(action, to: responder, from: nil)
-        return true
+        FinderCommandRouting.routeTextAction(action)
     }
 }
 

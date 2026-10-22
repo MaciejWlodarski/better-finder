@@ -42,10 +42,18 @@ struct NativePreview {
             }
         } catch { require(false, "bootstrap fixture file write failed"); return }
         markStage("configure-defaults")
-        UserDefaults.standard.setVolatileDomain([
+        var previewDefaults: [String: Any] = [
             "bf.openTabPaths": [fixture.path], "bf.showInspector": false,
             "bf.showSidebar": true, "bf.isDualPane": false
-        ], forName: UserDefaults.argumentDomain)
+        ]
+        #if BETTERFINDER_TESTING
+        // This scenario tests keyboard interaction in a freshly loaded fixture,
+        // not session restoration. Legacy tab paths deliberately restore PAUSED
+        // panes; the test root already supplies the fresh fixture startup URL.
+        previewDefaults.removeValue(forKey: "bf.openTabPaths")
+        previewDefaults["bf.restoreSession"] = false
+        #endif
+        UserDefaults.standard.setVolatileDomain(previewDefaults, forName: UserDefaults.argumentDomain)
         markStage("configure-index")
         FSearchIndex.shared.configuredRoots = [fixture.path]
         FSearchIndex.shared.usePersistentMMapCache = false
@@ -77,7 +85,16 @@ struct NativePreview {
                         state.rightPane.currentURL.standardizedFileURL == fixture.standardizedFileURL,
                         "both panes must stay in the synthetic fixture at startup")
                 require(FSearchIndex.shared.configuredRoots == [fixture.path], "index roots must stay isolated")
+                require(!pane.wasRestoredFromSession && !pane.isSessionBrowsingPaused,
+                        "keyboard fixture must be freshly loaded rather than session-paused")
+                let expectedNames: Set<String> = ["Dokumenty", "Fotografie", "Projekty", "Archiwum",
+                    "Notatki ze spotkania.md", "Plan projektu.txt", "README.md", "Szkice.svg", "Zestawienie.csv"]
+                require(Set(pane.displayedItems.map(\.name)) == expectedNames && pane.selectableItems.count == 9,
+                        "keyboard fixture must expose all nine synthetic entries")
+                require(pane.selectedPaths.isEmpty, "keyboard fixture must start without preselected items")
                 #endif
+                require(window.isKeyWindow && NSApp.keyWindow === window,
+                        "keyboard event target must be the key window")
                 require(window.firstResponder is FileDragSourceView, "file pane must receive initial keyboard focus")
                 postKey(125, "\u{f701}", window: window)
                 try? await Task.sleep(for: .milliseconds(100))
@@ -177,7 +194,10 @@ struct NativePreview {
         guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
             context: nil, characters: characters, charactersIgnoringModifiers: characters,
-            isARepeat: false, keyCode: code) else { return }
+            isARepeat: false, keyCode: code) else {
+            require(false, "cannot construct native key event"); return
+        }
+        require(event.window === window, "native key event must resolve to the target window")
         NSApp.postEvent(event, atStart: false)
     }
 

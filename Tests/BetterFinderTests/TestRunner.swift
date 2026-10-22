@@ -13,6 +13,7 @@ func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath
     @MainActor static func main() async {
         do {
             try CommandColdStartRegressionTests().runBeforeApplicationInitialization()
+            try await FolderSizeLifecycleRegressionTests().runAll()
             try await DirectoryNavigationRegressionTests().runAll()
             let tests = NavigationTests()
             try await tests.testDirectoryShowsFilesBeforeTagMetadataCompletes()

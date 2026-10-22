@@ -434,15 +434,7 @@ public struct FilePaneView: View {
             // Size Column
             Group {
                 if item.isDirectory {
-                    if let folderSize = folderSizes.displaySize(for: item.path) {
-                        Text(folderSize)
-                            .help(folderSizes.size(for: item.path) == nil ? "Dolne oszacowanie: skan osiągnął limit lub nie odczytał części katalogów." : "Pełny rozmiar folderu")
-                    } else {
-                        Text("—")
-                            .onAppear {
-                                folderSizes.requestSizeIfNeeded(for: item.path)
-                            }
-                    }
+                    FolderSizeLabel(path: item.path, revision: pane.directoryRevision)
                 } else {
                     Text(FormatHelpers.formatBytes(item.size))
                 }
@@ -578,23 +570,15 @@ public struct FilePaneView: View {
                                     .fill(isSelected ? selectionBackgroundColor : Color.clear)
                             )
 
-                            Text(
-                                item.isDirectory
-                                ? (folderSizes.displaySize(for: item.path) ?? "Folder")
-                                : FormatHelpers.formatBytes(item.size)
-                            )
+                            Group {
+                                if item.isDirectory {
+                                    FolderSizeLabel(path: item.path, revision: pane.directoryRevision)
+                                } else {
+                                    Text(FormatHelpers.formatBytes(item.size))
+                                }
+                            }
                             .font(FinderUI.captionFont)
                             .foregroundStyle(.secondary)
-                            .onAppear {
-                                if item.isDirectory {
-                                    folderSizes.requestSizeIfNeeded(for: item.path)
-                                }
-                            }
-                            .onChange(of: folderSizes.result(for: item.path)) { _, result in
-                                if item.isDirectory && result == nil {
-                                    folderSizes.requestSizeIfNeeded(for: item.path)
-                                }
-                            }
                         }
                         .frame(width: cellWidth)
                         .padding(6)
@@ -1082,6 +1066,7 @@ private struct MillerColumnSingleListView: View {
     @ObservedObject var pane: PaneTabState
     @ObservedObject private var iconCache = FileIconCache.shared
     @ObservedObject private var folderSizes = FolderSizeCache.shared
+    @ViewState private var folderSizeOwner = UUID()
     let selectionBackgroundColor: Color
     let selectionForegroundColor: Color
     let onSelectDirectory: (URL) -> Void
@@ -1107,6 +1092,17 @@ private struct MillerColumnSingleListView: View {
             .background(Color(nsColor: .windowBackgroundColor))
 
             Divider()
+            if pane.sortField == .size && items.contains(where: { $0.isDirectory && folderSizes.size(for: $0.path) == nil }) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Niepełne sortowanie: nieznane i częściowe rozmiary na końcu grupy.")
+                    if items.contains(where: { $0.isDirectory && folderSizes.status(for: $0.path) == .deferred }) {
+                        Text("Limit aktywnych folderów. Zawęź widok lub zamknij inne widoki.")
+                        Button("Ponów rozmiary") { updateFolderSizeDemand() }
+                    }
+                }
+                .font(FinderUI.captionFont)
+                .padding(FinderUI.compactSpacing)
+            }
 
             ScrollView {
                 LazyVStack(spacing: 1) {
@@ -1193,11 +1189,50 @@ private struct MillerColumnSingleListView: View {
             if pane.sortField == .size { items = pane.sortItems(items) }
         }
         .onChange(of: columnURL) { _, _ in loadColumn() }
+        .onDisappear { folderSizes.release(owner: folderSizeOwner) }
+    }
+
+    private func updateFolderSizeDemand() {
+        folderSizes.updateDemand(owner: folderSizeOwner,
+            paths: FolderSizeCache.columnDemandPaths(items: items, sortBySize: pane.sortField == .size),
+            priority: .background)
     }
 
     private func loadColumn() {
         let entries = BulkCrawler.readDirectoryFast(at: columnURL.path, includeHidden: pane.showHiddenFiles)
         items = pane.sortItems(entries.map { $0.toFileItem(loadTags: false) })
+        updateFolderSizeDemand()
         pane.loadTagMetadataIfNeeded(for: items)
     }
+}
+
+/// Each lazily appearing row owns its demand independently of other panes and
+/// the inspector. Offscreen rows release their lease instead of pinning a whole
+/// directory and starving a newly visible or selected folder.
+private struct FolderSizeLabel: View {
+    let path: String
+    let revision: UInt64
+    @ObservedObject private var cache = FolderSizeCache.shared
+    @ViewState private var owner = UUID()
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if cache.status(for: path) == .deferred {
+                Button("Odroczono ↻") { request() }
+                    .buttonStyle(.plain)
+                    .help("Limit aktywnych folderów. Zawęź widok lub zamknij inne widoki, a następnie kliknij, aby ponowić.")
+            } else {
+                Text(cache.statusText(for: path))
+                    .help(cache.size(for: path) == nil
+                        ? "W kolejce, w trakcie skanu lub dolne oszacowanie (limit / nieodczytane katalogi)."
+                        : "Pełny rozmiar folderu")
+            }
+        }
+        .onAppear { request() }
+        .onChange(of: path) { _, _ in request() }
+        .onChange(of: revision) { _, _ in request() }
+        .onDisappear { cache.release(owner: owner) }
+    }
+
+    private func request() { cache.updateDemand(owner: owner, paths: [path], priority: .visible) }
 }

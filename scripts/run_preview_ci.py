@@ -173,6 +173,12 @@ def main():
                         "missing window content", "cannot render window", "cannot encode window render",
                         "cannot write window render", "both panes must stay in the synthetic fixture at startup",
                         "index roots must stay isolated",
+                        "keyboard fixture must be freshly loaded rather than session-paused",
+                        "keyboard fixture must expose all nine synthetic entries",
+                        "keyboard fixture must start without preselected items",
+                        "keyboard event target must be the key window",
+                        "cannot construct native key event",
+                        "native key event must resolve to the target window",
                     }
                     if marker.is_file() and marker.stat().st_size <= 2048:
                         message = marker.read_text().removeprefix("FAIL: ").strip()

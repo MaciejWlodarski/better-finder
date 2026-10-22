@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import AppKit
 import Combine
 
@@ -285,6 +286,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
             guard !Task.isCancelled, !request.isCancelled, sessionWork === request,
                   context == savedSearchActivationContext else { return false }
             sessionWork = nil
+            clearNavigationFailure()
             sessionAvailability = .ready
             directoryLoadGeneration &+= 1
             directoryItems = sortItems(prepared.entries.map { $0.toFileItem(treeDepth: 0, loadTags: false) })
@@ -304,26 +306,110 @@ public final class PaneTabState: ObservableObject, Identifiable {
 
     public init(initialURL: URL, loadImmediately: Bool = true) {
         self.wasRestoredFromSession = !loadImmediately
+        self.initialLocationEstablished = !loadImmediately
         self.currentURL = initialURL.standardizedFileURL
         self.columnTrailURLs = [initialURL.standardizedFileURL]
         if loadImmediately { reloadDirectory() } else { sessionAvailability = .paused }
     }
 
-    public func navigate(to url: URL, recordHistory: Bool = true) {
-        cancelPendingSavedSearches()
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
-        if !isDir.boolValue {
-            NSWorkspace.shared.open(url)
+    // Directory-only navigation. The injectable reader/opener keep failure tests
+    // deterministic and ensure that history never becomes a file-open gesture.
+    var navigationDirectoryReader: (String, Bool) -> BulkCrawler.DirectoryReadResult = {
+        BulkCrawler.readDirectoryResult(at: $0, includeHidden: $1)
+    }
+    var fileOpener: (URL) -> Void = { _ = NSWorkspace.shared.open($0) }
+    @Published private(set) var navigationDiagnostic: String?
+    private enum NavigationTransition { case direct(Bool, Bool), back, forward }
+    @Published private(set) var navigationFailureID: UUID?
+    private var failedNavigation: (URL, NavigationTransition, String)?
+    private var navigationRetryContext: String {
+        "\(navigationRevision)\u{0}\(directoryLoadGeneration)\u{0}\(currentURL.path)\u{0}\(searchQuery)\u{0}\(searchScope.rawValue)\u{0}\(showHiddenFiles)\u{0}\(viewMode.rawValue)"
+    }
+
+    private func clearNavigationFailure() {
+        failedNavigation = nil
+        navigationFailureID = nil
+        navigationDiagnostic = nil
+    }
+    private var initialLocationEstablished = false
+
+    func retainInitialLocation() { initialLocationEstablished = true }
+
+    func openFile(_ url: URL) { fileOpener(url) }
+
+    /// Only the first presentation may synchronize a pristine, fresh right pane.
+    /// Session provenance never controls subsequent visibility changes.
+    func initializeLocationIfNeeded(matching url: URL) {
+        guard !initialLocationEstablished else { return }
+        initialLocationEstablished = true
+        navigate(to: url, recordHistory: false)
+    }
+
+    @discardableResult
+    public func navigate(to url: URL, recordHistory: Bool = true, clearSearch: Bool = false) -> Bool {
+        navigateDirectory(to: url, transition: .direct(recordHistory, clearSearch))
+    }
+
+    func retryNavigation(expectedFailureID: UUID? = nil) {
+        if let expectedFailureID, expectedFailureID != navigationFailureID { return }
+        guard let (url, transition, context) = failedNavigation else { return }
+        guard context == navigationRetryContext else {
+            clearNavigationFailure()
             return
         }
+        _ = navigateDirectory(to: url, transition: transition)
+    }
 
-        sessionAvailability = .ready
+    @discardableResult
+    private func navigateDirectory(to url: URL, transition: NavigationTransition) -> Bool {
+        // Invalidate a Resume even when this attempt fails: its late completion
+        // must not publish over the user's newer intent. Browsing state is retained.
+        cancelPendingSavedSearches()
         let standardized = url.standardizedFileURL
-        if recordHistory && standardized.path != currentURL.path {
-            historyBack.append(currentURL)
-            historyForward.removeAll()
+        let entries: [IndexedFileEntry]
+        do {
+            var info = stat()
+            guard stat(standardized.path, &info) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            guard (info.st_mode & S_IFMT) == S_IFDIR else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTDIR))
+            }
+            let result = navigationDirectoryReader(standardized.path, showHiddenFiles)
+            guard result.isComplete, result.errorCode == nil else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(result.errorCode ?? EIO))
+            }
+            entries = result.entries
+        } catch {
+            failedNavigation = (standardized, transition, navigationRetryContext)
+            navigationFailureID = UUID()
+            navigationDiagnostic = "Nie otwarto folderu „\(standardized.path)”: \(error.localizedDescription) Bieżąca lokalizacja i jej zawartość zostały zachowane. Spróbuj ponownie."
+            return false
         }
+
+        let clearSearch: Bool
+        switch transition {
+        case let .direct(recordHistory, clear):
+            clearSearch = clear
+            if recordHistory && standardized.path != currentURL.path {
+                historyBack.append(currentURL)
+                historyForward.removeAll()
+            }
+        case .back:
+            guard historyBack.last == standardized else { return false }
+            clearSearch = false
+            historyBack.removeLast()
+            historyForward.append(currentURL)
+        case .forward:
+            guard historyForward.last == standardized else { return false }
+            clearSearch = false
+            historyForward.removeLast()
+            historyBack.append(currentURL)
+        }
+        clearNavigationFailure()
+        initialLocationEstablished = true
+        sessionAvailability = .ready
+        permitsGlobalSearchWhileBrowsingPaused = false
         searchTask?.cancel()
         searchGeneration &+= 1
         isSearching = false
@@ -337,16 +423,16 @@ public final class PaneTabState: ObservableObject, Identifiable {
         expandedFolderPaths.removeAll()
         renamingItemPath = nil
 
-        if !searchQuery.isEmpty && searchScope == .wholeIndex {
+        if clearSearch || (!searchQuery.isEmpty && searchScope == .wholeIndex) {
             searchQuery = ""
             activeFilterPills = []
         }
-        // Keep the browsing snapshot in sync even while a local query stays active.
-        reloadDirectory()
-
+        // Install exactly the validated snapshot, never a second filesystem read.
+        installDirectoryEntries(entries)
         updateColumnTrail(for: standardized)
         FSearchIndex.shared.ensureDirectoryIndexed(standardized.path)
         AppState.shared.persistTabsState()
+        return true
     }
 
     var savedSearchActivationContext: String {
@@ -393,6 +479,8 @@ public final class PaneTabState: ObservableObject, Identifiable {
         }
         guard generation == savedSearchActivationGeneration,
               context == savedSearchActivationContext, !Task.isCancelled, shouldApply() else { return false }
+        clearNavigationFailure()
+        initialLocationEstablished = true
         let hiddenChanged = showHiddenFiles != item.includeHidden
         if let root = prepared.root, root.path != currentURL.path {
             historyBack.append(currentURL)
@@ -477,15 +565,13 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     public func goBack() {
-        guard let prev = historyBack.popLast() else { return }
-        historyForward.append(currentURL)
-        navigate(to: prev, recordHistory: false)
+        guard let prev = historyBack.last else { return }
+        navigateDirectory(to: prev, transition: .back)
     }
 
     public func goForward() {
-        guard let next = historyForward.popLast() else { return }
-        historyBack.append(currentURL)
-        navigate(to: next, recordHistory: false)
+        guard let next = historyForward.last else { return }
+        navigateDirectory(to: next, transition: .forward)
     }
 
     public func goUp() {
@@ -520,8 +606,12 @@ public final class PaneTabState: ObservableObject, Identifiable {
             return
         }
         cancelPendingSavedSearches()
+        let entries = BulkCrawler.readDirectoryFast(at: currentURL.path, includeHidden: showHiddenFiles)
+        installDirectoryEntries(entries)
+    }
+
+    private func installDirectoryEntries(_ entries: [IndexedFileEntry]) {
         let targetPath = currentURL.path
-        let includeHidden = showHiddenFiles
         directoryLoadGeneration &+= 1
         let loadGeneration = directoryLoadGeneration
         // Invalidate consumers of this directory snapshot before a local query
@@ -536,7 +626,6 @@ public final class PaneTabState: ObservableObject, Identifiable {
         tagOperations.removeAll()
         tagCache.removeAll()
         pendingTagPaths.removeAll()
-        let entries = BulkCrawler.readDirectoryFast(at: targetPath, includeHidden: includeHidden)
         let items = sortItems(entries.map { $0.toFileItem(treeDepth: 0, loadTags: false) })
         self.directoryItems = items
         triggerSearch()

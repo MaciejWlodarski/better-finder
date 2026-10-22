@@ -13,6 +13,20 @@ private struct IconFramePreferenceKey: PreferenceKey {
 /// changing selection or navigation, so global commands observe the same target.
 @MainActor
 enum FinderPaneActionRouting {
+    /// A retained view action must never activate a replacement or hidden pane.
+    @discardableResult
+    static func performIfCurrent(appState: AppState, pane: PaneTabState, paneSide: PaneSide,
+                                 action: () -> Void) -> Bool {
+        switch paneSide {
+        case .left:
+            guard appState.activeTabId == pane.id, appState.tabs.contains(where: { $0.id == pane.id }) else { return false }
+        case .right:
+            guard appState.isDualPane, appState.rightPane.id == pane.id else { return false }
+        }
+        perform(appState: appState, paneSide: paneSide, action: action)
+        return true
+    }
+
     static func perform(appState: AppState, paneSide: PaneSide, action: () -> Void) {
         appState.activePaneSide = paneSide
         action()
@@ -76,6 +90,20 @@ public struct FilePaneView: View {
     public var body: some View {
         VStack(spacing: 0) {
             PathBreadcrumbBar(appState: appState, pane: pane)
+
+            if let diagnostic = pane.navigationDiagnostic, let failureID = pane.navigationFailureID {
+                HStack {
+                    Text(diagnostic).font(FinderUI.captionFont)
+                    Spacer()
+                    Button("Spróbuj ponownie") {
+                        FinderPaneActionRouting.performIfCurrent(appState: appState, pane: pane, paneSide: paneSide) {
+                            pane.retryNavigation(expectedFailureID: failureID)
+                        }
+                    }
+                }
+                .padding(FinderUI.compactSpacing)
+                .accessibilityElement(children: .contain)
+            }
 
             if let diagnostic = pane.searchDiagnostic {
                 searchNotice(diagnostic)
@@ -669,7 +697,7 @@ public struct FilePaneView: View {
                         onSelectFile: { fileItem in
                             performPaneAction {
                                 let parent = fileItem.url.deletingLastPathComponent()
-                                if pane.currentURL.path != parent.path { pane.navigate(to: parent) }
+                                if pane.currentURL.path != parent.path, !pane.navigate(to: parent) { return }
                                 pane.select(fileItem)
                             }
                         }
@@ -817,7 +845,7 @@ public struct FilePaneView: View {
             if item.isDirectory && item.fileExtension.lowercased() != "app" {
                 pane.navigate(to: item.url)
             } else {
-                NSWorkspace.shared.open(item.url)
+                pane.openFile(item.url)
             }
         }
     }
@@ -853,9 +881,9 @@ public struct FilePaneView: View {
                 guard !pane.actionItems(for: item).isEmpty else { return }
                 performPaneAction {
                     let parentURL = URL(fileURLWithPath: item.parentPath, isDirectory: true)
-                    pane.searchQuery = ""
-                    pane.navigate(to: parentURL)
-                    pane.selectedPaths = [item.path]
+                    if pane.navigate(to: parentURL, clearSearch: true) {
+                        pane.selectedPaths = [item.path]
+                    }
                 }
             } label: {
                 Label("Pokaż w folderze nadrzędnym", systemImage: "folder.fill.badge.person.crop")

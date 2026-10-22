@@ -320,9 +320,7 @@ public struct PathBreadcrumbBar: View {
     }
 
     private func navigate(to url: URL) {
-        pane.searchQuery = ""
-        pane.activeFilterPills = []
-        pane.navigate(to: url)
+        pane.navigate(to: url, clearSearch: true)
     }
 
     private func activatePane() {

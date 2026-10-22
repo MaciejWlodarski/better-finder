@@ -400,9 +400,7 @@ public struct SidebarView: View {
     }
 
     private func navigate(to url: URL) {
-        activeTab.searchQuery = ""
-        activeTab.activeFilterPills = []
-        activeTab.navigate(to: url)
+        activeTab.navigate(to: url, clearSearch: true)
     }
 
     private func runSearch(_ query: String) {

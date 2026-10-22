@@ -352,8 +352,11 @@ public struct EmbeddedTerminalDrawerView: View {
             let targetURL = URL(fileURLWithPath: targetPath, isDirectory: true)
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: targetPath, isDirectory: &isDir), isDir.boolValue {
-                activeTab.navigate(to: targetURL)
-                outputLines.append(TerminalOutputLine(text: "→ \(targetURL.path)", isCommand: false, isError: false))
+                if activeTab.navigate(to: targetURL) {
+                    outputLines.append(TerminalOutputLine(text: "→ \(targetURL.path)", isCommand: false, isError: false))
+                } else {
+                    outputLines.append(TerminalOutputLine(text: activeTab.navigationDiagnostic ?? "cd: nie można odczytać folderu", isCommand: false, isError: true))
+                }
             } else {
                 outputLines.append(TerminalOutputLine(text: "cd: brak takiego katalogu: \(arg)", isCommand: false, isError: true))
             }

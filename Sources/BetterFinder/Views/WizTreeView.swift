@@ -992,9 +992,10 @@ public struct WizTreeAnalyzerView: View {
                 }
                 Button {
                     performPaneAction {
-                        pane.viewMode = .list
-                        pane.navigate(to: block.node.isDirectory ? block.node.url : block.node.url.deletingLastPathComponent())
-                        pane.selectedPaths = [block.node.path]
+                        if pane.navigate(to: block.node.isDirectory ? block.node.url : block.node.url.deletingLastPathComponent()) {
+                            pane.viewMode = .list
+                            pane.selectedPaths = [block.node.path]
+                        }
                     }
                 } label: {
                     Label("Pokaż na liście plików", systemImage: "list.bullet")

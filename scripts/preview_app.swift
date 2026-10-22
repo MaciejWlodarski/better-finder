@@ -6,6 +6,18 @@ struct NativePreview {
     @MainActor static func main() throws {
         let base = URL(fileURLWithPath: ProcessInfo.processInfo.environment["BETTERFINDER_PREVIEW_OUTPUT"]!, isDirectory: true)
         let fixture = base.appendingPathComponent("Pracownia", isDirectory: true)
+        #if BETTERFINDER_TESTING
+        // Check Foundation's resolved home before any singleton touches it.
+        // HOME alone is not an isolation guarantee on macOS.
+        let env = ProcessInfo.processInfo.environment
+        guard env["BETTERFINDER_PREVIEW_CI"] == "1",
+              let home = env["CFFIXED_USER_HOME"], env["HOME"] == home,
+              URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path == URL(fileURLWithPath: home).resolvingSymlinksInPath().path,
+              FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath().path == URL(fileURLWithPath: home).resolvingSymlinksInPath().path,
+              env["BETTERFINDER_TEST_ROOT"] == fixture.path else {
+            throw NSError(domain: "NativePreview", code: 1, userInfo: [NSLocalizedDescriptionKey: "Preview isolation check failed"])
+        }
+        #endif
         try FileManager.default.createDirectory(at: fixture, withIntermediateDirectories: true)
         for folder in ["Dokumenty", "Fotografie", "Projekty", "Archiwum"] {
             try FileManager.default.createDirectory(at: fixture.appendingPathComponent(folder), withIntermediateDirectories: true)
@@ -39,6 +51,12 @@ struct NativePreview {
                 try? await Task.sleep(for: .milliseconds(400))
                 let state = AppState.shared
                 let pane = state.activeTab
+                #if BETTERFINDER_TESTING
+                require(pane.currentURL.standardizedFileURL == fixture.standardizedFileURL &&
+                        state.rightPane.currentURL.standardizedFileURL == fixture.standardizedFileURL,
+                        "both panes must stay in the synthetic fixture at startup")
+                require(FSearchIndex.shared.configuredRoots == [fixture.path], "index roots must stay isolated")
+                #endif
                 require(window.firstResponder is FileDragSourceView, "file pane must receive initial keyboard focus")
                 postKey(125, "\u{f701}", window: window)
                 try? await Task.sleep(for: .milliseconds(100))
@@ -67,7 +85,7 @@ struct NativePreview {
                 state.focusSearchFieldTrigger += 1
                 try? await Task.sleep(for: .milliseconds(300))
                 require(pane.displayedItems.map(\.name) == ["README.md"], "search must match the fixture")
-                require(window.firstResponder is NSTextView, "Command-F focus must reach search text")
+                require(window.firstResponder is NSTextView, "programmatic search-focus trigger must reach search text")
                 postKey(0, "a", modifiers: [.command], window: window)
                 try? await Task.sleep(for: .milliseconds(100))
                 require((window.firstResponder as? NSTextView)?.selectedRange().length == pane.searchQuery.utf16.count,
@@ -143,7 +161,8 @@ struct NativePreview {
         guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { require(false, "cannot render window"); return }
         view.cacheDisplay(in: view.bounds, to: bitmap)
         guard let png = bitmap.representation(using: .png, properties: [:]) else { require(false, "cannot encode window render"); return }
-        try? png.write(to: url)
+        do { try png.write(to: url) }
+        catch { require(false, "cannot write window render"); return }
         print("CAPTURE \(url.path) \(bitmap.pixelsWide)x\(bitmap.pixelsHigh)")
     }
 }

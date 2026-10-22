@@ -317,7 +317,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
         // late responses even when the user has returned to the same folder.
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let snapshot = FileOperationsManager.fetchGitStatusSnapshot(for: targetPath) else { return }
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self, self.currentURL.path == targetPath,
                       self.directoryLoadGeneration == loadGeneration else { return }
                 FSearchIndex.shared.recordGitStatuses(snapshot.statuses, repositoryRoot: snapshot.repositoryRoot)

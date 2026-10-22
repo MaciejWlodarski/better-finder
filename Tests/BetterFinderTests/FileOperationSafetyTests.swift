@@ -962,11 +962,11 @@ struct FileOperationSafetyTests {
             .filter { $0.lastPathComponent.hasPrefix(".betterfinder-archive-") }
         try expect(staging.count == 1 && manager.undoStack.isEmpty)
         try expect(f.io.exists(staging[0].appendingPathComponent("archive.zip")))
-        if manager.lastStatusMessage?.contains(staging[0].path) != true {
-            let producerPath = source.deletingLastPathComponent().appendingPathComponent(staging[0].lastPathComponent)
-            print("Archive fixture diagnostic: enumerated=\(staging[0].path); producer=\(producerPath.path); normalizedEnumerated=\(staging[0].standardizedFileURL.resolvingSymlinksInPath().path); normalizedProducer=\(producerPath.standardizedFileURL.resolvingSymlinksInPath().path); status=\(manager.lastStatusMessage ?? "nil")")
-        }
-        try expect(manager.lastStatusMessage?.contains(staging[0].path) == true)
+        // Directory enumeration may return /private/var while the producer
+        // reports the equivalent /var URL from which staging was created.
+        let reportedStaging = source.deletingLastPathComponent().appendingPathComponent(staging[0].lastPathComponent)
+        try expect(reportedStaging.standardizedFileURL.resolvingSymlinksInPath() == staging[0].standardizedFileURL.resolvingSymlinksInPath())
+        try expect(manager.lastStatusMessage?.contains(reportedStaging.path) == true)
         let original = try f.text(source)
         try expect(original == "incoming bytes")
     }

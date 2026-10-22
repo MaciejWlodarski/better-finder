@@ -150,6 +150,10 @@ struct DiskAnalysisRegressionTests {
             command: "exec 1>&- 2>&-; trap '' TERM; /bin/sleep 60", directory: root, shell: "/bin/sh")
         try expect(closedResult.wasCancelled && Date().timeIntervalSince(closedStart) < 5)
         try expect(closedResult.waitIterations < 100)
+        let inheritedEnvironment = try TerminalCommandSession().run(
+            command: "printf '%s' \"$HOME\"", directory: root, shell: "/bin/sh")
+        try expect(inheritedEnvironment.status == 0)
+        try expect(inheritedEnvironment.output == (ProcessInfo.processInfo.environment["HOME"] ?? ""))
         let failure = try TerminalCommandSession().run(command: "exit 7", directory: root, shell: "/bin/sh")
         try expect(failure.status == 7)
         let limited = TerminalCommandSession(outputLimit: 1024)

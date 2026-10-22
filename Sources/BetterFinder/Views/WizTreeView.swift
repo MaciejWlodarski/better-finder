@@ -1279,7 +1279,7 @@ public struct WizTreeAnalyzerView: View {
             if failedHashes > 0 { messages.append("Pliki zmienione lub nieodczytane: \(failedHashes).") }
             if !complete && messages.isEmpty { messages.append("Skan niepełny; suma jest dolnym oszacowaniem.") }
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
-            await MainActor.run {
+            await MainActor.run { [branches, groups, categoryMap, messages] in
                 guard token.canPublish(active: self.scanToken, rootPath: self.pane.currentURL.path) else { return }
                 self.topBranches = branches.sorted { $0.size > $1.size }
                 self.largestFiles = Array(files.sorted { $0.size > $1.size }.prefix(150))

@@ -43,6 +43,53 @@ def last_stage(output):
         return "unavailable"
 
 
+def log_evidence(path):
+    """Return fixed evidence tags, never log text, paths, addresses or values.
+
+    Inspect at most 128 KiB (head/tail) of this invocation's private log. Tags
+    mean matching text was observed, not that a cause or missing GUI is proven.
+    No raw log is retained or uploaded, including on classifier failure.
+    """
+    try:
+        if path.is_symlink():
+            return "unavailable"
+        with path.open("rb") as stream:
+            head = stream.read(65536)
+            stream.seek(0, os.SEEK_END)
+            length = stream.tell()
+            if length > 65536:
+                stream.seek(max(65536, length - 65536))
+                tail = stream.read(65536)
+            else:
+                tail = b""
+        text = (head + b"\n" + tail).decode("utf-8", errors="replace").lower()
+    except (OSError, ValueError):
+        return "unavailable"
+    signatures = (
+        ("test-preferences-fatal", ("could not create isolated test preferences",)),
+        ("test-root-fatal", ("betterfinder_test_root must identify an isolated test directory",)),
+        ("explicit-windowserver-connection-error", (
+            "failed to connect to windowserver", "failed to connect to the windowserver",
+            "unable to connect to window server", "unable to connect to the window server",
+            "failed to establish the default connection to the windowserver")),
+        ("explicit-main-thread-error", (
+            "nsapplication must be initialized on the main thread",
+            "app.main() must be called on the main thread")),
+        ("uncaught-objective-c-exception", ("terminating app due to uncaught exception",)),
+        ("swift-nil-unwrap", ("unexpectedly found nil while unwrapping an optional value",)),
+        ("swift-fatal-error", ("fatal error:",)),
+        ("dispatch-queue-assertion-symbol", ("_dispatch_assert_queue_fail",)),
+        ("application-registration-symbol", ("_registerapplication",)),
+        ("appkit-main-symbol", ("nsapplicationmain",)),
+        ("swiftui-main-symbol", ("swiftui.app.main",)),
+    )
+    tags = [tag for tag, needles in signatures if any(needle in text for needle in needles)][:6]
+    # These are presence-only framework tokens, NOT a crash-frame attribution.
+    frameworks = ("AppKit", "SwiftUI", "HIServices", "SkyLight", "CoreFoundation", "libdispatch", "libswiftCore")
+    tags.extend("token-" + name for name in frameworks if name.lower() in text)
+    return ",".join(tags[:10]) if tags else "no-known-signature"
+
+
 def stop(process):
     if process is None:
         return
@@ -99,16 +146,18 @@ def main():
         process = None
         try:
             # Do not publish compiler/runtime logs or environment values.
-            with (sandbox / "native.log").open("wb") as log:
+            log_path = sandbox / "native.log"
+            with log_path.open("wb") as log:
                 process = subprocess.Popen(["zsh", "scripts/preview_app.sh"], cwd=ROOT, env=env,
                                            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 try:
                     code = process.wait(timeout=240)
                 except subprocess.TimeoutExpired:
-                    raise RuntimeError("Native preview exceeded 240 seconds; last stage: " + last_stage(output)) from None
+                    raise RuntimeError("Native preview exceeded 240 seconds; last stage: %s; fixed log evidence: %s" % (last_stage(output), log_evidence(log_path))) from None
                 if code:
                     marker = output / "verification.txt"
                     allowed = {
+                        "bootstrap App.main requires the main thread",
                         "bootstrap output path missing or invalid", "bootstrap CI mode missing",
                         "bootstrap fixed home missing", "bootstrap HOME differs from fixed home",
                         "bootstrap NSHomeDirectory isolation mismatch",
@@ -130,7 +179,7 @@ def main():
                             raise RuntimeError("Native preview assertion: " + message)
                     # Harness-only compilation/bootstrap failures are distinct from
                     # production build/tests; retain the last fixed stage, not logs.
-                    raise RuntimeError("Native preview failed (exit %d); last stage: %s; no artifact published" % (code, last_stage(output)))
+                    raise RuntimeError("Native preview failed (exit %d); last stage: %s; fixed log evidence: %s; no artifact published" % (code, last_stage(output), log_evidence(log_path)))
         finally:
             stop(process)
         verification = output / "verification.txt"

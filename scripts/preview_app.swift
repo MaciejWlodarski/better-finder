@@ -146,6 +146,7 @@ struct NativePreview {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
             require(false, "native preview timed out; a graphical macOS session is required")
         }
+        require(Thread.isMainThread, "bootstrap App.main requires the main thread")
         markStage("enter-app-main")
         BetterFinderApp.main()
     }

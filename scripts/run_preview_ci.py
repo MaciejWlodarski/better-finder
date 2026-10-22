@@ -19,6 +19,30 @@ MAX_BYTES = 8 * 1024 * 1024 - 2048  # Reserve 2 KiB for fixed verification; TOTA
 DEST = ROOT / ".build" / "previews-ci-artifact"
 
 
+def last_stage(output):
+    # File contents are untrusted: publish only exact fixed stage IDs, at most
+    # 128 input bytes. Missing/unreadable markers must not expose raw exceptions.
+    allowed = {
+        "prepare-bundle", "compile-harness", "sign-harness", "launch-native",
+        "native-entry", "check-ns-home", "check-file-manager-home",
+        "create-fixture-directories", "write-fixture-files", "configure-defaults",
+        "configure-index", "enter-app-main", "did-finish-launching",
+        "activate-window", "native-assertions",
+    }
+    try:
+        marker = output / "stage.txt"
+        if marker.is_symlink():
+            return "unavailable"
+        with marker.open("rb") as stream:
+            data = stream.read(129)
+        if len(data) > 128:
+            return "unavailable"
+        stage = data.decode("ascii").strip()
+        return stage if stage in allowed else "unavailable"
+    except (OSError, ValueError):
+        return "unavailable"
+
+
 def stop(process):
     if process is None:
         return
@@ -81,10 +105,15 @@ def main():
                 try:
                     code = process.wait(timeout=240)
                 except subprocess.TimeoutExpired:
-                    raise RuntimeError("Native preview exceeded 240 seconds; graphical session or compilation may be unavailable") from None
+                    raise RuntimeError("Native preview exceeded 240 seconds; last stage: " + last_stage(output)) from None
                 if code:
                     marker = output / "verification.txt"
                     allowed = {
+                        "bootstrap output path missing or invalid", "bootstrap CI mode missing",
+                        "bootstrap fixed home missing", "bootstrap HOME differs from fixed home",
+                        "bootstrap NSHomeDirectory isolation mismatch",
+                        "bootstrap FileManager home isolation mismatch", "bootstrap fixture root mismatch",
+                        "bootstrap fixture directory creation failed", "bootstrap fixture file write failed",
                         "no app window after launch", "file pane must receive initial keyboard focus",
                         "Down must select a file", "Shift-Down must extend selection",
                         "Return must open the native rename sheet", "reopened tab must restore the closed tab",
@@ -99,9 +128,9 @@ def main():
                         message = marker.read_text().removeprefix("FAIL: ").strip()
                         if message in allowed:
                             raise RuntimeError("Native preview assertion: " + message)
-                    # Keep public output fixed and non-sensitive. Reproduce compilation
-                    # through the preceding build/test gates, not a raw log upload.
-                    raise RuntimeError("Native preview failed (exit %d); no artifact published" % code)
+                    # Harness-only compilation/bootstrap failures are distinct from
+                    # production build/tests; retain the last fixed stage, not logs.
+                    raise RuntimeError("Native preview failed (exit %d); last stage: %s; no artifact published" % (code, last_stage(output)))
         finally:
             stop(process)
         verification = output / "verification.txt"

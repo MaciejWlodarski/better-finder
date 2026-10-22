@@ -3,36 +3,55 @@ import AppKit
 
 @main
 struct NativePreview {
-    @MainActor static func main() throws {
-        let base = URL(fileURLWithPath: ProcessInfo.processInfo.environment["BETTERFINDER_PREVIEW_OUTPUT"]!, isDirectory: true)
+    @MainActor static func main() {
+        guard let outputPath = ProcessInfo.processInfo.environment["BETTERFINDER_PREVIEW_OUTPUT"],
+              outputPath.hasPrefix("/") else {
+            require(false, "bootstrap output path missing or invalid"); return
+        }
+        let base = URL(fileURLWithPath: outputPath, isDirectory: true)
+        markStage("native-entry")
         let fixture = base.appendingPathComponent("Pracownia", isDirectory: true)
         #if BETTERFINDER_TESTING
-        // Check Foundation's resolved home before any singleton touches it.
-        // HOME alone is not an isolation guarantee on macOS.
+        // Keep each original isolation check; emit only fixed failure labels.
+        // Never include actual home paths or environment values in diagnostics.
         let env = ProcessInfo.processInfo.environment
-        guard env["BETTERFINDER_PREVIEW_CI"] == "1",
-              let home = env["CFFIXED_USER_HOME"], env["HOME"] == home,
-              URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path == URL(fileURLWithPath: home).resolvingSymlinksInPath().path,
-              FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath().path == URL(fileURLWithPath: home).resolvingSymlinksInPath().path,
-              env["BETTERFINDER_TEST_ROOT"] == fixture.path else {
-            throw NSError(domain: "NativePreview", code: 1, userInfo: [NSLocalizedDescriptionKey: "Preview isolation check failed"])
+        require(env["BETTERFINDER_PREVIEW_CI"] == "1", "bootstrap CI mode missing")
+        guard let home = env["CFFIXED_USER_HOME"] else {
+            require(false, "bootstrap fixed home missing"); return
         }
+        require(env["HOME"] == home, "bootstrap HOME differs from fixed home")
+        markStage("check-ns-home")
+        require(URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path == URL(fileURLWithPath: home).resolvingSymlinksInPath().path,
+                "bootstrap NSHomeDirectory isolation mismatch")
+        markStage("check-file-manager-home")
+        require(FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath().path == URL(fileURLWithPath: home).resolvingSymlinksInPath().path,
+                "bootstrap FileManager home isolation mismatch")
+        require(env["BETTERFINDER_TEST_ROOT"] == fixture.path, "bootstrap fixture root mismatch")
         #endif
-        try FileManager.default.createDirectory(at: fixture, withIntermediateDirectories: true)
-        for folder in ["Dokumenty", "Fotografie", "Projekty", "Archiwum"] {
-            try FileManager.default.createDirectory(at: fixture.appendingPathComponent(folder), withIntermediateDirectories: true)
-        }
-        for name in ["Notatki ze spotkania.md", "Plan projektu.txt", "README.md", "Szkice.svg", "Zestawienie.csv"] {
-            try Data("BetterFinder preview\n".utf8).write(to: fixture.appendingPathComponent(name))
-        }
+        markStage("create-fixture-directories")
+        do {
+            try FileManager.default.createDirectory(at: fixture, withIntermediateDirectories: true)
+            for folder in ["Dokumenty", "Fotografie", "Projekty", "Archiwum"] {
+                try FileManager.default.createDirectory(at: fixture.appendingPathComponent(folder), withIntermediateDirectories: true)
+            }
+        } catch { require(false, "bootstrap fixture directory creation failed"); return }
+        markStage("write-fixture-files")
+        do {
+            for name in ["Notatki ze spotkania.md", "Plan projektu.txt", "README.md", "Szkice.svg", "Zestawienie.csv"] {
+                try Data("BetterFinder preview\n".utf8).write(to: fixture.appendingPathComponent(name))
+            }
+        } catch { require(false, "bootstrap fixture file write failed"); return }
+        markStage("configure-defaults")
         UserDefaults.standard.setVolatileDomain([
             "bf.openTabPaths": [fixture.path], "bf.showInspector": false,
             "bf.showSidebar": true, "bf.isDualPane": false
         ], forName: UserDefaults.argumentDomain)
+        markStage("configure-index")
         FSearchIndex.shared.configuredRoots = [fixture.path]
         FSearchIndex.shared.usePersistentMMapCache = false
         NotificationCenter.default.addObserver(forName: NSApplication.didFinishLaunchingNotification, object: nil, queue: .main) { _ in
             Task { @MainActor in
+                markStage("did-finish-launching")
                 try? await Task.sleep(for: .seconds(2))
                 var candidate: NSWindow?
                 for _ in 0..<50 {
@@ -44,11 +63,13 @@ struct NativePreview {
                     print("WINDOWS: \(NSApp.windows.map { "\($0.title): visible=\($0.isVisible), class=\(type(of: $0))" })")
                     require(false, "no app window after launch"); return
                 }
+                markStage("activate-window")
                 window.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
                 window.setContentSize(NSSize(width: 1180, height: 730))
                 NSApp.appearance = NSAppearance(named: .aqua)
                 try? await Task.sleep(for: .milliseconds(400))
+                markStage("native-assertions")
                 let state = AppState.shared
                 let pane = state.activeTab
                 #if BETTERFINDER_TESTING
@@ -125,14 +146,26 @@ struct NativePreview {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
             require(false, "native preview timed out; a graphical macOS session is required")
         }
+        markStage("enter-app-main")
         BetterFinderApp.main()
+    }
+
+    // Best-effort diagnostics cannot throw out of main or print paths/errors.
+    @MainActor static func writeDiagnostic(_ value: String, file: String) {
+        guard let path = ProcessInfo.processInfo.environment["BETTERFINDER_PREVIEW_OUTPUT"],
+              path.hasPrefix("/") else { return }
+        let target = URL(fileURLWithPath: path, isDirectory: true).appendingPathComponent(file)
+        try? value.write(to: target, atomically: true, encoding: .utf8)
+    }
+
+    @MainActor static func markStage(_ stage: String) {
+        writeDiagnostic(stage, file: "stage.txt")
     }
 
     @MainActor static func require(_ condition: Bool, _ message: String) {
         guard condition else {
             let summary = "FAIL: \(message)"
-            let output = URL(fileURLWithPath: ProcessInfo.processInfo.environment["BETTERFINDER_PREVIEW_OUTPUT"]!).appendingPathComponent("verification.txt")
-            try? summary.write(to: output, atomically: true, encoding: .utf8)
+            writeDiagnostic(summary, file: "verification.txt")
             fputs("PREVIEW \(summary)\n", stderr)
             exit(1)
         }

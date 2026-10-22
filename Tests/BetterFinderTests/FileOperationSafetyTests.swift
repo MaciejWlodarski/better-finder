@@ -80,6 +80,11 @@ struct FileOperationSafetyTests {
     }
 
     static func runAll() async throws -> Int {
+        try await testHistoryRejectsReplacementEntries()
+        try await testHistoryAcceptsEditsToSameEntry()
+        try await testHistoryRejectsReplacedSymlinkAndRedoEntry()
+        try await testHistoryRetainsPartialSuffixAndUnknownIdentity()
+        try await testHistoryRecapturesIdentityAfterCrossVolumeStyleMove()
         try await testTransferPreflightStaysResponsiveAndOwned()
         try await testTransferRejectsSymlinkedDescendant()
         try await testTransferThroughParentAliasUsesSameEntryRules()
@@ -105,10 +110,242 @@ struct FileOperationSafetyTests {
         try testBoundedGitInspectionAndDriverNames()
         try testGitRenameRecordPairs()
         #if BETTERFINDER_TESTING
-        return 22
+        return 27
         #else
-        return 21
+        return 26
         #endif
+    }
+
+    private static func testHistoryRejectsReplacementEntries() async throws {
+        for mode in 0..<10 {
+            let f = try Fixture()
+            let source = f.sourceDirectory.appendingPathComponent("item.txt")
+            try f.write("original", to: source)
+            let manager = f.manager()
+            let target: URL
+            switch mode {
+            case 0:
+                target = manager.createFile(named: "created.txt", content: "created", in: f.destination)!
+            case 1:
+                target = manager.createFolder(named: "created-folder", in: f.destination)!
+            case 2:
+                target = manager.renameItem(f.item(source), to: "renamed.txt")!
+            case 3, 4, 8:
+                target = f.destination.appendingPathComponent("item.txt")
+                if mode == 8 { try f.write("displaced original", to: target) }
+                manager.performTransfer(sourceURLs: [source], into: f.destination,
+                                        isMove: mode == 4, explicitPolicy: mode == 8 ? .overwrite : .keepBoth)
+            case 5:
+                target = f.sourceDirectory.appendingPathComponent("item copy.txt")
+                manager.duplicateItems([f.item(source)])
+            case 6:
+                target = f.sourceDirectory.appendingPathComponent("item.zip")
+                manager.compressItems([f.item(source)], in: f.sourceDirectory)
+            case 9:
+                manager.moveToTrash([f.item(source)])
+                target = try f.fm.contentsOfDirectory(at: f.trash, includingPropertiesForKeys: nil).first!
+            default:
+                let archive = f.sourceDirectory.appendingPathComponent("item.zip")
+                let compressor = f.manager()
+                compressor.compressItems([f.item(source)], in: f.sourceDirectory)
+                try await idle(compressor)
+                target = f.sourceDirectory.appendingPathComponent("item")
+                manager.extractArchive(f.item(archive))
+            }
+            try await idle(manager)
+            try expect(manager.undoStack.count == 1 && f.io.exists(target))
+            let retained = f.root.appendingPathComponent("retained-original")
+            try f.fm.moveItem(at: target, to: retained)
+            try f.write("unrelated sentinel", to: target)
+            manager.undoLastOperation()
+            try await idle(manager)
+            try expect((try? f.text(target)) == "unrelated sentinel" && f.io.exists(retained))
+            try expect(manager.undoStack.count == 1 && manager.redoStack.isEmpty)
+            try expect(manager.lastStatusMessage?.contains("tożsamości") == true)
+        }
+    }
+
+    private static func testHistoryAcceptsEditsToSameEntry() async throws {
+        let f = try Fixture()
+        let manager = f.manager()
+        let file = manager.createFile(named: "editable.txt", content: "before", in: f.destination)!
+        let originalIdentity = try FileEntryIdentity.read(file)
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data("legitimate edit".utf8))
+        try handle.close()
+        let editedIdentity = try FileEntryIdentity.read(file)
+        try expect(editedIdentity == originalIdentity)
+        manager.undoLastOperation()
+        try await idle(manager)
+        try expect(!f.io.exists(file))
+        manager.redoLastOperation()
+        try await idle(manager)
+        try expect((try? f.text(file)) == "legitimate edit")
+        let directory = manager.createFolder(named: "edited-directory", in: f.destination)!
+        try f.write("new child", to: directory.appendingPathComponent("child.txt"))
+        manager.undoLastOperation()
+        try await idle(manager)
+        try expect(!f.io.exists(directory))
+        manager.redoLastOperation()
+        try await idle(manager)
+        try expect((try? f.text(directory.appendingPathComponent("child.txt"))) == "new child")
+    }
+
+    private static func testHistoryRejectsReplacedSymlinkAndRedoEntry() async throws {
+        let f = try Fixture()
+        let source = f.sourceDirectory.appendingPathComponent("link")
+        let destination = f.destination.appendingPathComponent("link")
+        let leaf = f.root.appendingPathComponent("leaf.txt")
+        try f.write("leaf must survive", to: leaf)
+        try f.fm.createSymbolicLink(at: source, withDestinationURL: leaf)
+        let manager = f.manager()
+        manager.performTransfer(sourceURLs: [source], into: f.destination, isMove: false, explicitPolicy: .keepBoth)
+        try await idle(manager)
+        try f.fm.moveItem(at: destination, to: f.root.appendingPathComponent("old-link"))
+        try f.fm.createSymbolicLink(at: destination, withDestinationURL: leaf)
+        manager.undoLastOperation()
+        try await idle(manager)
+        try expect(manager.undoStack.count == 1 && (try? f.fm.destinationOfSymbolicLink(atPath: destination.path)) != nil)
+        try expect((try? f.text(leaf)) == "leaf must survive")
+
+        let redoManager = f.manager()
+        let file = redoManager.createFile(named: "redo.txt", content: "ours", in: f.destination)!
+        redoManager.undoLastOperation()
+        try await idle(redoManager)
+        let trashed = try f.fm.contentsOfDirectory(at: f.trash, includingPropertiesForKeys: nil).first!
+        let retained = f.root.appendingPathComponent("retained-trash-entry")
+        try f.fm.moveItem(at: trashed, to: retained)
+        try f.write("unrelated trash sentinel", to: trashed)
+        redoManager.redoLastOperation()
+        try await idle(redoManager)
+        try expect(!f.io.exists(file) && (try? f.text(trashed)) == "unrelated trash sentinel")
+        try expect(redoManager.redoStack.count == 1 && redoManager.undoStack.isEmpty)
+
+        let overwrite = try Fixture()
+        let incoming = overwrite.sourceDirectory.appendingPathComponent("item.txt")
+        let replaced = overwrite.destination.appendingPathComponent("item.txt")
+        try overwrite.write("incoming", to: incoming)
+        try overwrite.write("original", to: replaced)
+        let overwriteManager = overwrite.manager()
+        overwriteManager.performTransfer(sourceURLs: [incoming], into: overwrite.destination,
+                                         isMove: false, explicitPolicy: .overwrite)
+        try await idle(overwriteManager)
+        overwriteManager.undoLastOperation()
+        try await idle(overwriteManager)
+        try expect((try? overwrite.text(replaced)) == "original")
+        try overwrite.fm.moveItem(at: replaced, to: overwrite.root.appendingPathComponent("saved-original"))
+        try overwrite.write("replacement sentinel", to: replaced)
+        overwriteManager.redoLastOperation()
+        try await idle(overwriteManager)
+        try expect((try? overwrite.text(replaced)) == "replacement sentinel")
+        try expect(overwriteManager.redoStack.count == 1 && overwriteManager.undoStack.isEmpty)
+
+        // Failed installation + failed rollback leaves an explicit recovery action.
+        // It must still refer to the original displaced entry, not a later occupant.
+        let recovery = try Fixture()
+        let recoverySource = recovery.sourceDirectory.appendingPathComponent("item.txt")
+        let recoveryTarget = recovery.destination.appendingPathComponent("item.txt")
+        try recovery.write("incoming", to: recoverySource)
+        try recovery.write("original", to: recoveryTarget)
+        let failure = Control()
+        failure.fail = true
+        var recoveryIO = recovery.io
+        recoveryIO.move = { from, to in
+            if to == recoveryTarget && failure.fail { throw RegressionFailure(description: "Installation/rollback failed") }
+            try FileManager.default.moveItem(at: from, to: to)
+        }
+        let recoveryManager = recovery.manager(recoveryIO)
+        recoveryManager.performTransfer(sourceURLs: [recoverySource], into: recovery.destination,
+                                        isMove: false, explicitPolicy: .overwrite)
+        try await idle(recoveryManager)
+        try expect(recoveryManager.undoStack.count == 1 && !recovery.io.exists(recoveryTarget))
+        let displaced = try recovery.fm.contentsOfDirectory(at: recovery.trash, includingPropertiesForKeys: nil).first!
+        try recovery.fm.moveItem(at: displaced, to: recovery.root.appendingPathComponent("saved-displaced"))
+        try recovery.write("recovery sentinel", to: displaced)
+        failure.fail = false
+        recoveryManager.undoLastOperation()
+        try await idle(recoveryManager)
+        try expect(!recovery.io.exists(recoveryTarget) && (try? recovery.text(displaced)) == "recovery sentinel")
+        try expect(recoveryManager.undoStack.count == 1 && recoveryManager.redoStack.isEmpty)
+    }
+
+    private static func testHistoryRetainsPartialSuffixAndUnknownIdentity() async throws {
+        let f = try Fixture()
+        let a = f.sourceDirectory.appendingPathComponent("a.txt")
+        let b = f.sourceDirectory.appendingPathComponent("b.txt")
+        try f.write("a", to: a); try f.write("b", to: b)
+        let manager = f.manager()
+        manager.performTransfer(sourceURLs: [a, b], into: f.destination, isMove: false, explicitPolicy: .keepBoth)
+        try await idle(manager)
+        let targetA = f.destination.appendingPathComponent("a.txt")
+        let targetB = f.destination.appendingPathComponent("b.txt")
+        let retained = f.root.appendingPathComponent("retained-a")
+        try f.fm.moveItem(at: targetA, to: retained)
+        try f.write("sentinel", to: targetA)
+        manager.undoLastOperation()
+        try await idle(manager)
+        try expect(!f.io.exists(targetB) && (try? f.text(targetA)) == "sentinel")
+        try expect(manager.undoStack.count == 1 && manager.redoStack.count == 1)
+        try expect(manager.undoStack.last?.transactionID == manager.redoStack.last?.transactionID)
+        try f.fm.moveItem(at: targetA, to: f.root.appendingPathComponent("retained-sentinel"))
+        try f.fm.moveItem(at: retained, to: targetA)
+        manager.undoLastOperation()
+        try await idle(manager)
+        try expect(manager.undoStack.isEmpty && manager.redoStack.count == 1)
+        manager.redoLastOperation()
+        try await idle(manager)
+        try expect((try? f.text(targetA)) == "a" && (try? f.text(targetB)) == "b")
+
+        let unavailable = Control()
+        unavailable.fail = true
+        var io = f.io
+        let readIdentity = io.identity
+        io.identity = { url in
+            if unavailable.fail { throw RegressionFailure(description: "Identity unavailable") }
+            return try readIdentity(url)
+        }
+        let uncertain = f.manager(io)
+        let created = uncertain.createFile(named: "unknown.txt", content: "must survive", in: f.destination)!
+        unavailable.fail = false // Must not bind a previously unknown identity lazily.
+        uncertain.undoLastOperation()
+        try await idle(uncertain)
+        try expect((try? f.text(created)) == "must survive" && uncertain.undoStack.count == 1)
+        try expect(uncertain.redoStack.isEmpty)
+        let retryable = f.manager(io)
+        let retryFile = retryable.createFile(named: "retry.txt", content: "retry", in: f.destination)!
+        unavailable.fail = true
+        retryable.undoLastOperation()
+        try await idle(retryable)
+        try expect(f.io.exists(retryFile) && retryable.undoStack.count == 1)
+        unavailable.fail = false
+        retryable.undoLastOperation()
+        try await idle(retryable)
+        try expect(!f.io.exists(retryFile) && retryable.undoStack.isEmpty && retryable.redoStack.count == 1)
+    }
+
+    private static func testHistoryRecapturesIdentityAfterCrossVolumeStyleMove() async throws {
+        let f = try Fixture()
+        let source = f.sourceDirectory.appendingPathComponent("item.txt")
+        let target = f.destination.appendingPathComponent("item.txt")
+        try f.write("cross-volume-style", to: source)
+        var io = f.io
+        io.move = { from, to in
+            // Emulate FileManager's copy/remove move across volumes: new inode.
+            try FileManager.default.copyItem(at: from, to: to)
+            try FileManager.default.removeItem(at: from)
+        }
+        let manager = f.manager(io)
+        manager.performTransfer(sourceURLs: [source], into: f.destination, isMove: true, explicitPolicy: .keepBoth)
+        try await idle(manager)
+        try expect(!f.io.exists(source) && f.io.exists(target))
+        manager.undoLastOperation()
+        try await idle(manager)
+        try expect(f.io.exists(source) && !f.io.exists(target))
+        manager.redoLastOperation()
+        try await idle(manager)
+        try expect(!f.io.exists(source) && (try? f.text(target)) == "cross-volume-style")
+        try expect(manager.redoStack.isEmpty && manager.undoStack.count == 1)
     }
 
     private static func testTransferPreflightStaysResponsiveAndOwned() async throws {

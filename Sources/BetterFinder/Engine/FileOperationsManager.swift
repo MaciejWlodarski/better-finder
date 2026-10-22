@@ -87,10 +87,6 @@ public struct GitStatusSnapshot: Sendable {
 
 public struct UndoableFileOperation {
     public enum Kind {
-        case moved(pairs: [(from: URL, to: URL)])
-        case copied(created: [URL])
-        case created(url: URL)
-        case trashed(pairs: [(original: URL, trashed: URL)])
         case actions([FileHistoryAction])
     }
     /// Both stacks retain this identity while a transaction is only partly applied.
@@ -107,12 +103,72 @@ public struct UndoableFileOperation {
 
 /// Actions describe the next direction to execute, so replacement undo and redo keep
 /// both the incoming item and the displaced original, including after a partial failure.
-public enum FileHistoryAction {
-    case move(from: URL, to: URL)
-    case trash(URL)
+/// No-follow identity of the directory entry, not the data its symlink points
+/// at. Content, size, mtime and permissions deliberately do not define identity:
+/// legitimate edits to the same object must not invalidate its history.
+struct FileEntryIdentity: Equatable, Sendable {
+    let device: Int64
+    let inode: UInt64
+    let type: UInt32
+    let generation: UInt32
+    let birthSeconds: Int64
+    let birthNanoseconds: Int64
+
+    static func read(_ url: URL) throws -> FileEntryIdentity {
+        var value = stat()
+        guard url.path.withCString({ lstat($0, &value) }) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard value.st_ino != 0 else {
+            throw FileOperationFailure(message: "Wolumin nie udostępnia wiarygodnej tożsamości elementu.")
+        }
+        return FileEntryIdentity(device: Int64(value.st_dev), inode: UInt64(value.st_ino),
+            type: UInt32(value.st_mode & S_IFMT), generation: UInt32(value.st_gen),
+            birthSeconds: Int64(value.st_birthtimespec.tv_sec),
+            birthNanoseconds: Int64(value.st_birthtimespec.tv_nsec))
+    }
+}
+
+public struct FileHistoryAction {
+    enum Operation {
+        case move(from: URL, to: URL)
+        case restore(from: URL, to: URL)
+        case trash(URL)
+    }
+    let operation: Operation
+    let identity: FileEntryIdentity?
+
+    private init(_ operation: Operation, source: URL, io: FileOperationIO) {
+        self.operation = operation
+        self.identity = try? io.identity(source)
+    }
+
+    // Capture at operation completion, NEVER when the user later presses Undo.
+    // Failed identity reads remain explicit unexecutable recovery records.
+    static func move(from: URL, to: URL, io: FileOperationIO = .live) -> Self {
+        Self(.move(from: from, to: to), source: from, io: io)
+    }
+    static func restore(from: URL, to: URL, io: FileOperationIO = .live) -> Self {
+        Self(.restore(from: from, to: to), source: from, io: io)
+    }
+    static func trash(_ url: URL, io: FileOperationIO = .live) -> Self {
+        Self(.trash(url), source: url, io: io)
+    }
+    var sourceURL: URL {
+        switch operation {
+        case .move(let from, _), .restore(let from, _): return from
+        case .trash(let url): return url
+        }
+    }
+    func validate(io: FileOperationIO) throws {
+        guard let identity, let current = try? io.identity(sourceURL), current == identity else {
+            throw FileOperationFailure(message: "Nie wykonano historii dla „\(sourceURL.lastPathComponent)”: obiekt zmienił się lub nie można potwierdzić jego tożsamości. Zachowano oczekującą operację.")
+        }
+    }
 }
 
 struct FileOperationIO {
+    var identity: (URL) throws -> FileEntryIdentity
     var resolveEntryPath: (URL) -> String
     var resolveDirectoryPath: (URL) -> String
     var exists: (URL) -> Bool
@@ -124,6 +180,7 @@ struct FileOperationIO {
     var removeEmptyDirectory: (URL) -> Void
 
     static let live = FileOperationIO(
+        identity: FileEntryIdentity.read,
         resolveEntryPath: { FileTransferPaths.entryPath($0) },
         resolveDirectoryPath: { $0.resolvingSymlinksInPath().standardizedFileURL.path },
         exists: { (try? FileManager.default.attributesOfItem(atPath: $0.path)) != nil },
@@ -228,35 +285,44 @@ enum SafeFileReplacement {
         let staged = stagingDirectory.appendingPathComponent(source.lastPathComponent)
         try io.createDirectory(stagingDirectory)
         var displaced: URL?
+        var restoreDisplaced: FileHistoryAction?
+        var restoreStaged: FileHistoryAction?
         do {
             if isMove {
                 try io.move(source, staged)
             } else {
                 try io.copy(source, staged)
             }
+            if isMove { restoreStaged = .move(from: staged, to: source, io: io) }
             let original = try io.trash(target)
             displaced = original
+            restoreDisplaced = .move(from: original, to: target, io: io)
             try io.move(staged, target)
             io.removeEmptyDirectory(stagingDirectory)
-            let undoIncoming: FileHistoryAction = isMove ? .move(from: target, to: source) : .trash(target)
-            return [undoIncoming, .move(from: original, to: target)]
+            let undoIncoming: FileHistoryAction = isMove ? .move(from: target, to: source, io: io) : .trash(target, io: io)
+            return [undoIncoming, restoreDisplaced!]
         } catch {
             var details = [error.localizedDescription]
             var recoveryActions: [FileHistoryAction] = []
             if let displaced {
                 do {
+                    try restoreDisplaced?.validate(io: io)
                     try io.move(displaced, target)
                 } catch {
                     details.append("Nie przywrócono oryginału; zachowano go w \(displaced.path): \(error.localizedDescription)")
-                    recoveryActions.append(.move(from: displaced, to: target))
+                    if let restoreDisplaced { recoveryActions.append(restoreDisplaced) }
                 }
             }
             if isMove && io.exists(staged) {
+                // A failed move may have left an owned partial entry in staging.
+                // Bind that recovery entry now; never store a bare deferred path.
+                let recovery = restoreStaged ?? .move(from: staged, to: source, io: io)
                 do {
+                    try recovery.validate(io: io)
                     try io.move(staged, source)
                 } catch {
                     details.append("Plik źródłowy zachowano w \(staged.path): \(error.localizedDescription)")
-                    recoveryActions.append(.move(from: staged, to: source))
+                    recoveryActions.append(recovery)
                 }
             }
             // Keep partial copies/moves for recovery; never remove an original as a fallback.
@@ -282,15 +348,22 @@ enum FileHistoryExecutor {
         var result = Result()
         for (index, action) in actions.enumerated() {
             do {
-                switch action {
+                try action.validate(io: io)
+                switch action.operation {
                 case .move(let from, let to):
                     try io.move(from, to)
-                    result.inverse.append(.move(from: to, to: from))
+                    result.inverse.append(.move(from: to, to: from, io: io))
+                    result.touchedDirectories.insert(from.deletingLastPathComponent().path)
+                    result.touchedDirectories.insert(to.deletingLastPathComponent().path)
+                case .restore(let from, let requested):
+                    let to = io.exists(requested) ? FileOperationsManager.uniqueURL(for: requested) : requested
+                    try io.move(from, to)
+                    result.inverse.append(.move(from: to, to: from, io: io))
                     result.touchedDirectories.insert(from.deletingLastPathComponent().path)
                     result.touchedDirectories.insert(to.deletingLastPathComponent().path)
                 case .trash(let url):
                     let trashed = try io.trash(url)
-                    result.inverse.append(.move(from: trashed, to: url))
+                    result.inverse.append(.move(from: trashed, to: url, io: io))
                     result.touchedDirectories.insert(url.deletingLastPathComponent().path)
                 }
                 result.completedCount += 1
@@ -455,19 +528,7 @@ public final class FileOperationsManager: ObservableObject {
         Task.detached(priority: .userInitiated) { [self] in
             let actions: [FileHistoryAction]
             switch op.kind {
-            case .moved(let pairs):
-                actions = pairs.reversed().map { .move(from: $0.to, to: $0.from) }
-            case .copied(let created):
-                actions = created.reversed().map { .trash($0) }
-            case .created(let url):
-                actions = [.trash(url)]
-            case .trashed(let pairs):
-                actions = pairs.map {
-                    let destination = io.exists($0.original) ? Self.uniqueURL(for: $0.original) : $0.original
-                    return .move(from: $0.trashed, to: destination)
-                }
-            case .actions(let stored):
-                actions = stored
+            case .actions(let stored): actions = stored
             }
             let result = FileHistoryExecutor.execute(actions, io: io)
             for dir in result.touchedDirectories {
@@ -746,10 +807,10 @@ public final class FileOperationsManager: ObservableObject {
                         itemUndo = try SafeFileReplacement.replace(source: src, target: targetURL, isMove: doMove, io: io)
                     } else if doMove {
                         try io.move(src, targetURL)
-                        itemUndo = [.move(from: targetURL, to: src)]
+                        itemUndo = [.move(from: targetURL, to: src, io: io)]
                     } else {
                         try io.copy(src, targetURL)
-                        itemUndo = [.trash(targetURL)]
+                        itemUndo = [.trash(targetURL, io: io)]
                     }
                     undoActions.append(contentsOf: itemUndo.reversed())
                     if doMove {
@@ -835,7 +896,7 @@ public final class FileOperationsManager: ObservableObject {
             let target = try Self.createUniqueItem(at: directory.appendingPathComponent(safeName)) { target in
                 try fm.createDirectory(at: target, withIntermediateDirectories: false)
             }
-            pushUndo(UndoableFileOperation(label: "Utworzenie folderu \(target.lastPathComponent)", kind: .created(url: target)))
+            pushUndo(UndoableFileOperation(label: "Utworzenie folderu \(target.lastPathComponent)", kind: .actions([.trash(target, io: fileIO)])))
             self.enqueueDirectoryRefresh(directory.path)
             lastStatusMessage = "Utworzono folder \(target.lastPathComponent)"
             return target
@@ -862,7 +923,7 @@ public final class FileOperationsManager: ObservableObject {
             if safeName.hasSuffix(".sh") || content.hasPrefix("#!") {
                 try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target.path)
             }
-            pushUndo(UndoableFileOperation(label: "Utworzenie pliku \(target.lastPathComponent)", kind: .created(url: target)))
+            pushUndo(UndoableFileOperation(label: "Utworzenie pliku \(target.lastPathComponent)", kind: .actions([.trash(target, io: fileIO)])))
             self.enqueueDirectoryRefresh(directory.path)
             lastStatusMessage = "Utworzono plik \(target.lastPathComponent)"
             return target
@@ -892,7 +953,7 @@ public final class FileOperationsManager: ObservableObject {
         }
         do {
             try FileManager.default.moveItem(at: item.url, to: dst)
-            pushUndo(UndoableFileOperation(label: "Zmiana nazwy \(item.name) → \(safeName)", kind: .moved(pairs: [(from: item.url, to: dst)])))
+            pushUndo(UndoableFileOperation(label: "Zmiana nazwy \(item.name) → \(safeName)", kind: .actions([.move(from: dst, to: item.url, io: fileIO)])))
             self.enqueueDirectoryRefresh(item.parentPath)
             lastStatusMessage = "Zmieniono nazwę na \(safeName)"
             return dst
@@ -974,6 +1035,7 @@ public final class FileOperationsManager: ObservableObject {
         let io = fileIO
         Task.detached(priority: .userInitiated) { [self] in
             var created: [URL] = []
+            var undo: [FileHistoryAction] = []
             var errors: [String] = []
             var touched = Set<String>()
             for (index, item) in items.enumerated() {
@@ -985,6 +1047,7 @@ public final class FileOperationsManager: ObservableObject {
                 do {
                     try io.copy(item.url, destination)
                     created.append(destination)
+                    undo.append(.trash(destination, io: io))
                     touched.insert(item.parentPath)
                 } catch {
                     errors.append("\(item.name): \(error.localizedDescription)")
@@ -992,11 +1055,12 @@ public final class FileOperationsManager: ObservableObject {
             }
             for directory in touched { self.enqueueDirectoryRefresh(directory) }
             let finalCreated = created
+            let finalUndo = Array(undo.reversed())
             let finalErrors = errors
             let finalTouched = touched
             await MainActor.run {
                 if !finalCreated.isEmpty {
-                    self.pushUndo(UndoableFileOperation(label: "Duplikacja \(finalCreated.count) elem.", kind: .copied(created: finalCreated)))
+                    self.pushUndo(UndoableFileOperation(label: "Duplikacja \(finalCreated.count) elem.", kind: .actions(finalUndo)))
                 }
                 for directory in finalTouched { FolderSizeCache.shared.invalidate(containing: directory) }
                 self.lastStatusMessage = finalErrors.isEmpty
@@ -1013,6 +1077,7 @@ public final class FileOperationsManager: ObservableObject {
         guard !items.isEmpty, beginMutation(title: "Przenoszenie do Kosza", totalCount: items.count) else { return }
         defer { activeTransfer = nil }
         var trashedPairs: [(original: URL, trashed: URL)] = []
+        var undo: [FileHistoryAction] = []
         var failures = 0
         var validationError: String?
         for item in items {
@@ -1027,6 +1092,7 @@ public final class FileOperationsManager: ObservableObject {
             do {
                 let trashed = try fileIO.trash(item.url)
                 trashedPairs.append((original: item.url, trashed: trashed))
+                undo.append(.restore(from: trashed, to: item.url, io: fileIO))
                 self.enqueueDirectoryRefresh(item.parentPath)
                 FolderSizeCache.shared.invalidate(containing: item.parentPath)
             } catch {
@@ -1034,7 +1100,7 @@ public final class FileOperationsManager: ObservableObject {
             }
         }
         if !trashedPairs.isEmpty {
-            pushUndo(UndoableFileOperation(label: "Kosz (\(trashedPairs.count) elem.)", kind: .trashed(pairs: trashedPairs)))
+            pushUndo(UndoableFileOperation(label: "Kosz (\(trashedPairs.count) elem.)", kind: .actions(undo)))
         }
         if let validationError {
             lastStatusMessage = "Przerwano usuwanie: \(validationError) (przeniesiono \(trashedPairs.count) elem.)"
@@ -1145,6 +1211,7 @@ public final class FileOperationsManager: ObservableObject {
         Task.detached(priority: .userInitiated) { [self] in
             var staging: URL?
             var published: URL?
+            var undo: [FileHistoryAction] = []
             var failure: String?
             do {
                 let root = try SafeArchivePublication.stagingDirectory(in: workingDir)
@@ -1156,6 +1223,7 @@ public final class FileOperationsManager: ObservableObject {
                 published = try Self.createUniqueItem(at: requestedURL) { candidate in
                     try io.publishExclusive(stagedURL, candidate)
                 }
+                if let published { undo = [.trash(published, io: io)] }
                 io.removeEmptyDirectory(root)
             } catch {
                 failure = error.localizedDescription
@@ -1168,10 +1236,11 @@ public final class FileOperationsManager: ObservableObject {
             }
             self.enqueueDirectoryRefresh(workingDir.path)
             let finalURL = published
+            let finalUndo = undo
             let finalError = failure
             await MainActor.run {
                 if let finalURL {
-                    self.pushUndo(UndoableFileOperation(label: "Utworzenie archiwum \(finalURL.lastPathComponent)", kind: .created(url: finalURL)))
+                    self.pushUndo(UndoableFileOperation(label: "Utworzenie archiwum \(finalURL.lastPathComponent)", kind: .actions(finalUndo)))
                     self.lastStatusMessage = "Utworzono archiwum \(finalURL.lastPathComponent)"
                 } else {
                     self.lastStatusMessage = finalError ?? "Kompresja nie powiodła się"
@@ -1212,6 +1281,7 @@ public final class FileOperationsManager: ObservableObject {
         Task.detached(priority: .userInitiated) { [self] in
             var staging: URL?
             var published: URL?
+            var undo: [FileHistoryAction] = []
             var failure: String?
             do {
                 let root = try SafeArchivePublication.stagingDirectory(in: parentDir)
@@ -1234,6 +1304,7 @@ public final class FileOperationsManager: ObservableObject {
                 published = try Self.createUniqueItem(at: requestedURL) { candidate in
                     try io.publishExclusive(stagedURL, candidate)
                 }
+                if let published { undo = [.trash(published, io: io)] }
                 io.removeEmptyDirectory(root)
             } catch {
                 failure = error.localizedDescription
@@ -1245,10 +1316,11 @@ public final class FileOperationsManager: ObservableObject {
             }
             self.enqueueDirectoryRefresh(parentDir.path)
             let finalURL = published
+            let finalUndo = undo
             let finalError = failure
             await MainActor.run {
                 if let finalURL {
-                    self.pushUndo(UndoableFileOperation(label: "Rozpakowanie \(item.name)", kind: .created(url: finalURL)))
+                    self.pushUndo(UndoableFileOperation(label: "Rozpakowanie \(item.name)", kind: .actions(finalUndo)))
                     self.lastStatusMessage = "Rozpakowano do: \(finalURL.lastPathComponent)"
                 } else {
                     self.lastStatusMessage = finalError ?? "Rozpakowanie nie powiodło się"
@@ -1488,14 +1560,10 @@ public final class FileOperationsManager: ObservableObject {
     nonisolated private static func referencesRemovedItems(_ kind: UndoableFileOperation.Kind, removed: [URL]) -> Bool {
         let urls: [URL]
         switch kind {
-        case .moved(let pairs): urls = pairs.flatMap { [$0.from, $0.to] }
-        case .copied(let created): urls = created
-        case .created(let url): urls = [url]
-        case .trashed(let pairs): urls = pairs.flatMap { [$0.original, $0.trashed] }
         case .actions(let actions):
             urls = actions.flatMap { action -> [URL] in
-                switch action {
-                case .move(let from, let to): return [from, to]
+                switch action.operation {
+                case .move(let from, let to), .restore(let from, let to): return [from, to]
                 case .trash(let url): return [url]
                 }
             }

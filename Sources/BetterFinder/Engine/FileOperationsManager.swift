@@ -1376,6 +1376,10 @@ public final class FileOperationsManager: ObservableObject {
         // Remove exactly Git's delimiter, not whitespace that belongs to a path.
         if gitRoot.hasSuffix("\n") { gitRoot.removeLast() }
         guard !gitRoot.isEmpty else { return nil }
+        // Git emits physical /private/var paths on macOS; Foundation's file
+        // URLs use the normalized /var namespace. Normalize once off-main so
+        // status keys match the directory crawler and successful-empty clears.
+        gitRoot = URL(fileURLWithPath: gitRoot).standardizedFileURL.resolvingSymlinksInPath().path
 
         // Status may run clean/process filters from .gitattributes when comparing
         // a tracked same-size edit. Enumerate keys without running Git plumbing,

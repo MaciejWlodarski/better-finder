@@ -98,6 +98,7 @@ public struct ParsedFSearchQuery: Sendable {
     public var limit: Int = 500
     public var fuzzyTypoTolerance: Bool = true
     public var pills: [ActiveFilterPill] = []
+    public var validationError: String?
 
     public var isEmpty: Bool {
         rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -122,13 +123,17 @@ public struct ParsedFSearchQuery: Sendable {
         var result = ParsedFSearchQuery(rawQuery: input)
         result.fuzzyTypoTolerance = fuzzyEnabled
         let tokens = tokenize(input)
+        if tokens.unterminatedQuote {
+            result.validationError = "Unclosed quotation mark in search query."
+            return result
+        }
 
-        for (idx, token) in tokens.enumerated() {
+        for (idx, token) in tokens.values.enumerated() {
             if token.isEmpty { continue }
 
             if let colonIndex = token.firstIndex(of: ":"), colonIndex != token.startIndex {
                 let rawKey = String(token[..<colonIndex]).lowercased()
-                let val = String(token[token.index(after: colonIndex)...])
+                let val = decodeQuotedValue(String(token[token.index(after: colonIndex)...]))
                 if !val.isEmpty {
                     let isNegated = rawKey.hasPrefix("!") || rawKey.hasPrefix("-")
                     let key = isNegated ? String(rawKey.dropFirst()) : rawKey
@@ -191,6 +196,8 @@ public struct ParsedFSearchQuery: Sendable {
                             ))
                             continue
                         }
+                        result.validationError = "Invalid or out-of-range size: \(val)"
+                        return result
 
                     case "mtime", "modified", "age", "dm":
                         if let mf = parseMTimeFilter(val) {
@@ -204,6 +211,8 @@ public struct ParsedFSearchQuery: Sendable {
                             ))
                             continue
                         }
+                        result.validationError = "Invalid or out-of-range modification age: \(val)"
+                        return result
 
                     case "in", "path", "dir", "folder":
                         result.pathSubstrings.append(val.lowercased())
@@ -229,6 +238,11 @@ public struct ParsedFSearchQuery: Sendable {
                         continue
 
                     case "regex", "re":
+                        do { _ = try NSRegularExpression(pattern: val, options: [.caseInsensitive]) }
+                        catch {
+                            result.validationError = "Invalid regular expression: \(error.localizedDescription)"
+                            return result
+                        }
                         result.regexPattern = val
                         result.pills.append(ActiveFilterPill(
                             id: "\(idx)-\(token)",
@@ -292,7 +306,7 @@ public struct ParsedFSearchQuery: Sendable {
                 result.terms.append(.suffix(term))
             } else if (token.hasPrefix("\"") && token.hasSuffix("\"") && token.count > 2) ||
                       (token.hasPrefix("'") && token.hasSuffix("'") && token.count > 2) {
-                let inner = String(token.dropFirst().dropLast()).lowercased()
+                let inner = decodeQuotedValue(token).lowercased()
                 result.terms.append(.exact(inner))
             } else {
                 let lower = token.lowercased()
@@ -348,33 +362,54 @@ public struct ParsedFSearchQuery: Sendable {
         return mask
     }
 
-    private static func tokenize(_ input: String) -> [String] {
+    // Keep the original spelling for removable filter pills. Decode only syntax
+    // quotes and escaped quotes/backslashes, preserving regex escapes such as \d.
+    private static func tokenize(_ input: String) -> (values: [String], unterminatedQuote: Bool) {
         var tokens: [String] = []
         var current = ""
-        var inQuote: Character? = nil
-
+        var inQuote: Character?
+        var escaped = false
         for ch in input {
-            if let q = inQuote {
+            if escaped {
                 current.append(ch)
-                if ch == q {
-                    inQuote = nil
-                }
-            } else if ch == "\"" || ch == "'" {
+                escaped = false
+            } else if ch == "\\" {
+                current.append(ch)
+                escaped = true
+            } else if let quote = inQuote {
+                current.append(ch)
+                if ch == quote { inQuote = nil }
+            } else if (ch == "\"" || ch == "'"), current.isEmpty || current.hasSuffix(":") {
                 inQuote = ch
                 current.append(ch)
             } else if ch.isWhitespace {
-                if !current.isEmpty {
-                    tokens.append(current)
-                    current = ""
-                }
+                if !current.isEmpty { tokens.append(current); current = "" }
             } else {
                 current.append(ch)
             }
         }
-        if !current.isEmpty {
-            tokens.append(current)
+        if !current.isEmpty { tokens.append(current) }
+        return (tokens, inQuote != nil)
+    }
+
+    private static func decodeQuotedValue(_ raw: String) -> String {
+        let quoted = raw.count >= 2 && ((raw.first == "\"" && raw.last == "\"") ||
+            (raw.first == "'" && raw.last == "'"))
+        let chars = Array(quoted ? String(raw.dropFirst().dropLast()) : raw)
+        var output = ""
+        var index = 0
+        while index < chars.count {
+            let ch = chars[index]
+            if ch == "\\", index + 1 < chars.count,
+               chars[index + 1] == "\\" || chars[index + 1] == "\"" || chars[index + 1] == "'" {
+                output.append(chars[index + 1])
+                index += 2
+            } else {
+                output.append(ch)
+                index += 1
+            }
         }
-        return tokens
+        return output
     }
 
     private static func parseSizeFilter(_ raw: String) -> SizeFilter? {
@@ -383,7 +418,7 @@ public struct ParsedFSearchQuery: Sendable {
             let parts = lower.components(separatedBy: "..")
             guard parts.count == 2,
                   let low = parseByteQuantity(parts[0]),
-                  let high = parseByteQuantity(parts[1]) else { return nil }
+                  let high = parseByteQuantity(parts[1]), low <= high else { return nil }
             return SizeFilter(op: .range, bytes: low, upperBytes: high, rawText: raw)
         }
 
@@ -418,7 +453,8 @@ public struct ParsedFSearchQuery: Sendable {
         var numStr = ""
         var unitStr = ""
         for ch in s {
-            if ch.isNumber || ch == "." {
+            if ch.isASCII && (ch.isNumber || ch == ".") {
+                guard unitStr.isEmpty else { return nil }
                 numStr.append(ch)
             } else {
                 unitStr.append(ch)
@@ -433,7 +469,14 @@ public struct ParsedFSearchQuery: Sendable {
         case "b", "": mult = 1
         default: return nil
         }
-        return Int64(val * mult)
+        if let integer = Int64(numStr) {
+            let (bytes, overflow) = integer.multipliedReportingOverflow(by: Int64(mult))
+            return !overflow && bytes >= 0 ? bytes : nil
+        }
+        let scaled = val * mult
+        guard scaled.isFinite, scaled >= 0 else { return nil }
+        // Int64.max rounds up to 2^63 as Double; a <= max check is unsafe.
+        return Int64(exactly: scaled.rounded(.towardZero))
     }
 
     private static func parseMTimeFilter(_ raw: String) -> MTimeFilter? {
@@ -458,7 +501,8 @@ public struct ParsedFSearchQuery: Sendable {
         var numStr = ""
         var unitStr = ""
         for ch in rest {
-            if ch.isNumber || ch == "." {
+            if ch.isASCII && (ch.isNumber || ch == ".") {
+                guard unitStr.isEmpty else { return nil }
                 numStr.append(ch)
             } else {
                 unitStr.append(ch)
@@ -476,6 +520,8 @@ public struct ParsedFSearchQuery: Sendable {
         case "y", "yr", "year", "years": mult = 365 * 86_400
         default: return nil
         }
-        return MTimeFilter(op: op, secondsAgo: val * mult, rawText: raw)
+        let seconds = val * mult
+        guard seconds.isFinite, seconds >= 0 else { return nil }
+        return MTimeFilter(op: op, secondsAgo: seconds, rawText: raw)
     }
 }

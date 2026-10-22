@@ -138,7 +138,7 @@ public struct InspectorPreviewView: View {
                             metadataRow(
                                 label: "Rozmiar",
                                 value: item.isDirectory
-                                    ? (folderSizes.size(for: item.path).map(FormatHelpers.formatBytes) ?? "Obliczanie...")
+                                    ? (folderSizes.displaySize(for: item.path) ?? "Obliczanie...")
                                     : FormatHelpers.formatBytes(item.size)
                             )
                             metadataRow(label: "Zmodyfikowano", value: FormatHelpers.formatDate(item.modificationDate))
@@ -218,7 +218,7 @@ public struct InspectorPreviewView: View {
                             }
                             HStack(spacing: 6) {
                                 inspectorActionButton(title: "Duplikuj", icon: "plus.square.on.square") {
-                                    _ = fileOps.duplicateItems([item])
+                                    fileOps.duplicateItems([item])
                                     activeTab.reloadDirectory()
                                 }
                                 inspectorActionButton(title: "Kosz", icon: "trash", isDestructive: true) {
@@ -246,6 +246,11 @@ public struct InspectorPreviewView: View {
                     sha256Hash = nil
                     md5Hash = nil
                     loadPreviewAndMetadata(for: item)
+                }
+                .onChange(of: folderSizes.result(for: item.path)) { _, result in
+                    if item.isDirectory && result == nil {
+                        folderSizes.requestSizeIfNeeded(for: item.path)
+                    }
                 }
                 .onDisappear {
                     hashRequestID = UUID()
@@ -298,7 +303,7 @@ public struct InspectorPreviewView: View {
     private var selectionSummary: some View {
         let items = activeTab.selectedItems
         let folders = items.filter(\.isDirectory)
-        let knownBytes = items.reduce(Int64(0)) { $0 + ($1.isDirectory ? (folderSizes.size(for: $1.path) ?? 0) : $1.size) }
+        let knownBytes = items.reduce(Int64(0)) { $0 + ($1.isDirectory ? (folderSizes.result(for: $1.path)?.bytes ?? 0) : $1.size) }
         let hasUnknownSize = folders.contains { folderSizes.size(for: $0.path) == nil }
         return VStack(alignment: .leading, spacing: 18) {
             Image(systemName: "doc.on.doc")
@@ -324,6 +329,11 @@ public struct InspectorPreviewView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task(id: items.map(\.path)) {
             for folder in folders { folderSizes.requestSizeIfNeeded(for: folder.path) }
+        }
+        .onChange(of: folderSizes.results) { _, _ in
+            for folder in folders where folderSizes.result(for: folder.path) == nil {
+                folderSizes.requestSizeIfNeeded(for: folder.path)
+            }
         }
     }
 
@@ -351,6 +361,7 @@ public struct InspectorPreviewView: View {
         }
         .padding(8)
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+        .disabled(fileOps.isBusy)
     }
 
     private func chmodBitGroup(label: String, rBit: UInt16, wBit: UInt16, xBit: UInt16, item: FileItem) -> some View {
@@ -385,8 +396,10 @@ public struct InspectorPreviewView: View {
     }
 
     private func applyChmod(_ mode: UInt16, for item: FileItem) {
-        currentModeBits = mode & 0o777
-        fileOps.setPosixPermissions(currentModeBits, for: item)
+        let requestedMode = mode & 0o777
+        guard !activeTab.actionItems(for: item).isEmpty,
+              fileOps.setPosixPermissions(requestedMode, for: item) else { return }
+        currentModeBits = requestedMode
         posixPermissionsString = String(format: "%@ (%03o)", Self.formatModeBits(currentModeBits), currentModeBits)
     }
 

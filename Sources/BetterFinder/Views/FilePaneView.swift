@@ -43,6 +43,20 @@ public struct FilePaneView: View {
         VStack(spacing: 0) {
             PathBreadcrumbBar(appState: appState, pane: pane)
 
+            if let diagnostic = pane.searchDiagnostic {
+                Label(diagnostic, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+            } else if pane.searchIsPartial {
+                Text("Wyniki częściowe: nie przeszukano wszystkich plików.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .padding(6)
+            }
+
             if pane.currentURL.path == "\(NSHomeDirectory())/.Trash" {
                 trashActionBanner
             }
@@ -91,12 +105,15 @@ public struct FilePaneView: View {
         .coordinateSpace(name: "FilePaneSpace")
         .background(NativeFileDragSource(pane: pane, frames: dragFrames, isActive: isFocusedPane, activate: activatePane))
         .onPreferenceChange(FileDragFramesKey.self) { dragFrames = $0 }
+        .onChange(of: folderSizes.results) { _, _ in
+            if pane.sortField == .size { pane.applySortChange() }
+        }
         .simultaneousGesture(TapGesture().onEnded { activatePane() })
         .sheet(isPresented: Binding(
             get: { pane.renamingItemPath != nil },
             set: { if !$0 { pane.renamingItemPath = nil } }
         )) {
-            if let item = pane.displayedItems.first(where: { $0.path == pane.renamingItemPath }) {
+            if let item = pane.renamingItem {
                 RenameItemSheet(item: item, pane: pane)
             }
         }
@@ -273,8 +290,9 @@ public struct FilePaneView: View {
             // Size Column
             Group {
                 if item.isDirectory {
-                    if let folderBytes = folderSizes.size(for: item.path) {
-                        Text(FormatHelpers.formatBytes(folderBytes))
+                    if let folderSize = folderSizes.displaySize(for: item.path) {
+                        Text(folderSize)
+                            .help(folderSizes.size(for: item.path) == nil ? "Dolne oszacowanie: skan osiągnął limit lub nie odczytał części katalogów." : "Pełny rozmiar folderu")
                     } else {
                         Text("—")
                             .onAppear {
@@ -412,13 +430,18 @@ public struct FilePaneView: View {
 
                             Text(
                                 item.isDirectory
-                                ? (folderSizes.size(for: item.path).map(FormatHelpers.formatBytes) ?? "Folder")
+                                ? (folderSizes.displaySize(for: item.path) ?? "Folder")
                                 : FormatHelpers.formatBytes(item.size)
                             )
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                             .onAppear {
                                 if item.isDirectory {
+                                    folderSizes.requestSizeIfNeeded(for: item.path)
+                                }
+                            }
+                            .onChange(of: folderSizes.result(for: item.path)) { _, result in
+                                if item.isDirectory && result == nil {
                                     folderSizes.requestSizeIfNeeded(for: item.path)
                                 }
                             }
@@ -561,7 +584,7 @@ public struct FilePaneView: View {
             Image(systemName: pane.searchQuery.isEmpty ? "folder" : "magnifyingglass")
                 .font(.system(size: 42, weight: .ultraLight))
                 .foregroundStyle(.tertiary)
-            Text(pane.searchQuery.isEmpty ? "Ten folder jest pusty" : "Brak pasujących plików")
+            Text(pane.searchQuery.isEmpty ? "Ten folder jest pusty" : (pane.searchDiagnostic != nil || pane.searchIsPartial ? "Brak wyników w sprawdzonym zakresie" : "Brak pasujących plików"))
                 .font(.system(size: 17, weight: .semibold))
             Text(pane.searchQuery.isEmpty ? "Przeciągnij tutaj pliki lub utwórz nowy folder."
                  : "Zmień zapytanie, usuń filtry lub poszerz zakres wyszukiwania.")
@@ -626,6 +649,7 @@ public struct FilePaneView: View {
     }
 
     private func openOrEnterItem(_ item: FileItem) {
+        guard !pane.actionItems(for: item).isEmpty else { return }
         if item.isDirectory && item.fileExtension.lowercased() != "app" {
             pane.navigate(to: item.url)
         } else {
@@ -637,7 +661,8 @@ public struct FilePaneView: View {
 
     @ViewBuilder
     private func itemContextMenu(for item: FileItem) -> some View {
-        let targetItems: [FileItem] = pane.selectedPaths.contains(item.path) ? pane.selectedItems : [item]
+        // Resolve inside the action, not while the menu captures an old row.
+        let targetItems = { pane.actionItems(for: item) }
 
         Button {
             openOrEnterItem(item)
@@ -650,6 +675,7 @@ public struct FilePaneView: View {
         }
 
         Button {
+            guard !pane.actionItems(for: item).isEmpty else { return }
             activatePane()
             pane.select(item)
             appState.toggleQuickLook()
@@ -659,6 +685,7 @@ public struct FilePaneView: View {
 
         if !pane.searchQuery.isEmpty {
             Button {
+                guard !pane.actionItems(for: item).isEmpty else { return }
                 let parentURL = URL(fileURLWithPath: item.parentPath, isDirectory: true)
                 pane.searchQuery = ""
                 pane.navigate(to: parentURL)
@@ -675,7 +702,7 @@ public struct FilePaneView: View {
             ForEach(FinderTagColor.allCases) { tagColor in
                 let hasTag = item.tags.contains(tagColor)
                 Button {
-                    fileOps.toggleTag(tagColor, for: targetItems)
+                    fileOps.toggleTag(tagColor, for: targetItems())
                     pane.reloadDirectory()
                 } label: {
                     Label(
@@ -687,14 +714,14 @@ public struct FilePaneView: View {
             if !item.tags.isEmpty {
                 Divider()
                 Button("Usuń wszystkie tagi", role: .destructive) {
-                    fileOps.clearTags(for: targetItems)
+                    fileOps.clearTags(for: targetItems())
                     pane.reloadDirectory()
                 }
             }
         }
 
         Button {
-            fileOps.showShareSheet(for: targetItems)
+            fileOps.showShareSheet(for: targetItems())
         } label: {
             Label("Udostępnij (AirDrop, Wiadomości...)", systemImage: "square.and.arrow.up")
         }
@@ -702,13 +729,13 @@ public struct FilePaneView: View {
         Divider()
 
         Button {
-            fileOps.cutItems(targetItems)
+            fileOps.cutItems(targetItems())
         } label: {
             Label("Wytnij (Cmd+X)", systemImage: "scissors")
         }
 
         Button {
-            fileOps.copyItems(targetItems)
+            fileOps.copyItems(targetItems())
         } label: {
             Label("Kopiuj (Cmd+C)", systemImage: "doc.on.doc")
         }
@@ -725,26 +752,28 @@ public struct FilePaneView: View {
         Button {
             activatePane()
             pane.select(item)
+            guard !pane.actionItems(for: item).isEmpty else { return }
             pane.renamingItemPath = item.path
         } label: {
             Label("Zmień nazwę...", systemImage: "pencil")
         }
 
         Button {
-            _ = fileOps.duplicateItems(targetItems)
+            fileOps.duplicateItems(targetItems())
             pane.reloadDirectory()
         } label: {
             Label("Duplikuj (Cmd+D)", systemImage: "plus.square.on.square")
         }
 
         Button {
-            fileOps.compressItems(targetItems, in: pane.currentURL)
+            fileOps.compressItems(targetItems(), in: pane.currentURL)
         } label: {
             Label("Kompresuj do ZIP", systemImage: "doc.zipper")
         }
 
         if item.isExtractableArchive {
             Button {
+                guard !pane.actionItems(for: item).isEmpty else { return }
                 fileOps.extractArchive(item)
             } label: {
                 Label("Rozpakuj archiwum tutaj", systemImage: "archivebox.fill")
@@ -754,18 +783,20 @@ public struct FilePaneView: View {
         Divider()
 
         Button {
-            fileOps.copyPaths(targetItems)
+            fileOps.copyPaths(targetItems())
         } label: {
             Label("Kopiuj pełną ścieżkę (Cmd+Opt+C)", systemImage: "link")
         }
 
         Button {
+            guard !pane.actionItems(for: item).isEmpty else { return }
             fileOps.openInTerminal(at: item.url)
         } label: {
             Label("Otwórz w Terminalu", systemImage: "terminal")
         }
 
         Button {
+            guard !pane.actionItems(for: item).isEmpty else { return }
             fileOps.openInCodeEditor(at: item.url)
         } label: {
             Label("Otwórz w edytorze kodu", systemImage: "chevron.left.forwardslash.chevron.right")
@@ -773,6 +804,7 @@ public struct FilePaneView: View {
 
         if item.isDirectory {
             Button {
+                guard !pane.actionItems(for: item).isEmpty else { return }
                 appState.addBookmark(for: item.url)
             } label: {
                 Label("Przypnij do paska bocznego", systemImage: "bookmark")
@@ -780,7 +812,7 @@ public struct FilePaneView: View {
         }
 
         Button {
-            fileOps.revealInAppleFinder(targetItems)
+            fileOps.revealInAppleFinder(targetItems())
         } label: {
             Label("Pokaż w klasycznym Finderze", systemImage: "macwindow")
         }
@@ -788,7 +820,7 @@ public struct FilePaneView: View {
         Divider()
 
         Button(role: .destructive) {
-            fileOps.moveToTrash(targetItems)
+            fileOps.moveToTrash(targetItems())
             pane.reloadDirectory()
         } label: {
             Label("Przenieś do Kosza", systemImage: "trash")
@@ -854,6 +886,7 @@ private struct MillerColumnSingleListView: View {
     let columnURL: URL
     @ObservedObject var pane: PaneTabState
     @ObservedObject private var iconCache = FileIconCache.shared
+    @ObservedObject private var folderSizes = FolderSizeCache.shared
     let onSelectDirectory: (URL) -> Void
     let onSelectFile: (FileItem) -> Void
 
@@ -929,15 +962,18 @@ private struct MillerColumnSingleListView: View {
         }
         .onChange(of: pane.showHiddenFiles) { _, _ in loadColumn() }
         .onChange(of: pane.directoryRevision) { _, _ in loadColumn() }
+        .onChange(of: pane.sortField) { _, _ in loadColumn() }
+        .onChange(of: pane.sortAscending) { _, _ in loadColumn() }
+        .onChange(of: pane.foldersOnTop) { _, _ in loadColumn() }
+        .onChange(of: folderSizes.results) { _, _ in
+            if pane.sortField == .size { items = pane.sortItems(items) }
+        }
         .onChange(of: columnURL) { _, _ in loadColumn() }
     }
 
     private func loadColumn() {
         let entries = BulkCrawler.readDirectoryFast(at: columnURL.path, includeHidden: pane.showHiddenFiles)
-        items = entries.map { $0.toFileItem(loadTags: false) }.sorted { a, b in
-            if a.isDirectory != b.isDirectory { return a.isDirectory && !b.isDirectory }
-            return a.name.localizedStandardCompare(b.name) == .orderedAscending
-        }
+        items = pane.sortItems(entries.map { $0.toFileItem(loadTags: false) })
         pane.loadTagMetadataIfNeeded(for: items)
     }
 }

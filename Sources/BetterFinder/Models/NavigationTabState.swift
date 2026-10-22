@@ -61,7 +61,16 @@ public final class PaneTabState: ObservableObject, Identifiable {
     @Published public var selectedPaths: Set<String> = []
     @Published public var expandedFolderPaths: Set<String> = []
 
-    @Published public var viewMode: FinderViewMode = .list
+    @Published public var viewMode: FinderViewMode = .list {
+        didSet {
+            guard oldValue != viewMode else { return }
+            clearAnalysisSelection()
+            if viewMode != .list { expandedFolderPaths.removeAll() }
+            rebuildDisplayedItemsWithExpandedTree()
+            reconcileSelection()
+            directoryRevision &+= 1
+        }
+    }
     @Published public var sortField: SortField = .name
     @Published public var sortAscending: Bool = true
     @Published public var foldersOnTop: Bool = true
@@ -75,6 +84,8 @@ public final class PaneTabState: ObservableObject, Identifiable {
     @Published public var lastSearchLatencyMs: Double = 0
     @Published public var activeFilterPills: [ActiveFilterPill] = []
     @Published public var searchBackendName: String = "fsearch-native"
+    @Published public private(set) var searchDiagnostic: String?
+    @Published public private(set) var searchIsPartial: Bool = false
 
     // Inline editing / path bar state
     @Published public var isEditingPathBar: Bool = false
@@ -88,6 +99,11 @@ public final class PaneTabState: ObservableObject, Identifiable {
 
     private var searchTask: Task<Void, Never>?
     private var searchGeneration: UInt64 = 0
+    private var searchContext: String?
+    private var directoryLoadGeneration: UInt64 = 0
+    @Published private var analysisItems: [FileItem] = []
+    private var analysisRootPath: String?
+    private var analysisGeneration: UUID?
     @Published public private(set) var tagMetadataRevision: UInt64 = 0
     private var metadataGeneration: UInt64 = 0
     private var tagCache: [String: [FinderTagColor]] = [:]
@@ -109,21 +125,94 @@ public final class PaneTabState: ObservableObject, Identifiable {
         return name.isEmpty || name == "/" ? "Macintosh HD" : name
     }
 
+    /// The only projection eligible for keyboard commands and file operations.
+    public var selectableItems: [FileItem] {
+        if viewMode == .wiztree && searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return analysisRootPath == currentURL.path ? analysisItems : []
+        }
+        return displayedItems
+    }
+
     public var selectedItems: [FileItem] {
-        displayedItems.filter { selectedPaths.contains($0.path) }
+        selectableItems.filter { selectedPaths.contains($0.path) }
     }
 
     public var primarySelectedItem: FileItem? {
         if let cursor = selectionCursorPath, selectedPaths.contains(cursor),
-           let item = displayedItems.first(where: { $0.path == cursor }) {
+           let item = selectableItems.first(where: { $0.path == cursor }) {
             return item
         }
-        return displayedItems.first(where: { selectedPaths.contains($0.path) })
+        return selectableItems.first(where: { selectedPaths.contains($0.path) })
+    }
+
+    public var renamingItem: FileItem? {
+        guard let path = renamingItemPath else { return nil }
+        return selectableItems.first { $0.path == path }
+    }
+
+    public func beginAnalysisProjection(rootPath: String, generation: UUID) {
+        let root = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+        guard viewMode == .wiztree, root == currentURL.path,
+              searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        clearAnalysisSelection()
+        analysisRootPath = root
+        analysisGeneration = generation
+    }
+
+    public func publishAnalysisItems(_ items: [FileItem], rootPath: String, generation: UUID) {
+        let root = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+        guard viewMode == .wiztree, root == currentURL.path,
+              root == analysisRootPath, generation == analysisGeneration,
+              searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        var seen = Set<String>()
+        analysisItems = items.filter {
+            ($0.path == root || $0.path.hasPrefix(root == "/" ? "/" : root + "/")) && seen.insert($0.path).inserted
+        }
+        reconcileSelection()
+    }
+
+    public func setAnalysisSelection(_ items: [FileItem], rootPath: String) {
+        let root = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+        guard viewMode == .wiztree, root == currentURL.path, root == analysisRootPath,
+              searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let visible = Set(analysisItems.map(\.path))
+        let selected = items.filter { visible.contains($0.path) }
+        selectedPaths = Set(selected.map(\.path))
+        selectionCursorPath = selected.last?.path
+        selectionAnchorPath = selected.first?.path
+        QuickLookCoordinator.shared.updateIfVisible(urls: selectedItems.map(\.url))
+    }
+
+    public func clearAnalysisSelection() {
+        if analysisRootPath != nil {
+            renamingItemPath = nil
+            selectedPaths.removeAll()
+            selectionCursorPath = nil
+            selectionAnchorPath = nil
+        }
+        analysisRootPath = nil
+        analysisGeneration = nil
+        analysisItems.removeAll()
+    }
+
+    /// Context-menu actions re-resolve their targets at invocation time.
+    public func actionItems(for item: FileItem) -> [FileItem] {
+        guard let current = selectableItems.first(where: { $0.path == item.path }) else { return [] }
+        return selectedPaths.contains(item.path) ? selectedItems : [current]
+    }
+
+    private func reconcileSelection() {
+        let visible = Set(selectableItems.map(\.path))
+        if let renamingItemPath, !visible.contains(renamingItemPath) { self.renamingItemPath = nil }
+        selectedPaths.formIntersection(visible)
+        if let cursor = selectionCursorPath, !visible.contains(cursor) { selectionCursorPath = nil }
+        if let anchor = selectionAnchorPath, !visible.contains(anchor) { selectionAnchorPath = nil }
+        QuickLookCoordinator.shared.updateIfVisible(urls: selectedItems.map(\.url))
     }
 
     public init(initialURL: URL) {
-        self.currentURL = initialURL
-        self.columnTrailURLs = [initialURL]
+        self.currentURL = initialURL.standardizedFileURL
+        self.columnTrailURLs = [initialURL.standardizedFileURL]
         reloadDirectory()
     }
 
@@ -143,6 +232,9 @@ public final class PaneTabState: ObservableObject, Identifiable {
         searchTask?.cancel()
         searchGeneration &+= 1
         isSearching = false
+        clearAnalysisSelection()
+        displayedItems.removeAll()
+        searchContext = nil
         currentURL = standardized
         selectionCursorPath = nil
         selectionAnchorPath = nil
@@ -187,7 +279,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     public func toggleFolderExpansion(for item: FileItem) {
-        guard item.isDirectory else { return }
+        guard viewMode == .list, item.isDirectory, selectableItems.contains(where: { $0.path == item.path }) else { return }
         if expandedFolderPaths.contains(item.path) {
             expandedFolderPaths.remove(item.path)
             // Also collapse any nested subfolders under this folder
@@ -202,6 +294,14 @@ public final class PaneTabState: ObservableObject, Identifiable {
     public func reloadDirectory() {
         let targetPath = currentURL.path
         let includeHidden = showHiddenFiles
+        directoryLoadGeneration &+= 1
+        let loadGeneration = directoryLoadGeneration
+        // Invalidate consumers of this directory snapshot before a local query
+        // starts asynchronous work. Its eventual result commit has its own revision.
+        directoryRevision &+= 1
+        FileIconCache.shared.invalidate(containing: targetPath)
+        FolderSizeCache.shared.invalidate(containing: targetPath)
+        clearAnalysisSelection()
 
         metadataGeneration &+= 1
         for operation in tagOperations { operation.cancel() }
@@ -212,23 +312,19 @@ public final class PaneTabState: ObservableObject, Identifiable {
         let items = sortItems(entries.map { $0.toFileItem(treeDepth: 0, loadTags: false) })
         self.directoryItems = items
         triggerSearch()
-        if searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { directoryRevision &+= 1 }
 
-        // Asynchronously fetch git status for developer directories
+        // A successful empty snapshot clears formerly dirty badges. Ignore
+        // late responses even when the user has returned to the same folder.
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let gitMap = FileOperationsManager.fetchGitStatusMap(for: targetPath)
-            guard !gitMap.isEmpty else { return }
+            guard let snapshot = FileOperationsManager.fetchGitStatusSnapshot(for: targetPath) else { return }
             Task { @MainActor in
-                guard let self = self, self.currentURL.path == targetPath else { return }
-                var updated = false
+                guard let self, self.currentURL.path == targetPath,
+                      self.directoryLoadGeneration == loadGeneration else { return }
+                FSearchIndex.shared.recordGitStatuses(snapshot.statuses, repositoryRoot: snapshot.repositoryRoot)
                 for idx in self.directoryItems.indices {
-                    let p = self.directoryItems[idx].path
-                    if let status = gitMap[p] {
-                        self.directoryItems[idx].gitStatus = status
-                        updated = true
-                    }
+                    self.directoryItems[idx].gitStatus = snapshot.statuses[self.directoryItems[idx].path]
                 }
-                if updated && self.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+                if self.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.rebuildDisplayedItemsWithExpandedTree()
                 }
             }
@@ -237,9 +333,9 @@ public final class PaneTabState: ObservableObject, Identifiable {
 
     private func rebuildDisplayedItemsWithExpandedTree() {
         guard searchQuery.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        if expandedFolderPaths.isEmpty {
+        if viewMode != .list || expandedFolderPaths.isEmpty {
             displayedItems = directoryItems
-            selectedPaths.formIntersection(Set(displayedItems.map(\.path)))
+            reconcileSelection()
             loadTagMetadataIfNeeded(for: displayedItems)
             return
         }
@@ -247,7 +343,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
         flat.reserveCapacity(directoryItems.count + expandedFolderPaths.count * 10)
         appendTreeItems(from: directoryItems, into: &flat)
         displayedItems = flat
-        selectedPaths.formIntersection(Set(flat.map(\.path)))
+        reconcileSelection()
         loadTagMetadataIfNeeded(for: flat)
     }
 
@@ -273,6 +369,16 @@ public final class PaneTabState: ObservableObject, Identifiable {
         let q = searchQuery.trimmingCharacters(in: .whitespaces)
         let parsed = ParsedFSearchQuery.parse(q, fuzzyEnabled: fuzzyEnabled)
         activeFilterPills = parsed.pills
+        searchDiagnostic = parsed.validationError
+        searchIsPartial = false
+        let context = "\(currentURL.path)\u{0}\(searchScope.rawValue)\u{0}\(q)\u{0}\(showHiddenFiles)\u{0}\(fuzzyEnabled)"
+        if context != searchContext {
+            selectedPaths.removeAll()
+            selectionCursorPath = nil
+            selectionAnchorPath = nil
+            clearAnalysisSelection()
+        }
+        searchContext = context
 
         guard !q.isEmpty else {
             isSearching = false
@@ -282,6 +388,16 @@ public final class PaneTabState: ObservableObject, Identifiable {
             return
         }
 
+        // Never leave results from a previous query or directory actionable.
+        // Same-context refreshes may restore selection only after fresh results commit.
+        displayedItems.removeAll()
+        QuickLookCoordinator.shared.updateIfVisible(urls: [])
+        if parsed.validationError != nil {
+            isSearching = false
+            reconcileSelection()
+            directoryRevision &+= 1
+            return
+        }
         isSearching = true
         let scope = searchScope
         let dirPath = currentURL.path
@@ -294,15 +410,18 @@ public final class PaneTabState: ObservableObject, Identifiable {
                 scope: scope,
                 scopeDirectory: dirPath,
                 includeHidden: showHidden,
-                fuzzyEnabled: fuzzy
+                fuzzyEnabled: fuzzy,
+                isCancelled: { Task.isCancelled }
             )
             if Task.isCancelled { return }
             await MainActor.run { [weak self] in
                 guard let self = self, self.searchGeneration == generation else { return }
                 self.displayedItems = self.sortItems(bundle.items)
-                self.selectedPaths.formIntersection(Set(self.displayedItems.map(\.path)))
+                self.reconcileSelection()
                 self.lastSearchLatencyMs = bundle.elapsedMilliseconds
                 self.searchBackendName = bundle.backendName
+                self.searchIsPartial = bundle.isPartial
+                self.searchDiagnostic = bundle.diagnostic
                 self.isSearching = false
                 self.directoryRevision &+= 1
             }
@@ -343,18 +462,31 @@ public final class PaneTabState: ObservableObject, Identifiable {
         Self.metadataQueue.addOperation(operation)
     }
 
+    public var visibleDirectoryPaths: Set<String> {
+        var paths: Set<String> = [currentURL.path]
+        guard searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return paths }
+        if viewMode == .list { paths.formUnion(expandedFolderPaths) }
+        if viewMode == .columns { paths.formUnion(columnTrailURLs.map(\.path)) }
+        return paths
+    }
+
     public func isAffectedByDirectoryChanges(_ changedDirectories: Set<String>) -> Bool {
+        let changed = Set(changedDirectories.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
         let path = currentURL.path
-        if changedDirectories.contains(path) { return true }
-        guard !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        // Changes to a displayed directory, or its ancestor (removed/renamed
+        // directory), invalidate its snapshot. Component boundaries are required.
+        if visibleDirectoryPaths.contains(where: { visible in
+            changed.contains { dir in visible == dir || visible.hasPrefix(dir == "/" ? "/" : dir + "/") }
+        }) { return true }
+        guard !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            // Disk-analysis views also depend on descendants of the root.
+            return viewMode == .wiztree && changed.contains { $0.hasPrefix(path == "/" ? "/" : path + "/") }
+        }
         switch searchScope {
-        case .wholeIndex: return !changedDirectories.isEmpty
-        case .currentFolder:
-            return changedDirectories.contains { path.hasPrefix($0 == "/" ? "/" : $0 + "/") }
+        case .wholeIndex: return !changed.isEmpty
+        case .currentFolder: return false
         case .recursiveFolder:
-            return changedDirectories.contains {
-                $0.hasPrefix(path == "/" ? "/" : path + "/") || path.hasPrefix($0 == "/" ? "/" : $0 + "/")
-            }
+            return changed.contains { $0.hasPrefix(path == "/" ? "/" : path + "/") }
         }
     }
 
@@ -368,12 +500,14 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     public func select(_ item: FileItem, extending: Bool = false, toggling: Bool = false) {
+        let items = selectableItems
+        guard items.contains(where: { $0.path == item.path }) else { return }
         if extending,
            let anchor = selectionAnchorPath ?? primarySelectedItem?.path,
-           let start = displayedItems.firstIndex(where: { $0.path == anchor }),
-           let end = displayedItems.firstIndex(where: { $0.path == item.path }) {
+           let start = items.firstIndex(where: { $0.path == anchor }),
+           let end = items.firstIndex(where: { $0.path == item.path }) {
             selectionAnchorPath = anchor
-            selectedPaths = Set(displayedItems[min(start, end)...max(start, end)].map(\.path))
+            selectedPaths = Set(items[min(start, end)...max(start, end)].map(\.path))
         } else if toggling {
             if selectedPaths.contains(item.path) { selectedPaths.remove(item.path) }
             else { selectedPaths.insert(item.path) }
@@ -387,18 +521,20 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     public func moveSelection(by delta: Int, extending: Bool = false) {
-        guard !displayedItems.isEmpty else { return }
-        let current = selectionCursorPath.flatMap { path in displayedItems.firstIndex(where: { $0.path == path }) }
-            ?? primarySelectedItem.flatMap { item in displayedItems.firstIndex(where: { $0.path == item.path }) }
-        let next = current.map { max(0, min(displayedItems.count - 1, $0 + delta)) }
-            ?? (delta > 0 ? 0 : displayedItems.count - 1)
-        select(displayedItems[next], extending: extending)
+        let items = selectableItems
+        guard !items.isEmpty else { return }
+        let current = selectionCursorPath.flatMap { path in items.firstIndex(where: { $0.path == path }) }
+            ?? primarySelectedItem.flatMap { item in items.firstIndex(where: { $0.path == item.path }) }
+        let next = current.map { max(0, min(items.count - 1, $0 + delta)) }
+            ?? (delta > 0 ? 0 : items.count - 1)
+        select(items[next], extending: extending)
     }
 
     public func selectAll() {
-        selectedPaths = Set(displayedItems.map(\.path))
-        selectionAnchorPath = displayedItems.first?.path
-        selectionCursorPath = displayedItems.last?.path
+        let items = selectableItems
+        selectedPaths = Set(items.map(\.path))
+        selectionAnchorPath = items.first?.path
+        selectionCursorPath = items.last?.path
         QuickLookCoordinator.shared.updateIfVisible(urls: selectedItems.map(\.url))
     }
 
@@ -430,7 +566,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
         }
     }
 
-    private func sortItems(_ list: [FileItem]) -> [FileItem] {
+    public func sortItems(_ list: [FileItem]) -> [FileItem] {
         list.sorted { a, b in
             if foldersOnTop && a.isDirectory != b.isDirectory {
                 return a.isDirectory && !b.isDirectory
@@ -440,9 +576,13 @@ public final class PaneTabState: ObservableObject, Identifiable {
             case .name:
                 cmp = a.name.localizedStandardCompare(b.name) == .orderedAscending
             case .size:
-                let sizeA = a.isDirectory ? (FolderSizeCache.shared.size(for: a.path) ?? 0) : a.size
-                let sizeB = b.isDirectory ? (FolderSizeCache.shared.size(for: b.path) ?? 0) : b.size
-                if sizeA != sizeB {
+                let exactA = a.isDirectory ? FolderSizeCache.shared.size(for: a.path) : a.size
+                let exactB = b.isDirectory ? FolderSizeCache.shared.size(for: b.path) : b.size
+                if (exactA == nil) != (exactB == nil) { return exactA != nil }
+                let sizeA = exactA ?? FolderSizeCache.shared.result(for: a.path)?.bytes
+                let sizeB = exactB ?? FolderSizeCache.shared.result(for: b.path)?.bytes
+                if (sizeA == nil) != (sizeB == nil) { return sizeA != nil }
+                if let sizeA, let sizeB, sizeA != sizeB {
                     cmp = sizeA < sizeB
                 } else {
                     cmp = a.name.localizedStandardCompare(b.name) == .orderedAscending
@@ -465,8 +605,8 @@ public final class PaneTabState: ObservableObject, Identifiable {
             switch sortField {
             case .name: equal = a.name.localizedStandardCompare(b.name) == .orderedSame
             case .size:
-                let sizeA = a.isDirectory ? (FolderSizeCache.shared.size(for: a.path) ?? 0) : a.size
-                let sizeB = b.isDirectory ? (FolderSizeCache.shared.size(for: b.path) ?? 0) : b.size
+                let sizeA = a.isDirectory ? FolderSizeCache.shared.result(for: a.path)?.bytes : a.size
+                let sizeB = b.isDirectory ? FolderSizeCache.shared.result(for: b.path)?.bytes : b.size
                 equal = sizeA == sizeB && a.name.localizedStandardCompare(b.name) == .orderedSame
             case .dateModified: equal = a.modificationDate == b.modificationDate && a.name.localizedStandardCompare(b.name) == .orderedSame
             case .kind: equal = a.kindDisplayString == b.kindDisplayString && a.name.localizedStandardCompare(b.name) == .orderedSame

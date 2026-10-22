@@ -24,7 +24,7 @@ Skrypt buduje aplikację dla architektury bieżącego Maca i podpisuje ją lokal
 - Lista pojawia się przed odczytem tagów; blokujący dostawca metadanych nie zatrzymuje startu okna. Odczyty tagów, ikon plików i list aplikacji „Otwórz w…” działają w ograniczonych kolejkach w tle.
 - Inspektor z podglądem, metadanymi, tagami i sumami kontrolnymi. Przy wielu zaznaczonych elementach pokazuje podsumowanie całego zaznaczenia.
 - Przeciąganie całego zaznaczenia w liście i siatce ikon. Zrzut wielu plików jest pojedynczą operacją; ⌥ wymusza kopiowanie. Standardowy zrzut pomiędzy woluminami kopiuje pliki.
-- Dwa panele z porównaniem folderów i kopiowaniem zaznaczenia do drugiego panelu, dostępne z menu aktywnego panelu na pasku kart.
+- Dwa panele z porównaniem bezpośredniej zawartości folderów i kopiowaniem różnic lub zaznaczenia do drugiego panelu. To nie jest rekurencyjna synchronizacja: wspólne podfoldery są oznaczane jako nieporównane, a konflikty typów wymagają ręcznego rozstrzygnięcia. Zwykłe pliki są porównywane według treści i czasu modyfikacji; zastępowanie wymaga wyboru polityki konfliktu.
 - Pasek stanu z liczbą elementów, rozmiarem zaznaczenia, miejscem na woluminie oraz komunikatami operacji. Transfer obejmujący wiele plików można przerwać po bieżącym pliku.
 
 ## Wyszukiwanie
@@ -72,7 +72,13 @@ Skróty edycji działają na tekście, gdy aktywne jest pole wyszukiwania, ście
 
 Przy zastępowaniu pliku aplikacja najpierw przygotowuje dane wejściowe, a poprzedni element zachowuje w Koszu. Błąd uruchamia próbę przywrócenia. Undo/Redo obejmuje również zastąpiony element. Nieudane kroki pozostają dostępne do ponowienia; jeśli automatyczne przywrócenie się nie powiedzie, komunikat wskazuje zachowane dane.
 
+Skanowanie i wyszukiwanie oznaczają wyniki częściowe, jeśli osiągnięto limit lub nie odczytano wszystkich danych. Rozmiar katalogu z symbolem ≥ oraz suma „co najmniej” są dolnym oszacowaniem, nie dokładnym rozmiarem. Czyszczenie duplikatów ponownie sprawdza treść i tożsamość plików, w tym zachowywanego egzemplarza, oraz przerywa operację po wykryciu zmiany. Nie jest to blokada plików przed równoczesnym zapisem przez inne aplikacje.
+
+Kompresja i rozpakowywanie tworzą wynik w prywatnym katalogu roboczym, a następnie publikują go bez zastępowania cudzych danych. Jeśli wolumin nie potwierdza obsługi bezpiecznej publikacji wyłącznej, operacja kończy się błędem; zachowane dane robocze są wskazane w komunikacie.
+
 Historia operacji jest przechowywana w pamięci i nie stanowi dziennika odzyskiwania po awarii procesu. Anulowanie transferu działa pomiędzy plikami. Opróżnienie Kosza wymaga potwierdzenia i jest nieodwracalne. Zmiana koloru tagu zachowuje własne, nazwane tagi Findera; polecenie „Usuń wszystkie tagi” usuwa je świadomie.
+
+Automatyczny podgląd Git wyłącza wykonywalne helpery fsmonitor oraz filtry clean/process i nie analizuje zawartości submodułów. Jest to porównanie surowych plików: w repozytoriach z filtrami, np. Git LFS, plik może być oznaczony jako zmieniony mimo czystego statusu w zaufanym Git. Błąd lub przekroczenie limitu inspekcji oznacza brak dostępnego statusu, nie „czyste repozytorium”.
 
 ## Sprawdzenia
 
@@ -80,7 +86,7 @@ Historia operacji jest przechowywana w pamięci i nie stanowi dziennika odzyskiw
 ./scripts/run_tests.sh
 ```
 
-Runner kompiluje rzeczywiste modele i silniki oraz wykonuje testy na plikach tymczasowych; nie wymaga XCTest ani makr Swift Testing. Dodatkowy zestaw testuje zastępowanie, rollback, historię operacji, własność schowka i metadane tagów. Testy zastępowania używają kontrolowanego zamiennika Kosza; nie opróżniają systemowego Kosza ani nie zmieniają schowka.
+Runner kompiluje rzeczywiste modele, silniki i widoki w izolowanym trybie testowym (osobny katalog domowy, ustawienia i dane tymczasowe) oraz wykonuje testy na plikach tymczasowych; nie wymaga XCTest ani makr Swift Testing. Dodatkowy zestaw testuje zastępowanie, rollback, historię operacji, własność schowka i metadane tagów. Testy zastępowania używają kontrolowanego zamiennika Kosza; nie opróżniają systemowego Kosza ani nie zmieniają schowka.
 
 Podgląd natywnego GUI na danych testowych (w aktywnej sesji graficznej macOS):
 
@@ -89,3 +95,5 @@ Podgląd natywnego GUI na danych testowych (w aktywnej sesji graficznej macOS):
 ```
 
 Uruchamia osobny bundle, sprawdza zdarzenia klawiatury i zapisuje rendery własnego okna do `.build/previews`. Obejmuje listę, wyszukiwanie, wąskie okno, dwa panele, inspektor, zmianę nazwy oraz ciemny motyw z ikonami. Nie wymaga przechwytywania ekranu ani dostępu do systemowego Kosza.
+
+Automatyczny workflow `.github/workflows/macos-regressions.yml` buduje aplikację i uruchamia zestawy regresji na macOS. Nie zastępuje ręcznej kontroli GUI, Quick Look, FSEvents, woluminów ani Thread Sanitizera. Samo dodanie workflow nie oznacza, że testy zostały wykonane.

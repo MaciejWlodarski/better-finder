@@ -186,7 +186,7 @@ private struct FinderStatusBar: View {
     private var selectionDescription: String {
         let items = activeTab.selectedItems
         guard !items.isEmpty else { return "\(activeTab.displayedItems.count.formatted()) elementów" }
-        let knownBytes = items.reduce(Int64(0)) { $0 + ($1.isDirectory ? (folderSizes.size(for: $1.path) ?? 0) : $1.size) }
+        let knownBytes = items.reduce(Int64(0)) { $0 + ($1.isDirectory ? (folderSizes.result(for: $1.path)?.bytes ?? 0) : $1.size) }
         let unknownFolders = items.contains { $0.isDirectory && folderSizes.size(for: $0.path) == nil }
         return "Zaznaczono \(items.count) z \(activeTab.displayedItems.count) · \(unknownFolders ? "co najmniej " : "")\(FormatHelpers.formatBytes(knownBytes))"
     }

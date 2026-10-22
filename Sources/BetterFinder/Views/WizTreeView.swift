@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import CryptoKit
+import Darwin
 
 public struct WizTreeNode: Identifiable, Sendable {
     public var id: String { path }
@@ -35,9 +36,142 @@ public struct DuplicateFileGroup: Identifiable, Sendable {
     public let sha256: String
     public let fileSize: Int64
     public let files: [FileItem]
+    let snapshots: [String: DuplicateFileSnapshot]
 
     public var wastedBytes: Int64 {
         fileSize * Int64(max(0, files.count - 1))
+    }
+}
+
+// A generation is cancelled on every root/mode change, refresh and disappearance.
+// The same predicate protects all publication paths, including empty results.
+final class AnalysisRequestToken: @unchecked Sendable {
+    let id = UUID()
+    let rootPath: String
+    private let lock = NSLock()
+    private var cancelled = false
+    init(rootPath: String) { self.rootPath = rootPath }
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    func canPublish(active: AnalysisRequestToken?, rootPath: String) -> Bool {
+        active === self && self.rootPath == rootPath && !isCancelled
+    }
+}
+
+struct DuplicateFileSnapshot: Equatable, Sendable {
+    let device: Int64
+    let inode: UInt64
+    let size: Int64
+    let modifiedSeconds: Int64
+    let modifiedNanoseconds: Int64
+    let changedSeconds: Int64
+    let changedNanoseconds: Int64
+
+    init(_ info: stat) throws {
+        guard (info.st_mode & S_IFMT) == S_IFREG else { throw DuplicateSafetyError.changed }
+        device = Int64(info.st_dev)
+        inode = UInt64(info.st_ino)
+        size = Int64(info.st_size)
+        modifiedSeconds = Int64(info.st_mtimespec.tv_sec)
+        modifiedNanoseconds = Int64(info.st_mtimespec.tv_nsec)
+        changedSeconds = Int64(info.st_ctimespec.tv_sec)
+        changedNanoseconds = Int64(info.st_ctimespec.tv_nsec)
+    }
+}
+
+enum DuplicateSafetyError: LocalizedError {
+    case changed, unreadable, cancelled
+    var errorDescription: String? {
+        switch self {
+        case .changed: return "Plik lub zachowywany oryginał zmienił się. Nic więcej nie usunięto; wykonaj nowy skan."
+        case .unreadable: return "Nie można bezpiecznie odczytać pliku. Wykonaj nowy skan."
+        case .cancelled: return "Skanowanie anulowano."
+        }
+    }
+}
+
+/// Full streaming SHA-256, with no size ceiling and no symlink/special-file reads.
+/// Snapshot checks detect replacement and writes during or after hashing. A filesystem
+/// can still change between the final check and a path-based Trash operation; this is
+/// not a transactional filesystem lock and does not claim to prevent hostile races.
+enum DuplicateFileSafety {
+    static func snapshot(at url: URL) throws -> DuplicateFileSnapshot {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { throw DuplicateSafetyError.unreadable }
+        return try DuplicateFileSnapshot(info)
+    }
+
+    static func hash(at url: URL, isCancelled: () -> Bool = { false }) throws -> (hash: String, snapshot: DuplicateFileSnapshot) {
+        let before = try snapshot(at: url)
+        let fd = Darwin.open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        guard fd >= 0 else { throw DuplicateSafetyError.unreadable }
+        defer { Darwin.close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, try DuplicateFileSnapshot(info) == before else { throw DuplicateSafetyError.changed }
+        var digest = SHA256()
+        var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
+        while true {
+            if isCancelled() { throw DuplicateSafetyError.cancelled }
+            let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress!, $0.count) }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw DuplicateSafetyError.unreadable
+            }
+            if count == 0 { break }
+            digest.update(data: Data(buffer.prefix(count)))
+        }
+        guard fstat(fd, &info) == 0, try DuplicateFileSnapshot(info) == before,
+              try snapshot(at: url) == before else { throw DuplicateSafetyError.changed }
+        return (digest.finalize().map { String(format: "%02x", $0) }.joined(), before)
+    }
+
+    static func validate(_ group: DuplicateFileGroup, isCancelled: () -> Bool = { false }) throws {
+        guard group.files.count > 1, group.snapshots.count == group.files.count else { throw DuplicateSafetyError.changed }
+        var identities = Set<String>()
+        for item in group.files {
+            let current = try hash(at: item.url, isCancelled: isCancelled)
+            guard current.hash == group.sha256, current.snapshot == group.snapshots[item.path],
+                  identities.insert("\(current.snapshot.device):\(current.snapshot.inode)").inserted else {
+                throw DuplicateSafetyError.changed
+            }
+        }
+    }
+
+    // Called immediately before each candidate enters the Trash, not just once per scan.
+    static func validateBeforeTrash(_ item: FileItem, in group: DuplicateFileGroup) throws {
+        guard let keeper = group.files.first, keeper.path != item.path,
+              let kept = group.snapshots[keeper.path], let candidate = group.snapshots[item.path],
+              try snapshot(at: keeper.url) == kept,
+              try snapshot(at: item.url) == candidate else { throw DuplicateSafetyError.changed }
+    }
+
+    static func groups(from entries: [IndexedFileEntry], token: AnalysisRequestToken) -> (groups: [DuplicateFileGroup], failed: Int) {
+        var bySize: [Int64: [IndexedFileEntry]] = [:]
+        for entry in entries where !entry.isDirectory && !entry.isSymlink {
+            bySize[entry.size, default: []].append(entry)
+        }
+        var groups: [DuplicateFileGroup] = []
+        var failed = 0
+        for sameSize in bySize.values where sameSize.count > 1 {
+            var byHash: [String: [(FileItem, DuplicateFileSnapshot)]] = [:]
+            var seenIdentities = Set<String>()
+            for entry in sameSize.sorted(by: { $0.fullPath < $1.fullPath }) {
+                if token.isCancelled { return ([], failed) }
+                do {
+                    let item = entry.toFileItem(loadTags: false)
+                    let result = try hash(at: item.url, isCancelled: { token.isCancelled })
+                    guard result.snapshot.size == entry.size else { failed += 1; continue }
+                    // Hard links are one physical file, not reclaimable duplicate storage.
+                    guard seenIdentities.insert("\(result.snapshot.device):\(result.snapshot.inode)").inserted else { continue }
+                    byHash[result.hash, default: []].append((item, result.snapshot))
+                } catch { failed += 1 }
+            }
+            for (hash, pairs) in byHash where pairs.count > 1 {
+                groups.append(DuplicateFileGroup(id: hash, sha256: hash, fileSize: pairs[0].1.size,
+                    files: pairs.map { $0.0 }, snapshots: Dictionary(uniqueKeysWithValues: pairs.map { ($0.0.path, $0.1) })))
+            }
+        }
+        return (groups.sorted { $0.wastedBytes > $1.wastedBytes }, failed)
     }
 }
 
@@ -253,6 +387,22 @@ public enum WizTreeSubMode: String, CaseIterable, Identifiable {
     public var id: String { rawValue }
 }
 
+/// Shared production projection builder: keyboard selection uses displayed rows
+/// and rendered tiles, never an arbitrary last-clicked singleton or hidden subtree.
+enum WizTreeSelectionProjection {
+    static func items(mode: WizTreeSubMode, branches: [WizTreeNode], largestFiles: [FileItem],
+                      duplicateGroups: [DuplicateFileGroup], visibleBlocks: [TreemapPlacedBlock] = []) -> [FileItem] {
+        let candidates: [FileItem]
+        switch mode {
+        case .treemap: candidates = branches.map { $0.toFileItem() } + visibleBlocks.map { $0.node.toFileItem() }
+        case .largestFiles: candidates = largestFiles
+        case .duplicates: candidates = duplicateGroups.flatMap(\.files)
+        }
+        var seen = Set<String>()
+        return candidates.filter { seen.insert($0.path).inserted }
+    }
+}
+
 public struct WizTreeAnalyzerView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var pane: PaneTabState
@@ -267,8 +417,13 @@ public struct WizTreeAnalyzerView: View {
     @ViewState private var largestFiles: [FileItem] = []
     @ViewState private var categoryStats: [(FileKindCategory, Int64, Int)] = []
     @ViewState private var duplicateGroups: [DuplicateFileGroup] = []
+    @ViewState private var scanToken: AnalysisRequestToken?
+    @ViewState private var scanTask: Task<Void, Never>?
+    @ViewState private var scanIsComplete = false
+    @ViewState private var scanDiagnostic: String?
+    @ViewState private var duplicateActionError: String?
+    @ViewState private var isValidatingDuplicates = false
     @ViewState private var hoveredBlock: TreemapPlacedBlock? = nil
-    @ViewState private var selectedNodePath: String? = nil
 
     public init(appState: AppState, pane: PaneTabState) {
         self.appState = appState
@@ -288,12 +443,22 @@ public struct WizTreeAnalyzerView: View {
                 Divider()
             }
 
+            if let diagnostic = scanDiagnostic {
+                Text(diagnostic).font(.system(size: 11)).foregroundStyle(.orange)
+                    .padding(.horizontal, 14).padding(.vertical, 5)
+            }
+            if let error = duplicateActionError {
+                Text(error).font(.system(size: 11)).foregroundStyle(.red)
+                    .padding(.horizontal, 14).padding(.vertical, 5)
+            }
+            Text("Zakres: \(pane.showHiddenFiles ? "z ukrytymi plikami" : "bez ukrytych plików"), bez śledzenia dowiązań. Limit: 60 000 wpisów.")
+                .font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 14)
             // Main Content
             if isScanning {
                 VStack(spacing: 12) {
                     ProgressView()
                         .controlSize(.regular)
-                    Text("Skanowanie drzewa przez getattrlistbulk (\(pane.currentURL.lastPathComponent))...")
+                    Text("Skanowanie i weryfikacja drzewa (\(pane.currentURL.lastPathComponent))...")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
@@ -310,10 +475,15 @@ public struct WizTreeAnalyzerView: View {
             }
         }
         .onAppear {
-            runWizTreeScan(for: pane.currentURL)
+            runActiveScan(for: pane.currentURL)
         }
-        .onChange(of: pane.currentURL.path) { _, _ in
-            runWizTreeScan(for: pane.currentURL)
+        .onChange(of: pane.currentURL.path) { _, _ in runActiveScan(for: pane.currentURL) }
+        .onChange(of: pane.showHiddenFiles) { _, _ in runActiveScan(for: pane.currentURL) }
+        .onChange(of: pane.directoryRevision) { _, _ in runActiveScan(for: pane.currentURL) }
+        .onDisappear {
+            scanToken?.cancel()
+            scanTask?.cancel()
+            pane.clearAnalysisSelection()
         }
     }
 
@@ -336,16 +506,14 @@ public struct WizTreeAnalyzerView: View {
             }
             .pickerStyle(.segmented)
             .frame(width: 420)
-            .onChange(of: subMode) { _, newMode in
-                if newMode == .duplicates && duplicateGroups.isEmpty {
-                    runDuplicatesScan(for: pane.currentURL)
-                }
+            .onChange(of: subMode) { _, _ in
+                runActiveScan(for: pane.currentURL)
             }
 
             Spacer()
 
             HStack(spacing: 8) {
-                Text("Łącznie: \(FormatHelpers.formatBytes(totalScannedBytes))")
+                Text("\(scanIsComplete ? "Łącznie" : "Co najmniej"): \(FormatHelpers.formatBytes(totalScannedBytes))")
                     .font(.system(size: 11.5, weight: .bold, design: .monospaced))
                     .foregroundStyle(.primary)
                 Text("· \(totalScannedFiles.formatted()) plików")
@@ -362,7 +530,7 @@ public struct WizTreeAnalyzerView: View {
             .background(Color.primary.opacity(0.05), in: Capsule())
 
             Button {
-                runWizTreeScan(for: pane.currentURL)
+                runActiveScan(for: pane.currentURL)
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 11.5, weight: .semibold))
@@ -431,7 +599,7 @@ public struct WizTreeAnalyzerView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(Array(topBranches.enumerated()), id: \.element.id) { idx, node in
                         let pct = totalScannedBytes > 0 ? Double(node.size) / Double(totalScannedBytes) : 0
-                        let isSelected = (selectedNodePath == node.path)
+                        let isSelected = pane.selectedPaths.contains(node.path)
 
                         HStack(spacing: 10) {
                             Image(nsImage: iconCache.icon(for: node.toFileItem(), preferThumbnail: false))
@@ -492,8 +660,7 @@ public struct WizTreeAnalyzerView: View {
                         )
                         .simultaneousGesture(
                             TapGesture(count: 1).onEnded {
-                                selectedNodePath = node.path
-                                pane.selectedPaths = [node.path]
+                                pane.setAnalysisSelection([node.toFileItem()], rootPath: pane.currentURL.path)
                             }
                         )
                     }
@@ -513,10 +680,15 @@ public struct WizTreeAnalyzerView: View {
                         nodes: topBranches,
                         in: CGRect(origin: .zero, size: geo.size)
                     )
+                    let generation = scanToken
                     ZStack(alignment: .topLeading) {
                         ForEach(blocks) { block in
                             treemapBlockView(block)
                         }
+                    }
+                    .onAppear { publishTreemapProjection(blocks, token: generation) }
+                    .onChange(of: blocks.map(\.id)) { _, _ in
+                        publishTreemapProjection(blocks, token: generation)
                     }
                 }
                 .padding(6)
@@ -567,7 +739,7 @@ public struct WizTreeAnalyzerView: View {
     @ViewBuilder
     private func treemapBlockView(_ block: TreemapPlacedBlock) -> some View {
         let isHovered = (hoveredBlock?.id == block.id)
-        let isSelected = (selectedNodePath == block.node.path)
+        let isSelected = pane.selectedPaths.contains(block.node.path)
         let baseColor = block.node.kindCategory.treemapColor
 
         if block.isGroupContainer {
@@ -658,8 +830,7 @@ public struct WizTreeAnalyzerView: View {
             )
             .simultaneousGesture(
                 TapGesture(count: 1).onEnded {
-                    selectedNodePath = block.node.path
-                    pane.selectedPaths = [block.node.path]
+                    pane.setAnalysisSelection([block.node.toFileItem()], rootPath: pane.currentURL.path)
                 }
             )
             .contextMenu {
@@ -689,8 +860,7 @@ public struct WizTreeAnalyzerView: View {
                 }
                 Divider()
                 Button(role: .destructive) {
-                    FileOperationsManager.shared.moveToTrash([block.node.toFileItem()])
-                    runWizTreeScan(for: pane.currentURL)
+                    trashAnalyzedItem(block.node.toFileItem())
                 } label: {
                     Label("Przenieś do Kosza", systemImage: "trash")
                 }
@@ -734,8 +904,7 @@ public struct WizTreeAnalyzerView: View {
                             .frame(width: 95, alignment: .trailing)
 
                         Button(role: .destructive) {
-                            FileOperationsManager.shared.moveToTrash([item])
-                            runWizTreeScan(for: pane.currentURL)
+                            trashAnalyzedItem(item)
                         } label: {
                             Image(systemName: "trash")
                                 .foregroundStyle(.red)
@@ -745,7 +914,9 @@ public struct WizTreeAnalyzerView: View {
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 6)
-                    .background(idx.isMultiple(of: 2) ? Color.clear : Color.primary.opacity(0.025))
+                    .background(pane.selectedPaths.contains(item.path) ? Color.accentColor.opacity(0.18) : (idx.isMultiple(of: 2) ? Color.clear : Color.primary.opacity(0.025)))
+                    .contentShape(Rectangle())
+                    .onTapGesture { pane.setAnalysisSelection([item], rootPath: pane.currentURL.path) }
                 }
             }
         }
@@ -757,12 +928,12 @@ public struct WizTreeAnalyzerView: View {
         VStack(spacing: 0) {
             if duplicateGroups.isEmpty {
                 VStack(spacing: 10) {
-                    Image(systemName: "checkmark.seal.fill")
+                    Image(systemName: scanIsComplete ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                         .font(.system(size: 32))
-                        .foregroundStyle(.green)
-                    Text("Brak zduplikowanych plików w tym drzewie katalogów")
+                        .foregroundStyle(scanIsComplete ? Color.green : Color.orange)
+                    Text(scanIsComplete ? "Nie znaleziono duplikatów w przeskanowanym zakresie" : "Nie znaleziono duplikatów w częściowo sprawdzonym zakresie")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("Skanowanie grupuje pliki o tym samym rozmiarze i weryfikuje pełny hash SHA-256")
+                    Text("SHA-256 pełnej treści, także plików pustych i dużych. Dowiązania symboliczne nie są śledzone. Ukryte pliki zależą od ustawienia widoku.")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 }
@@ -770,25 +941,23 @@ public struct WizTreeAnalyzerView: View {
             } else {
                 let totalWasted = duplicateGroups.reduce(Int64(0)) { $0 + $1.wastedBytes }
                 HStack {
-                    Text("Znaleziono \(duplicateGroups.count) grup duplikatów · Możliwe do odzyskania: \(FormatHelpers.formatBytes(totalWasted))")
+                    Text("Znaleziono \(duplicateGroups.count) grup duplikatów · Logiczny rozmiar nadmiarowych kopii: \(FormatHelpers.formatBytes(totalWasted))")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.orange)
                     Spacer()
                     Button("Usuń nadmiarowe kopie do Kosza (zachowaj po 1 oryginale)") {
-                        var redundant: [FileItem] = []
-                        for group in duplicateGroups {
-                            redundant.append(contentsOf: group.files.dropFirst())
-                        }
-                        FileOperationsManager.shared.moveToTrash(redundant)
-                        runDuplicatesScan(for: pane.currentURL)
+                        trashDuplicates(duplicateGroups)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                    .disabled(isValidatingDuplicates)
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
                 .background(Color.orange.opacity(0.08))
 
+                Text("To suma rozmiarów logicznych, nie gwarantowane odzyskane miejsce. Dowiązania twarde, klony APFS i kompresja mogą współdzielić dane.")
+                    .font(.system(size: 10.5)).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 4)
                 Divider()
 
                 ScrollView {
@@ -802,7 +971,7 @@ public struct WizTreeAnalyzerView: View {
                                         .font(.system(size: 10.5, design: .monospaced))
                                         .foregroundStyle(.secondary)
                                     Spacer()
-                                    Text("Zajmuje nadmiarowo: \(FormatHelpers.formatBytes(group.wastedBytes))")
+                                    Text("Nadmiarowe dane logiczne: \(FormatHelpers.formatBytes(group.wastedBytes))")
                                         .font(.system(size: 11, weight: .semibold))
                                         .foregroundStyle(.orange)
                                 }
@@ -814,13 +983,16 @@ public struct WizTreeAnalyzerView: View {
                                         Text(file.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
                                             .font(.system(size: 11.5, design: .monospaced))
                                         Spacer()
-                                        Button("Kosz", role: .destructive) {
-                                            FileOperationsManager.shared.moveToTrash([file])
-                                            runDuplicatesScan(for: pane.currentURL)
+                                        Button(file.path == group.files.first?.path ? "Zachowywany oryginał" : "Kosz", role: .destructive) {
+                                            trashDuplicates([group], onlyPath: file.path)
                                         }
+                                        .disabled(file.path == group.files.first?.path || isValidatingDuplicates)
                                         .buttonStyle(.bordered)
                                         .controlSize(.mini)
                                     }
+                                    .background(pane.selectedPaths.contains(file.path) ? Color.accentColor.opacity(0.18) : Color.clear)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { pane.setAnalysisSelection([file], rootPath: pane.currentURL.path) }
                                 }
                             }
                             .padding(10)
@@ -833,139 +1005,140 @@ public struct WizTreeAnalyzerView: View {
         }
     }
 
-    // MARK: - Fast Multi-Threaded `getattrlistbulk` WizTree Scanner
+    // MARK: - Generation-bound, bounded scans
 
-    private func runWizTreeScan(for rootURL: URL) {
+    private func runActiveScan(for rootURL: URL) {
+        scanToken?.cancel()
+        scanTask?.cancel()
+        let token = AnalysisRequestToken(rootPath: rootURL.path)
+        scanToken = token
         isScanning = true
-        let rootPath = rootURL.path
+        scanIsComplete = false
+        scanDiagnostic = nil
+        topBranches = []
+        largestFiles = []
+        duplicateGroups = []
+        categoryStats = []
+        totalScannedBytes = 0
+        totalScannedFiles = 0
+        scanDurationMs = 0
+        hoveredBlock = nil
+        pane.beginAnalysisProjection(rootPath: rootURL.path, generation: token.id)
         let showHidden = pane.showHiddenFiles
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let t0 = DispatchTime.now().uptimeNanoseconds
-            let topEntries = BulkCrawler.readDirectoryFast(at: rootPath, includeHidden: showHidden)
-
-            var branches: [WizTreeNode] = []
-            var allFiles: [FileItem] = []
-            var catMap: [FileKindCategory: (Int64, Int)] = [:]
-            var totalBytes: Int64 = 0
-            var totalFiles = 0
-
-            for entry in topEntries {
-                if entry.isDirectory && !entry.isSymlink {
-                    let subEntries = BulkCrawler.crawlTree(
-                        roots: [entry.fullPath],
-                        skipHeavyDevDirs: false,
-                        maxEntries: 60_000
-                    )
-                    var folderBytes: Int64 = 0
-                    var folderFiles = 0
-                    var childLeafs: [WizTreeNode] = []
-
-                    for sub in subEntries where !sub.isDirectory {
-                        folderBytes += sub.size
-                        folderFiles += 1
-                        let cat = FileKindCategory.detect(extension: sub.ext, isDirectory: false)
-                        let prev = catMap[cat] ?? (0, 0)
-                        catMap[cat] = (prev.0 + sub.size, prev.1 + 1)
-
-                        let fi = sub.toFileItem()
-                        allFiles.append(fi)
-                        childLeafs.append(WizTreeNode(
-                            name: sub.name,
-                            path: sub.fullPath,
-                            url: fi.url,
-                            isDirectory: false,
-                            size: sub.size,
-                            fileCount: 1,
-                            kindCategory: cat,
-                            modificationDate: fi.modificationDate,
-                            children: []
-                        ))
-                    }
-                    childLeafs.sort { $0.size > $1.size }
-                    totalBytes += folderBytes
-                    totalFiles += folderFiles
-
-                    branches.append(WizTreeNode(
-                        name: entry.name,
-                        path: entry.fullPath,
-                        url: URL(fileURLWithPath: entry.fullPath, isDirectory: true),
-                        isDirectory: true,
-                        size: folderBytes,
-                        fileCount: max(1, folderFiles),
-                        kindCategory: .folder,
-                        modificationDate: Date(timeIntervalSince1970: TimeInterval(entry.mtimeEpoch)),
-                        children: Array(childLeafs.prefix(32))
-                    ))
-                } else {
-                    let cat = FileKindCategory.detect(extension: entry.ext, isDirectory: false)
-                    let prev = catMap[cat] ?? (0, 0)
-                    catMap[cat] = (prev.0 + entry.size, prev.1 + 1)
-                    totalBytes += entry.size
-                    totalFiles += 1
-
-                    let fi = entry.toFileItem()
-                    allFiles.append(fi)
-                    branches.append(WizTreeNode(
-                        name: entry.name,
-                        path: entry.fullPath,
-                        url: fi.url,
-                        isDirectory: false,
-                        size: entry.size,
-                        fileCount: 1,
-                        kindCategory: cat,
-                        modificationDate: fi.modificationDate,
-                        children: []
-                    ))
-                }
+        let mode = subMode
+        scanTask = Task.detached(priority: .userInitiated) {
+            let started = DispatchTime.now().uptimeNanoseconds
+            let scan = BulkCrawler.crawlTreeResult(roots: [rootURL.path], skipHeavyDevDirs: false,
+                maxEntries: 60_000, includeHidden: showHidden, isCancelled: { token.isCancelled })
+            guard !token.isCancelled else { return }
+            var groups: [DuplicateFileGroup] = []
+            var failedHashes = 0
+            if mode == .duplicates {
+                let result = DuplicateFileSafety.groups(from: scan.entries, token: token)
+                groups = result.groups
+                failedHashes = result.failed
             }
-
-            branches.sort { $0.size > $1.size }
-            allFiles.sort { $0.size > $1.size }
-            let sortedCats = catMap.map { ($0.key, $0.value.0, $0.value.1) }.sorted { $0.1 > $1.1 }
-            let topLargest = Array(allFiles.prefix(150))
-
-            let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
-
-            Task { @MainActor in
-                self.topBranches = branches
-                self.largestFiles = topLargest
-                self.categoryStats = sortedCats
-                self.totalScannedBytes = totalBytes
-                self.totalScannedFiles = totalFiles
-                self.scanDurationMs = elapsedMs
+            let files = scan.entries.filter { !$0.isDirectory && !$0.isSymlink }.map { $0.toFileItem(loadTags: false) }
+            var categoryMap: [FileKindCategory: (Int64, Int)] = [:]
+            for item in files {
+                let previous = categoryMap[item.kindCategory] ?? (0, 0)
+                categoryMap[item.kindCategory] = (previous.0 + item.size, previous.1 + 1)
+            }
+            let rootPrefix = rootURL.path == "/" ? "/" : rootURL.path + "/"
+            var filesByBranch: [String: [FileItem]] = [:]
+            for item in files {
+                let relative = item.path.dropFirst(rootPrefix.count)
+                let first = String(relative.split(separator: "/", maxSplits: 1).first ?? "")
+                filesByBranch[first, default: []].append(item)
+            }
+            var branches: [WizTreeNode] = []
+            for entry in scan.entries where entry.parentPath == rootURL.path && !entry.isSymlink {
+                let branchFiles = filesByBranch[entry.name] ?? []
+                let item = entry.toFileItem(loadTags: false)
+                let children = branchFiles.sorted { $0.size > $1.size }.prefix(32).map { leaf in
+                    WizTreeNode(name: leaf.name, path: leaf.path, url: leaf.url, isDirectory: false,
+                        size: leaf.size, fileCount: 1, kindCategory: leaf.kindCategory,
+                        modificationDate: leaf.modificationDate, children: [])
+                }
+                branches.append(WizTreeNode(name: entry.name, path: entry.fullPath, url: item.url,
+                    isDirectory: entry.isDirectory, size: entry.isDirectory ? branchFiles.reduce(0) { $0 + $1.size } : item.size,
+                    fileCount: entry.isDirectory ? branchFiles.count : 1, kindCategory: item.kindCategory,
+                    modificationDate: item.modificationDate, children: entry.isDirectory ? children : []))
+            }
+            let complete = scan.isComplete && failedHashes == 0
+            var messages: [String] = []
+            if scan.reachedEntryLimit { messages.append("Wyniki częściowe: osiągnięto limit 60 000 wpisów.") }
+            if scan.skippedDirectoryCount > 0 { messages.append("Pominięte katalogi: \(scan.skippedDirectoryCount).") }
+            if scan.unreadableDirectoryCount > 0 { messages.append("Nieodczytane katalogi: \(scan.unreadableDirectoryCount).") }
+            if failedHashes > 0 { messages.append("Pliki zmienione lub nieodczytane: \(failedHashes).") }
+            if !complete && messages.isEmpty { messages.append("Skan niepełny; suma jest dolnym oszacowaniem.") }
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            await MainActor.run {
+                guard token.canPublish(active: self.scanToken, rootPath: self.pane.currentURL.path) else { return }
+                self.topBranches = branches.sorted { $0.size > $1.size }
+                self.largestFiles = Array(files.sorted { $0.size > $1.size }.prefix(150))
+                self.duplicateGroups = groups
+                self.categoryStats = categoryMap.map { ($0.key, $0.value.0, $0.value.1) }.sorted { $0.1 > $1.1 }
+                self.totalScannedBytes = files.reduce(0) { $0 + $1.size }
+                self.totalScannedFiles = files.count
+                self.scanDurationMs = elapsed
+                self.scanIsComplete = complete
+                self.scanDiagnostic = messages.isEmpty ? nil : messages.joined(separator: " ")
                 self.isScanning = false
+                // Publish the entire ordered visible projection independently of selection.
+                let visible = WizTreeSelectionProjection.items(mode: mode, branches: self.topBranches,
+                    largestFiles: self.largestFiles, duplicateGroups: self.duplicateGroups)
+                self.pane.publishAnalysisItems(visible, rootPath: token.rootPath, generation: token.id)
             }
         }
     }
 
-    private func runDuplicatesScan(for rootURL: URL) {
-        let rootPath = rootURL.path
-        DispatchQueue.global(qos: .userInitiated).async {
-            let entries = BulkCrawler.crawlTree(roots: [rootPath], skipHeavyDevDirs: true, maxEntries: 50_000)
-            var bySize: [Int64: [IndexedFileEntry]] = [:]
-            for e in entries where !e.isDirectory && !e.isSymlink && e.size > 0 && e.size <= 50 * 1024 * 1024 {
-                bySize[e.size, default: []].append(e)
-            }
+    private func publishTreemapProjection(_ blocks: [TreemapPlacedBlock], token: AnalysisRequestToken?) {
+        guard let token, token.canPublish(active: scanToken, rootPath: pane.currentURL.path),
+              !isScanning, subMode == .treemap else { return }
+        // Ranked rows are visible in the scrollable list. Only rendered tiles, not
+        // children hidden by geometry/max-block limits, join the keyboard projection.
+        let visible = WizTreeSelectionProjection.items(mode: .treemap, branches: topBranches,
+            largestFiles: largestFiles, duplicateGroups: duplicateGroups, visibleBlocks: blocks)
+        pane.publishAnalysisItems(visible, rootPath: token.rootPath, generation: token.id)
+    }
 
-            var groups: [DuplicateFileGroup] = []
-            for (size, sameSizeList) in bySize where sameSizeList.count > 1 {
-                var byHash: [String: [FileItem]] = [:]
-                for entry in sameSizeList {
-                    let url = URL(fileURLWithPath: entry.fullPath)
-                    if let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) {
-                        let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-                        byHash[hash, default: []].append(entry.toFileItem())
+    private func trashAnalyzedItem(_ item: FileItem) {
+        let root = pane.currentURL.path
+        guard let token = scanToken, token.canPublish(active: scanToken, rootPath: root), !isScanning,
+              item.path.hasPrefix(root == "/" ? "/" : root + "/") else { return }
+        FileOperationsManager.shared.moveToTrash([item])
+        runActiveScan(for: pane.currentURL)
+    }
+
+    private func trashDuplicates(_ groups: [DuplicateFileGroup], onlyPath: String? = nil) {
+        guard let token = scanToken, token.canPublish(active: scanToken, rootPath: pane.currentURL.path),
+              !isScanning, !isValidatingDuplicates else { return }
+        isValidatingDuplicates = true
+        duplicateActionError = nil
+        Task.detached(priority: .userInitiated) {
+            do {
+                // Validate all content before starting; final per-file checks run in the mutation path.
+                for group in groups { try DuplicateFileSafety.validate(group, isCancelled: { token.isCancelled }) }
+                await MainActor.run {
+                    defer { self.isValidatingDuplicates = false }
+                    guard token.canPublish(active: self.scanToken, rootPath: self.pane.currentURL.path) else { return }
+                    for group in groups {
+                        let candidates = group.files.dropFirst().filter { onlyPath == nil || $0.path == onlyPath }
+                        FileOperationsManager.shared.moveToTrash(Array(candidates), validating: { item in
+                            guard !token.isCancelled else { throw DuplicateSafetyError.cancelled }
+                            try DuplicateFileSafety.validateBeforeTrash(item, in: group)
+                        })
                     }
+                    self.runActiveScan(for: self.pane.currentURL)
                 }
-                for (hash, files) in byHash where files.count > 1 {
-                    groups.append(DuplicateFileGroup(id: hash, sha256: hash, fileSize: size, files: files))
+            } catch {
+                await MainActor.run {
+                    self.isValidatingDuplicates = false
+                    guard token.canPublish(active: self.scanToken, rootPath: self.pane.currentURL.path) else { return }
+                    self.duplicateActionError = error.localizedDescription
+                    self.runActiveScan(for: self.pane.currentURL)
                 }
-            }
-            groups.sort { $0.wastedBytes > $1.wastedBytes }
-
-            Task { @MainActor in
-                self.duplicateGroups = groups
             }
         }
     }

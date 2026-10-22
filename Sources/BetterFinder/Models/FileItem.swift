@@ -319,12 +319,44 @@ public final class FileIconCache: ObservableObject {
         return queue
     }()
     @Published public private(set) var thumbnails: [String: NSImage] = [:]
-    private var inFlightThumbnails: Set<String> = []
+    private var inFlightThumbnails: [String: UUID] = [:]
+    private struct ThumbnailVersion: Equatable {
+        let size: Int64
+        let modified: Date
+        let created: Date
+    }
+    private var thumbnailVersions: [String: ThumbnailVersion] = [:]
+    // Injection exercises the actual cache and publication path without requiring
+    // a Quick Look extension in deterministic regression tests.
+    private let thumbnailGenerator: ((FileItem, @escaping (NSImage?) -> Void) -> Void)?
 
-    private init() {}
+    init(thumbnailGenerator: ((FileItem, @escaping (NSImage?) -> Void) -> Void)? = nil) {
+        self.thumbnailGenerator = thumbnailGenerator
+    }
+
+    public func invalidate(containing changedPath: String) {
+        let path = URL(fileURLWithPath: changedPath).standardizedFileURL.path
+        let candidates = Set(thumbnails.keys).union(inFlightThumbnails.keys).union(thumbnailVersions.keys)
+        for candidate in candidates where candidate == path || candidate.hasPrefix(path == "/" ? "/" : path + "/") {
+            thumbnails.removeValue(forKey: candidate)
+            inFlightThumbnails.removeValue(forKey: candidate)
+            thumbnailVersions.removeValue(forKey: candidate)
+            cache.removeValue(forKey: candidate)
+        }
+    }
+
+    private func synchronizeThumbnailVersion(for item: FileItem) {
+        let version = ThumbnailVersion(size: item.size, modified: item.modificationDate, created: item.creationDate)
+        if thumbnailVersions[item.path] != version {
+            thumbnails.removeValue(forKey: item.path)
+            inFlightThumbnails.removeValue(forKey: item.path)
+            thumbnailVersions[item.path] = version
+        }
+    }
 
     public func icon(for item: FileItem, preferThumbnail: Bool = true) -> NSImage {
-        if preferThumbnail, let thumb = thumbnails[item.path] {
+        if preferThumbnail && item.supportsRichThumbnail { synchronizeThumbnailVersion(for: item) }
+        if preferThumbnail && item.supportsRichThumbnail, let thumb = thumbnails[item.path] {
             return thumb
         }
         if preferThumbnail && item.supportsRichThumbnail {
@@ -355,30 +387,37 @@ public final class FileIconCache: ObservableObject {
     }
 
     public func requestThumbnailIfNeeded(for item: FileItem) {
+        guard item.supportsRichThumbnail else { return }
+        synchronizeThumbnailVersion(for: item)
         let path = item.path
-        guard thumbnails[path] == nil, !inFlightThumbnails.contains(path) else { return }
-        inFlightThumbnails.insert(path)
-
-        let req = QLThumbnailGenerator.Request(
-            fileAt: item.url,
-            size: CGSize(width: 160, height: 160),
-            scale: 2.0,
-            representationTypes: .thumbnail
-        )
-        QLThumbnailGenerator.shared.generateBestRepresentation(for: req) { [weak self] rep, _ in
-            guard let nsImg = rep?.nsImage else {
-                Task { @MainActor in
-                    self?.inFlightThumbnails.remove(path)
-                }
-                return
-            }
+        guard thumbnails[path] == nil, inFlightThumbnails[path] == nil else { return }
+        let requestID = UUID()
+        inFlightThumbnails[path] = requestID
+        let completion: (NSImage?) -> Void = { [weak self] image in
             Task { @MainActor in
-                guard let self = self else { return }
-                if self.thumbnails.count > 800 {
-                    self.thumbnails.removeAll(keepingCapacity: true)
+                guard let self, self.inFlightThumbnails[path] == requestID else { return }
+                self.inFlightThumbnails.removeValue(forKey: path)
+                guard let image else {
+                    self.thumbnailVersions.removeValue(forKey: path)
+                    return
                 }
-                self.thumbnails[path] = nsImg
-                self.inFlightThumbnails.remove(path)
+                if self.thumbnails.count >= 800 {
+                    self.thumbnails.removeAll(keepingCapacity: true)
+                    // Keep version tokens for in-flight requests only.
+                    self.thumbnailVersions = self.thumbnailVersions.filter { self.inFlightThumbnails[$0.key] != nil || $0.key == path }
+                }
+                self.thumbnails[path] = image
+            }
+        }
+        if let thumbnailGenerator {
+            thumbnailGenerator(item, completion)
+        } else {
+            let request = QLThumbnailGenerator.Request(
+                fileAt: item.url, size: CGSize(width: 160, height: 160), scale: 2.0,
+                representationTypes: .thumbnail
+            )
+            QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
+                completion(representation?.nsImage)
             }
         }
     }

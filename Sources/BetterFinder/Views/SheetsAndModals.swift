@@ -1,15 +1,75 @@
 import SwiftUI
 import AppKit
 
+struct QuickSearchRequest: Sendable {
+    let query: String
+    let rootPath: String
+    let includeHidden: Bool
+    let token: AnalysisRequestToken
+}
+
+@MainActor
+final class QuickSearchModel: ObservableObject {
+    @Published private(set) var results: [FileItem] = []
+    @Published private(set) var elapsedMs: Double = 0
+    @Published private(set) var isSearching = false
+    @Published private(set) var diagnostic: String?
+    private var task: Task<Void, Never>?
+    private var token: AnalysisRequestToken?
+    private let provider: @Sendable (QuickSearchRequest) -> FSearchResultBundle
+
+    init(provider: @escaping @Sendable (QuickSearchRequest) -> FSearchResultBundle = { request in
+        FSearchIndex.shared.search(rawQuery: request.query, scope: .wholeIndex,
+            scopeDirectory: request.rootPath, includeHidden: request.includeHidden, fuzzyEnabled: true,
+            isCancelled: { request.token.isCancelled })
+    }) { self.provider = provider }
+
+    func cancel() {
+        token?.cancel()
+        task?.cancel()
+        token = nil
+        isSearching = false
+    }
+
+    func schedule(_ query: String, rootPath: String, includeHidden: Bool, debounceNanoseconds: UInt64 = 180_000_000) {
+        cancel()
+        results = []
+        elapsedMs = 0
+        diagnostic = nil
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let current = AnalysisRequestToken(rootPath: rootPath)
+        token = current
+        isSearching = true
+        let request = QuickSearchRequest(query: trimmed, rootPath: rootPath, includeHidden: includeHidden, token: current)
+        let provider = self.provider
+        task = Task.detached(priority: .userInitiated) { [weak self] in
+            do { try await Task.sleep(nanoseconds: debounceNanoseconds) } catch { return }
+            guard !current.isCancelled else { return }
+            let bundle = provider(request)
+            guard !current.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self, current.canPublish(active: self.token, rootPath: rootPath) else { return }
+                self.results = bundle.items
+                self.elapsedMs = bundle.elapsedMilliseconds
+                self.diagnostic = bundle.diagnostic ?? (bundle.isPartial ? "Wyniki częściowe." : nil)
+                self.isSearching = false
+            }
+        }
+    }
+}
+
 // MARK: - 1. Instant Cmd+P Spotlight fsearch Modal
 
+@MainActor
 public struct QuickFSearchSpotlightModal: View {
     @ObservedObject var appState: AppState
     @ObservedObject var activeTab: PaneTabState
 
     @ViewState private var queryText: String = ""
-    @ViewState private var results: [FileItem] = []
-    @ViewState private var elapsedMs: Double = 0
+    @StateObject private var search = QuickSearchModel()
+    private var results: [FileItem] { search.results }
+    private var elapsedMs: Double { search.elapsedMs }
     @ViewState private var selectedIndex: Int = 0
     @FocusState private var isFocused: Bool
 
@@ -65,9 +125,9 @@ public struct QuickFSearchSpotlightModal: View {
                     Image(systemName: "sparkle.magnifyingglass")
                         .font(.system(size: 28))
                         .foregroundStyle(.secondary)
-                    Text(queryText.isEmpty
-                         ? "Wpisz zapytanie fsearch, aby przeszukać \(appState.indexedFileCount.formatted()) plików w < 1 ms"
-                         : "Brak pasujących wyników")
+                    Text(search.isSearching ? "Wyszukiwanie…" : (queryText.isEmpty
+                         ? "Wpisz zapytanie fsearch, aby przeszukać \(appState.indexedFileCount.formatted()) plików"
+                         : (search.diagnostic == nil ? "Brak pasujących wyników" : "Brak wyników w sprawdzonym zakresie")))
                         .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
                     HStack(spacing: 8) {
@@ -145,7 +205,7 @@ public struct QuickFSearchSpotlightModal: View {
             Divider()
 
             HStack {
-                Text("Kliknij lub Enter aby przejść do pliku/folderu · Esc aby zamknąć")
+                Text(search.diagnostic ?? "Kliknij lub Enter aby przejść do pliku/folderu · Esc aby zamknąć")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -158,37 +218,23 @@ public struct QuickFSearchSpotlightModal: View {
             .background(Color(nsColor: .windowBackgroundColor))
         }
         .frame(width: 680, height: 440)
-        .onAppear {
-            isFocused = true
-        }
+        .onAppear { isFocused = true }
+        .onDisappear { search.cancel() }
+        .onChange(of: activeTab.currentURL.path) { _, _ in runSpotlightQuery(queryText) }
+        .onChange(of: activeTab.showHiddenFiles) { _, _ in runSpotlightQuery(queryText) }
     }
 
     private func quickSampleButton(_ sample: String) -> some View {
         Button(sample) {
             queryText = sample
-            runSpotlightQuery(sample)
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
     }
 
     private func runSpotlightQuery(_ q: String) {
-        let trimmed = q.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else {
-            results = []
-            elapsedMs = 0
-            return
-        }
-        let bundle = FSearchIndex.shared.search(
-            rawQuery: trimmed,
-            scope: .wholeIndex,
-            scopeDirectory: activeTab.currentURL.path,
-            includeHidden: activeTab.showHiddenFiles,
-            fuzzyEnabled: true
-        )
-        results = bundle.items
-        elapsedMs = bundle.elapsedMilliseconds
         selectedIndex = 0
+        search.schedule(q, rootPath: activeTab.currentURL.path, includeHidden: activeTab.showHiddenFiles)
     }
 
     private func activateSelectedResult(revealInFolder: Bool) {
@@ -345,12 +391,15 @@ public struct NewFolderSheetView: View {
 
 // MARK: - 4. Dual-Pane Folder Compare & Sync Sheet
 
-public struct FolderCompareEntry: Identifiable {
-    public enum Status: String {
+public struct FolderCompareEntry: Identifiable, Sendable {
+    public enum Status: String, Sendable {
         case onlyLeft = "Tylko w lewym"
         case onlyRight = "Tylko w prawym"
-        case modified = "Różny rozmiar/czas"
-        case identical = "Identyczne"
+        case modified = "Różna treść lub czas"
+        case identical = "Zgodna treść i czas"
+        case notCompared = "Podfolder: nieporównany"
+        case typeConflict = "Różny typ: sprawdź ręcznie"
+        case unreadable = "Nieodczytany / zmieniony"
     }
     public var id: String { name }
     public let name: String
@@ -359,15 +408,113 @@ public struct FolderCompareEntry: Identifiable {
     public let status: Status
 }
 
+/// Deliberately shallow comparison: common directories are UNKNOWN, never identical.
+/// This UI copies selected top-level files; it is not a recursive mirror/synchronizer.
+enum FolderComparison {
+    static func compare(left: URL, right: URL, includeHidden: Bool, token: AnalysisRequestToken) -> (entries: [FolderCompareEntry], diagnostic: String?) {
+        let leftRead = BulkCrawler.readDirectoryResult(at: left.path, includeHidden: includeHidden, isCancelled: { token.isCancelled })
+        let rightRead = BulkCrawler.readDirectoryResult(at: right.path, includeHidden: includeHidden, isCancelled: { token.isCancelled })
+        guard leftRead.isComplete && rightRead.isComplete else {
+            return ([], "Nie można w pełni odczytać obu katalogów. Kopiowanie wyłączone.")
+        }
+        let leftMap = Dictionary(uniqueKeysWithValues: leftRead.entries.map { ($0.name, $0.toFileItem(loadTags: false)) })
+        let rightMap = Dictionary(uniqueKeysWithValues: rightRead.entries.map { ($0.name, $0.toFileItem(loadTags: false)) })
+        var entries: [FolderCompareEntry] = []
+        for name in Set(leftMap.keys).union(rightMap.keys).sorted() {
+            if token.isCancelled { return ([], nil) }
+            let l = leftMap[name], r = rightMap[name]
+            let status: FolderCompareEntry.Status
+            if l == nil { status = .onlyRight }
+            else if r == nil { status = .onlyLeft }
+            else if let l, let r {
+                if l.isDirectory != r.isDirectory || l.isSymlink != r.isSymlink { status = .typeConflict }
+                else if l.isDirectory { status = .notCompared }
+                else {
+                    do {
+                        if l.isSymlink {
+                            let leftTarget = try FileManager.default.destinationOfSymbolicLink(atPath: l.path)
+                            let rightTarget = try FileManager.default.destinationOfSymbolicLink(atPath: r.path)
+                            status = leftTarget == rightTarget && l.modificationDate == r.modificationDate ? .identical : .modified
+                        } else {
+                            let lh = try DuplicateFileSafety.hash(at: l.url, isCancelled: { token.isCancelled })
+                            let rh = try DuplicateFileSafety.hash(at: r.url, isCancelled: { token.isCancelled })
+                            status = lh.hash == rh.hash && lh.snapshot.size == rh.snapshot.size
+                                && lh.snapshot.modifiedSeconds == rh.snapshot.modifiedSeconds
+                                && lh.snapshot.modifiedNanoseconds == rh.snapshot.modifiedNanoseconds ? .identical : .modified
+                        }
+                    } catch { status = .unreadable }
+                }
+            } else { status = .unreadable }
+            entries.append(FolderCompareEntry(name: name, leftItem: l, rightItem: r, status: status))
+        }
+        return (entries, nil)
+    }
+
+    static func copyCandidates(_ entries: [FolderCompareEntry], leftToRight: Bool) -> [URL] {
+        entries.compactMap { entry in
+            guard entry.status == .modified || entry.status == (leftToRight ? .onlyLeft : .onlyRight) else { return nil }
+            return leftToRight ? entry.leftItem?.url : entry.rightItem?.url
+        }
+    }
+}
+
+/// Both nested pane objects must be observed directly. AppState does not forward
+/// their objectWillChange, and a same-path refresh is a new comparison generation.
+struct FolderComparisonContext: Equatable, Sendable {
+    let leftID: UUID
+    let rightID: UUID
+    let leftPath: String
+    let rightPath: String
+    let leftRevision: UInt64
+    let rightRevision: UInt64
+    let leftHidden: Bool
+    let rightHidden: Bool
+
+    @MainActor init(left: PaneTabState, right: PaneTabState) {
+        leftID = left.id
+        rightID = right.id
+        leftPath = left.currentURL.path
+        rightPath = right.currentURL.path
+        leftRevision = left.directoryRevision
+        rightRevision = right.directoryRevision
+        leftHidden = left.showHiddenFiles
+        rightHidden = right.showHiddenFiles
+    }
+}
+
 public struct FolderCompareSheetView: View {
     @ObservedObject var appState: AppState
+
+    public init(appState: AppState) { self.appState = appState }
+
+    public var body: some View {
+        FolderComparisonContentView(appState: appState, leftPane: appState.leftTab, rightPane: appState.rightPane)
+            .id(appState.leftTab.id.uuidString + appState.rightPane.id.uuidString)
+    }
+}
+
+private struct FolderComparisonContentView: View {
+    @ObservedObject var appState: AppState
+    @ObservedObject var leftPane: PaneTabState
+    @ObservedObject var rightPane: PaneTabState
     @ObservedObject var fileOps = FileOperationsManager.shared
 
     @ViewState private var entries: [FolderCompareEntry] = []
     @ViewState private var hideIdentical: Bool = true
+    @ViewState private var compareTask: Task<Void, Never>?
+    @ViewState private var compareToken: AnalysisRequestToken?
+    @ViewState private var isComparing = false
+    @ViewState private var compareDiagnostic: String?
+    @ViewState private var comparedContext: FolderComparisonContext?
 
-    public init(appState: AppState) {
+    init(appState: AppState, leftPane: PaneTabState, rightPane: PaneTabState) {
         self.appState = appState
+        self.leftPane = leftPane
+        self.rightPane = rightPane
+    }
+
+    private var comparisonContext: FolderComparisonContext {
+        FolderComparisonContext(left: leftPane, right: rightPane)
     }
 
     private var filteredEntries: [FolderCompareEntry] {
@@ -375,15 +522,15 @@ public struct FolderCompareSheetView: View {
     }
 
     public var body: some View {
-        let leftURL = appState.leftTab.currentURL
-        let rightURL = appState.rightPane.currentURL
+        let leftURL = leftPane.currentURL
+        let rightURL = rightPane.currentURL
 
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Image(systemName: "arrow.left.arrow.right.square.fill")
                     .font(.system(size: 18))
                     .foregroundStyle(Color.accentColor)
-                Text("Porównanie i synchronizacja katalogów (Dual-Pane)")
+                Text("Porównanie bezpośredniej zawartości katalogów")
                     .font(.system(size: 15, weight: .bold))
                 Spacer()
                 Toggle("Ukryj identyczne", isOn: $hideIdentical)
@@ -404,6 +551,8 @@ public struct FolderCompareSheetView: View {
 
             Divider()
 
+            Text(compareDiagnostic ?? (isComparing ? "Porównywanie treści plików…" : "Porównanie treści i czasu plików, bez rekurencji. Wspólne podfoldery i konflikty typów wymagają osobnego porównania. Kopiowanie nie usuwa pozycji docelowych."))
+                .font(.system(size: 11)).foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(spacing: 3) {
                     ForEach(filteredEntries) { entry in
@@ -434,27 +583,12 @@ public struct FolderCompareSheetView: View {
             .frame(height: 230)
 
             HStack {
-                Button("Synchronizuj Lewy → Prawy") {
-                    let toCopy = entries.compactMap { e -> URL? in
-                        guard e.status == .onlyLeft || e.status == .modified else { return nil }
-                        return e.leftItem?.url
-                    }
-                    fileOps.performTransfer(sourceURLs: toCopy, into: rightURL, isMove: false, explicitPolicy: .overwrite)
-                    appState.rightPane.reloadDirectory()
-                    computeDiff()
-                }
-                .buttonStyle(.bordered)
-
-                Button("Synchronizuj Prawy → Lewy") {
-                    let toCopy = entries.compactMap { e -> URL? in
-                        guard e.status == .onlyRight || e.status == .modified else { return nil }
-                        return e.rightItem?.url
-                    }
-                    fileOps.performTransfer(sourceURLs: toCopy, into: leftURL, isMove: false, explicitPolicy: .overwrite)
-                    appState.leftTab.reloadDirectory()
-                    computeDiff()
-                }
-                .buttonStyle(.bordered)
+                Button("Kopiuj różnice Lewy → Prawy") { copyDifferences(leftToRight: true) }
+                    .buttonStyle(.bordered)
+                    .disabled(isComparing || compareDiagnostic != nil || comparedContext != comparisonContext || fileOps.isBusy)
+                Button("Kopiuj różnice Prawy → Lewy") { copyDifferences(leftToRight: false) }
+                    .buttonStyle(.bordered)
+                    .disabled(isComparing || compareDiagnostic != nil || comparedContext != comparisonContext || fileOps.isBusy)
 
                 Spacer()
 
@@ -466,9 +600,9 @@ public struct FolderCompareSheetView: View {
         }
         .padding(18)
         .frame(width: 620)
-        .onAppear {
-            computeDiff()
-        }
+        .onAppear { computeDiff() }
+        .onChange(of: comparisonContext) { _, _ in computeDiff() }
+        .onDisappear { compareToken?.cancel(); compareTask?.cancel() }
     }
 
     private func statusColor(_ status: FolderCompareEntry.Status) -> Color {
@@ -477,32 +611,50 @@ public struct FolderCompareSheetView: View {
         case .onlyRight: return .purple
         case .modified: return .orange
         case .identical: return .green
+        case .notCompared: return .secondary
+        case .typeConflict, .unreadable: return .red
         }
     }
 
     private func computeDiff() {
-        let leftMap = Dictionary(uniqueKeysWithValues: appState.leftTab.directoryItems.map { ($0.name, $0) })
-        let rightMap = Dictionary(uniqueKeysWithValues: appState.rightPane.directoryItems.map { ($0.name, $0) })
-        let allNames = Set(leftMap.keys).union(rightMap.keys).sorted()
-
-        var list: [FolderCompareEntry] = []
-        for name in allNames {
-            let l = leftMap[name]
-            let r = rightMap[name]
-            let status: FolderCompareEntry.Status
-            if l != nil && r == nil {
-                status = .onlyLeft
-            } else if l == nil && r != nil {
-                status = .onlyRight
-            } else if let li = l, let ri = r {
-                status = (li.size == ri.size) ? .identical : .modified
-            } else {
-                status = .identical
+        compareToken?.cancel()
+        compareTask?.cancel()
+        let context = comparisonContext
+        let left = leftPane.currentURL
+        let right = rightPane.currentURL
+        let includeHidden = context.leftHidden || context.rightHidden
+        let token = AnalysisRequestToken(rootPath: left.path)
+        compareToken = token
+        entries = []
+        compareDiagnostic = nil
+        comparedContext = nil
+        isComparing = true
+        compareTask = Task.detached(priority: .userInitiated) {
+            let result = FolderComparison.compare(left: left, right: right, includeHidden: includeHidden, token: token)
+            await MainActor.run {
+                guard token.canPublish(active: self.compareToken, rootPath: self.leftPane.currentURL.path),
+                      context == self.comparisonContext else { return }
+                self.entries = result.entries
+                self.compareDiagnostic = result.diagnostic
+                self.comparedContext = context
+                self.isComparing = false
             }
-            list.append(FolderCompareEntry(name: name, leftItem: l, rightItem: r, status: status))
         }
-        entries = list
     }
+
+    private func copyDifferences(leftToRight: Bool) {
+        guard !isComparing, compareDiagnostic == nil, comparedContext == comparisonContext,
+              let token = compareToken, token.canPublish(active: compareToken, rootPath: leftPane.currentURL.path) else { return }
+        let candidates = FolderComparison.copyCandidates(entries, leftToRight: leftToRight)
+        let destination = leftToRight ? rightPane.currentURL : leftPane.currentURL
+        fileOps.performTransfer(sourceURLs: candidates, into: destination, isMove: false, explicitPolicy: .ask) { _ in
+            guard token.canPublish(active: self.compareToken, rootPath: self.leftPane.currentURL.path) else { return }
+            self.leftPane.reloadDirectory()
+            self.rightPane.reloadDirectory()
+            self.computeDiff()
+        }
+    }
+
 }
 
 // MARK: - 5. File Conflict Resolution Sheet
@@ -584,7 +736,8 @@ public struct ConflictResolutionSheetView: View {
             into: c.destinationDirectory,
             isMove: c.isMove,
             explicitPolicy: policy,
-            copyAcrossVolumes: c.copyAcrossVolumes
+            copyAcrossVolumes: c.copyAcrossVolumes,
+            completion: c.completion
         )
         AppState.shared.activeTab.reloadDirectory()
         if AppState.shared.isDualPane {

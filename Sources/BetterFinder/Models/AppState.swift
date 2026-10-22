@@ -39,26 +39,51 @@ public struct VolumeInfoItem: Identifiable {
 public final class AppState: ObservableObject {
     public static let shared = AppState()
 
+    // A test executable must never restore or write the user's real preferences,
+    // enumerate their home, or automatically start the indexer.
+    private static let preferences: UserDefaults = {
+        #if BETTERFINDER_TESTING
+        guard let suite = UserDefaults(suiteName: "com.betterfinder.tests.\(UUID().uuidString)") else {
+            fatalError("Could not create isolated test preferences")
+        }
+        return suite
+        #else
+        return UserDefaults.standard
+        #endif
+    }()
+
+    private static var homeDirectoryURL: URL {
+        #if BETTERFINDER_TESTING
+        guard let root = ProcessInfo.processInfo.environment["BETTERFINDER_TEST_ROOT"],
+              root.hasPrefix("/"), FileManager.default.fileExists(atPath: root) else {
+            fatalError("BETTERFINDER_TEST_ROOT must identify an isolated test directory")
+        }
+        return URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL
+        #else
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        #endif
+    }
+
     @Published public var tabs: [PaneTabState] = []
     @Published public var activeTabId: UUID
 
     // Dual-pane mode
     @Published public var isDualPane: Bool = false {
-        didSet { UserDefaults.standard.set(isDualPane, forKey: "bf.isDualPane") }
+        didSet { Self.preferences.set(isDualPane, forKey: "bf.isDualPane") }
     }
     @Published public var rightPane: PaneTabState
     @Published public var activePaneSide: PaneSide = .left
 
     // UI Panels & Modals
     @Published public var showSidebar: Bool = true {
-        didSet { UserDefaults.standard.set(showSidebar, forKey: "bf.showSidebar") }
+        didSet { Self.preferences.set(showSidebar, forKey: "bf.showSidebar") }
     }
     @Published public private(set) var recentlyClosedTabs: [PaneTabState] = []
     @Published public var showInspector: Bool = false {
-        didSet { UserDefaults.standard.set(showInspector, forKey: "bf.showInspector") }
+        didSet { Self.preferences.set(showInspector, forKey: "bf.showInspector") }
     }
     @Published public var iconGridSize: Double = 64.0 {
-        didSet { UserDefaults.standard.set(iconGridSize, forKey: "bf.iconGridSize") }
+        didSet { Self.preferences.set(iconGridSize, forKey: "bf.iconGridSize") }
     }
     @Published public var showTerminalDrawer: Bool = false
     @Published public var showQuickFSearchModal: Bool = false
@@ -92,9 +117,9 @@ public final class AppState: ObservableObject {
     }
 
     private init() {
-        let defaults = UserDefaults.standard
-        let homeURL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-        let devLabPath = "\(NSHomeDirectory())/dev"
+        let defaults = Self.preferences
+        let homeURL = Self.homeDirectoryURL
+        let devLabPath = homeURL.appendingPathComponent("dev").path
         let defaultStartURL = FileManager.default.fileExists(atPath: devLabPath)
             ? URL(fileURLWithPath: devLabPath, isDirectory: true)
             : homeURL
@@ -135,7 +160,9 @@ public final class AppState: ObservableObject {
 
         setupSidebarLocations()
         loadPersistedBookmarksAndSmartFolders()
+        #if !BETTERFINDER_TESTING
         refreshMountedVolumes()
+        #endif
         setupIndexCallbacks()
     }
 
@@ -152,16 +179,29 @@ public final class AppState: ObservableObject {
         }
         FSearchIndex.shared.onDirectoryChangedOnDisk = { changedDirs in
             Task { @MainActor in
-                for tab in self.tabs + [self.rightPane] where tab.isAffectedByDirectoryChanges(changedDirs) {
-                    tab.refresh()
-                }
+                self.handleDirectoryChanges(changedDirs)
             }
         }
+        #if !BETTERFINDER_TESTING
         FSearchIndex.shared.startIndexing()
+        #else
+        isIndexing = false
+        #endif
+    }
+
+    public func handleDirectoryChanges(_ changedDirs: Set<String>) {
+        // Invalidate shared caches even when no current pane displays the folder.
+        for path in changedDirs {
+            FolderSizeCache.shared.invalidate(containing: path)
+            FileIconCache.shared.invalidate(containing: path)
+        }
+        for tab in tabs + [rightPane] where tab.isAffectedByDirectoryChanges(changedDirs) {
+            tab.refresh()
+        }
     }
 
     public func setupSidebarLocations() {
-        let home = NSHomeDirectory()
+        let home = Self.homeDirectoryURL.path
         let iCloudPath = "\(home)/Library/Mobile Documents/com~apple~CloudDocs"
         let trashPath = "\(home)/.Trash"
 
@@ -176,9 +216,11 @@ public final class AppState: ObservableObject {
         }
         candidates.append(contentsOf: [
             ("Projekty", "hammer.fill", "\(home)/dev"),
-            ("Aplikacje", "app.badge.fill", "/Applications"),
             ("Kosz", "trash.fill", trashPath)
         ])
+        #if !BETTERFINDER_TESTING
+        candidates.append(("Aplikacje", "app.badge.fill", "/Applications"))
+        #endif
 
         var favs: [SidebarLocationItem] = []
         for (title, icon, path) in candidates {
@@ -197,7 +239,7 @@ public final class AppState: ObservableObject {
     // MARK: - UserDefaults Persistence for Bookmarks, Smart Folders & Tabs
 
     private func loadPersistedBookmarksAndSmartFolders() {
-        let defaults = UserDefaults.standard
+        let defaults = Self.preferences
         if let paths = defaults.stringArray(forKey: "bf.customBookmarks") {
             customBookmarks = paths.compactMap { path in
                 var isDir: ObjCBool = false
@@ -214,8 +256,8 @@ public final class AppState: ObservableObject {
 
     public func persistTabsState() {
         let paths = tabs.map { $0.currentURL.path }
-        UserDefaults.standard.set(paths, forKey: "bf.openTabPaths")
-        UserDefaults.standard.set(tabs.firstIndex(where: { $0.id == activeTabId }) ?? 0, forKey: "bf.activeTabIndex")
+        Self.preferences.set(paths, forKey: "bf.openTabPaths")
+        Self.preferences.set(tabs.firstIndex(where: { $0.id == activeTabId }) ?? 0, forKey: "bf.activeTabIndex")
     }
 
     public func addBookmark(for url: URL) {
@@ -228,12 +270,12 @@ public final class AppState: ObservableObject {
             url: url,
             isCustomBookmark: true
         ))
-        UserDefaults.standard.set(customBookmarks.map { $0.url.path }, forKey: "bf.customBookmarks")
+        Self.preferences.set(customBookmarks.map { $0.url.path }, forKey: "bf.customBookmarks")
     }
 
     public func removeBookmark(_ item: SidebarLocationItem) {
         customBookmarks.removeAll { $0.id == item.id }
-        UserDefaults.standard.set(customBookmarks.map { $0.url.path }, forKey: "bf.customBookmarks")
+        Self.preferences.set(customBookmarks.map { $0.url.path }, forKey: "bf.customBookmarks")
     }
 
     public func saveSmartFolder(query: String, title: String? = nil) {
@@ -247,7 +289,7 @@ public final class AppState: ObservableObject {
         )
         savedSmartFolders.append(item)
         if let data = try? JSONEncoder().encode(savedSmartFolders) {
-            UserDefaults.standard.set(data, forKey: "bf.savedSmartFolders")
+            Self.preferences.set(data, forKey: "bf.savedSmartFolders")
         }
         FileOperationsManager.shared.lastStatusMessage = "Zapisano Smart Folder: \(item.title)"
     }
@@ -255,7 +297,7 @@ public final class AppState: ObservableObject {
     public func removeSmartFolder(_ item: SavedSmartFolderItem) {
         savedSmartFolders.removeAll { $0.id == item.id }
         if let data = try? JSONEncoder().encode(savedSmartFolders) {
-            UserDefaults.standard.set(data, forKey: "bf.savedSmartFolders")
+            Self.preferences.set(data, forKey: "bf.savedSmartFolders")
         }
     }
 

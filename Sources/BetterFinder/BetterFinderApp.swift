@@ -116,7 +116,7 @@ struct BetterFinderApp: App {
 
                 Button("Duplikuj zaznaczone") {
                     guard canUseFileCommands else { return }
-                    _ = fileOps.duplicateItems(appState.activeTab.selectedItems)
+                    fileOps.duplicateItems(appState.activeTab.selectedItems)
                     appState.activeTab.reloadDirectory()
                 }
                 .keyboardShortcut("d", modifiers: [.command])

@@ -4,6 +4,8 @@ import Foundation
 // Compile the actual production helpers in isolation. All file operations run in
 // a disposable fixture; the injected Trash is another folder inside that fixture.
 // Run: swift scripts/test_file_operations.swift
+// Full manager/history/ZIP/Git regressions also run in FileOperationSafetyTests
+// through scripts/run_tests.sh; do not treat this isolated helper suite as UI coverage.
 let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
 let manager = try String(contentsOf: project.appendingPathComponent("Sources/BetterFinder/Engine/FileOperationsManager.swift"), encoding: .utf8)
 let model = try String(contentsOf: project.appendingPathComponent("Sources/BetterFinder/Models/FileItem.swift"), encoding: .utf8)

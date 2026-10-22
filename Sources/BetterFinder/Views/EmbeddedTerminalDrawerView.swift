@@ -52,9 +52,23 @@ final class TerminalCommandSession: @unchecked Sendable {
         if let error = setupErrors.first(where: { $0 != 0 }) { Darwin.close(writeFD); throw posixError(error) }
         var argv = [strdup(shell), strdup("-c"), strdup(command), nil]
         defer { for pointer in argv { if let pointer { free(pointer) } } }
+        // Own a stable environment snapshot through the spawn call instead of
+        // relying on the C environment accessor unavailable in this Swift toolchain.
+        var environment: [UnsafeMutablePointer<CChar>?] = []
+        defer { for pointer in environment { if let pointer { free(pointer) } } }
+        for (key, value) in ProcessInfo.processInfo.environment {
+            guard let entry = strdup("\(key)=\(value)") else {
+                Darwin.close(writeFD)
+                throw posixError(ENOMEM)
+            }
+            environment.append(entry)
+        }
+        environment.append(nil)
         var pid: pid_t = 0
         let spawnError = argv.withUnsafeMutableBufferPointer { args in
-            posix_spawn(&pid, shell, &actions, &attributes, args.baseAddress!, _NSGetEnviron().pointee)
+            environment.withUnsafeMutableBufferPointer { env in
+                posix_spawn(&pid, shell, &actions, &attributes, args.baseAddress!, env.baseAddress!)
+            }
         }
         Darwin.close(writeFD)
         guard spawnError == 0 else { throw posixError(spawnError) }

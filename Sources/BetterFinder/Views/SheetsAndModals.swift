@@ -968,6 +968,7 @@ public struct FSearchSettingsSheetView: View {
     }
 
     public var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
             HStack {
                 Image(systemName: "gearshape.2.fill")
@@ -979,6 +980,24 @@ public struct FSearchSettingsSheetView: View {
                 Spacer()
             }
 
+            Divider()
+
+            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                Toggle("Zapisuj i przywracaj sesję", isOn: Binding(
+                    get: { appState.restoreSessionEnabled },
+                    set: { appState.setSessionRestorationEnabled($0) }
+                ))
+                Text("Zmiany sesji obowiązują od razu, niezależnie od przycisków na dole. Lokalnie zapisywane są ścieżki, kolejność kart, oba panele, widoki i tekst wyszukiwania. Zaznaczenia, schowek, cofanie i operacje nie są przywracane. Foldery wracają wstrzymane do chwili wybrania „Wznów”.")
+                    .font(FinderUI.captionFont).foregroundStyle(.secondary)
+                Text("Wyłączenie zatrzymuje zapis i przywracanie, ale zachowuje poprzedni zapis. Włączenie zapisuje bieżącą sesję. Wyczyszczenie usuwa zapis i wyłącza tę opcję; otwarte karty i inteligentne foldery pozostają bez zmian.")
+                    .font(FinderUI.captionFont).foregroundStyle(.secondary)
+                if let notice = appState.sessionPersistenceNotice {
+                    Text(notice).font(FinderUI.captionFont).foregroundStyle(.orange)
+                }
+                Button("Wyczyść zapis sesji i wyłącz przywracanie", role: .destructive) {
+                    appState.clearSavedSession()
+                }.buttonStyle(.bordered)
+            }
             Divider()
 
             // Indexed Roots
@@ -1109,6 +1128,8 @@ public struct FSearchSettingsSheetView: View {
         .controlSize(.regular)
         .padding(FinderUI.sheetPadding)
         .frame(width: 580)
+        }
+        .frame(maxHeight: 760)
     }
 
     private func addRoot() {

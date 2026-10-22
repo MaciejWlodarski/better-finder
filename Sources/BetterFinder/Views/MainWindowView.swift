@@ -197,6 +197,7 @@ private struct FinderStatusBar: View {
     }
 
     private var selectionDescription: String {
+        if activeTab.isSessionPaused { return "Zapisany widok · wstrzymany" }
         let items = activeTab.selectedItems
         let summary = FinderSelectionSummary(pane: activeTab)
         guard !items.isEmpty, !summary.isSearching else { return summary.countDescription }

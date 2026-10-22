@@ -13,6 +13,7 @@ public struct SmartSearchPreset: Identifiable {
 public struct SidebarView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var activeTab: PaneTabState
+    @StateObject private var dropLoad = FileDropLoadController()
     @Environment(\.controlActiveState) private var controlActiveState
 
     @ViewState private var dropTargetedPath: String? = nil
@@ -72,12 +73,14 @@ public struct SidebarView: View {
                 .padding(.vertical, 14)
             }
 
+            FileDropLoadingStatusView(controller: dropLoad)
             Divider()
             indexFooter
         }
         .font(FinderUI.bodyFont)
         .background(VisualEffectBackground(material: .sidebar, blendingMode: .behindWindow))
         .accessibilityLabel("Pasek boczny")
+        .onDisappear { dropLoad.cancel() }
     }
 
     private var bookmarksSection: some View {
@@ -414,8 +417,7 @@ public struct SidebarView: View {
     private func handleDropFiles(providers: [NSItemProvider], into destinationURL: URL) -> Bool {
         guard FileDropLoader.accepts(providers) else { return false }
         let copyInstead = NSEvent.modifierFlags.contains(.option)
-        Task { @MainActor in
-            let urls = await FileDropLoader.urls(from: providers)
+        dropLoad.begin(providers: providers, destination: destinationURL) { urls in
             FileOperationsManager.shared.handleDropURLs(urls, into: destinationURL, copyInsteadOfMove: copyInstead)
         }
         return true

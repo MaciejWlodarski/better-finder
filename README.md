@@ -80,6 +80,16 @@ Historia operacji jest przechowywana w pamięci i nie stanowi dziennika odzyskiw
 
 Automatyczny podgląd Git wyłącza wykonywalne helpery fsmonitor oraz filtry clean/process i nie analizuje zawartości submodułów. Jest to porównanie surowych plików: w repozytoriach z filtrami, np. Git LFS, plik może być oznaczony jako zmieniony mimo czystego statusu w zaufanym Git. Błąd lub przekroczenie limitu inspekcji oznacza brak dostępnego statusu, nie „czyste repozytorium”.
 
+## Przywracanie sesji
+
+Sesja zapamiętuje lokalnie kolejność kart, oba panele, aktywną stronę, widok, sortowanie, ukryte pliki, fuzzy oraz zapytanie i jego zakres. Po ponownym uruchomieniu zapisane widoki są **wstrzymane**. Przycisk „Wznów zapisany widok” odczytuje wybrany folder oraz świadomie uruchamia zapisane wyszukiwanie lub analizę. Nie jest to automatyczne otwarcie wszystkich folderów przy starcie. Wybranie zapisanego wyszukiwania całego indeksu może pokazać jego wyniki bez otwierania wstrzymanego folderu; po wyczyszczeniu zapytania folder nadal wymaga wznowienia.
+
+Nieosiągalna lokalizacja pozostaje widoczna z własną ścieżką i ustawieniami. Można ponowić odczyt albo wybrać inną lokalizację. Przekroczenie czasu oczekiwania nie oznacza usunięcia folderu. Odtwarzanie nie dodaje katalogów do indeksu; zwykłe uruchomienie wcześniej skonfigurowanego indeksowania pozostaje odrębnym mechanizmem aplikacji.
+
+W ustawieniach „Zapisuj i przywracaj sesję” działa natychmiast, niezależnie od zapisu konfiguracji indeksu. Wyłączenie zatrzymuje nowe zapisy i odtwarzanie, zachowując poprzedni zapis. Ponowne włączenie zapisuje bieżący układ. „Wyczyść zapis sesji i wyłącz przywracanie” usuwa tylko zapis sesji oraz stary zapis ścieżek kart i wyłącza dalsze zapisy do ponownego włączenia opcji. Nie zamyka otwartych kart ani nie usuwa inteligentnych folderów i zakładek. Nieobsługiwany/uszkodzony zapis jest chroniony przed nadpisaniem do świadomego wyczyszczenia.
+
+Zaznaczenie, schowek, Undo/Redo, terminal, wyniki analizy i niedokończone operacje nie są zapisywane. Dane sesji nie są wysyłane ani synchronizowane przez aplikację. Nazwane przestrzenie robocze nie są jeszcze obsługiwane.
+
 ## Sprawdzenia
 
 ```sh

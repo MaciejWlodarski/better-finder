@@ -26,6 +26,7 @@ public struct FilePaneView: View {
     @ObservedObject var folderSizes = FolderSizeCache.shared
     @ObservedObject var fileOps = FileOperationsManager.shared
     @ObservedObject var iconCache = FileIconCache.shared
+    @StateObject private var dropLoad = FileDropLoadController()
     public let paneSide: PaneSide
     public let isFocusedPane: Bool
 
@@ -99,33 +100,39 @@ public struct FilePaneView: View {
                 trashActionBanner
             }
 
-            ZStack {
-                switch pane.viewMode {
-                case .list:
-                    listBrowserView
-                case .icons:
-                    iconGridBrowserView
-                case .columns:
-                    if !hasSearchQuery {
-                        millerColumnsBrowserView
-                    } else { listBrowserView }
-                case .wiztree:
-                    if !hasSearchQuery {
-                        WizTreeAnalyzerView(
-                            appState: appState,
-                            pane: pane,
-                            paneSide: paneSide,
-                            selectionBackgroundColor: selectionBackgroundColor,
-                            selectionForegroundColor: selectionForegroundColor
-                        )
-                    } else { listBrowserView }
-                }
+            FileDropLoadingStatusView(controller: dropLoad)
 
-                if showsPanePlaceholder && pane.displayedItems.isEmpty {
-                    if pane.isSearching {
-                        searchLoadingPlaceholder
-                    } else {
-                        emptyStatePlaceholder
+            ZStack {
+                if pane.isSessionPaused {
+                    restoredSessionPlaceholder
+                } else {
+                    switch pane.viewMode {
+                    case .list:
+                        listBrowserView
+                    case .icons:
+                        iconGridBrowserView
+                    case .columns:
+                        if !hasSearchQuery {
+                            millerColumnsBrowserView
+                        } else { listBrowserView }
+                    case .wiztree:
+                        if !hasSearchQuery {
+                            WizTreeAnalyzerView(
+                                appState: appState,
+                                pane: pane,
+                                paneSide: paneSide,
+                                selectionBackgroundColor: selectionBackgroundColor,
+                                selectionForegroundColor: selectionForegroundColor
+                            )
+                        } else { listBrowserView }
+                    }
+
+                    if showsPanePlaceholder && pane.displayedItems.isEmpty {
+                        if pane.isSearching {
+                            searchLoadingPlaceholder
+                        } else {
+                            emptyStatePlaceholder
+                        }
                     }
                 }
             }
@@ -138,10 +145,11 @@ public struct FilePaneView: View {
                     .allowsHitTesting(false)
             )
             .onDrop(of: [.fileURL], isTargeted: $isPaneDropTargeted) { providers in
-                handleDropProviders(providers: providers, into: pane.currentURL)
+                guard !pane.isSessionBrowsingPaused else { return false }
+                return handleDropProviders(providers: providers, into: pane.currentURL)
             }
             .contextMenu {
-                paneBackgroundContextMenu
+                if !pane.isSessionBrowsingPaused { paneBackgroundContextMenu }
             }
         }
         .overlay(
@@ -152,6 +160,9 @@ public struct FilePaneView: View {
                 )
                 .allowsHitTesting(false)
         )
+        .onDisappear { dropLoad.cancel() }
+        .onChange(of: pane.id) { _, _ in dropLoad.cancel() }
+        .onChange(of: pane.currentURL.path) { _, _ in dropLoad.cancel() }
         .coordinateSpace(name: "FilePaneSpace")
         .background(NativeFileDragSource(pane: pane, frames: dragFrames, isActive: isFocusedPane, activate: activatePane))
         .onPreferenceChange(FileDragFramesKey.self) { dragFrames = $0 }
@@ -167,6 +178,56 @@ public struct FilePaneView: View {
                 RenameItemSheet(item: item, pane: pane)
             }
         }
+    }
+
+    private var restoredSessionPlaceholder: some View {
+        VStack(spacing: FinderUI.sectionSpacing) {
+            Image(systemName: "pause.circle").font(.largeTitle).accessibilityHidden(true)
+            Text("Zapisany widok jest wstrzymany").font(FinderUI.bodyFont.weight(.semibold))
+            Text(pane.currentURL.path).font(FinderUI.detailFont).textSelection(.enabled)
+                .lineLimit(3).truncationMode(.middle).help(pane.currentURL.path)
+            if case .unavailable(let reason) = pane.sessionAvailability {
+                Text(reason).font(FinderUI.detailFont).foregroundStyle(.secondary)
+            } else {
+                Text("Folder nie został jeszcze odczytany. Wznowienie otworzy tę lokalizację i uruchomi zapisane wyszukiwanie lub analizę, jeśli były aktywne.")
+                    .font(FinderUI.detailFont).foregroundStyle(.secondary)
+            }
+            if !pane.searchQuery.isEmpty {
+                Text("Wyszukiwanie: \(pane.searchQuery)").font(FinderUI.detailFont).lineLimit(3)
+            }
+            if pane.sessionAvailability == .loading {
+                ProgressView("Otwieranie zapisanego widoku…")
+                Button("Anuluj") { pane.cancelSessionRestoration() }
+            } else {
+                Button("Wznów zapisany widok") {
+                    activatePane()
+                    Task {
+                        guard appState.activeTab.id == pane.id else { return }
+                        await pane.resumeSession()
+                    }
+                }.buttonStyle(.borderedProminent)
+                Button("Wybierz inną lokalizację…") {
+                    activatePane()
+                    let context = pane.savedSearchActivationContext
+                    let panel = NSOpenPanel()
+                    panel.canChooseFiles = false
+                    panel.canChooseDirectories = true
+                    panel.allowsMultipleSelection = false
+                    // Do not set directoryURL to the unavailable path.
+                    panel.begin { response in
+                        guard response == .OK, let url = panel.url else { return }
+                        Task { @MainActor in
+                            guard pane.savedSearchActivationContext == context,
+                                  appState.tabs.contains(where: { $0.id == pane.id }) || appState.rightPane.id == pane.id else { return }
+                            pane.navigate(to: url)
+                        }
+                    }
+                }
+            }
+        }
+        .multilineTextAlignment(.center)
+        .padding(FinderUI.sheetPadding)
+        .frame(maxWidth: 520)
     }
 
     // MARK: - 1. Native List View with Expandable Outline Tree (`▸`) & Drag/Drop
@@ -724,11 +785,12 @@ public struct FilePaneView: View {
     // MARK: - Drag & Drop Handler
 
     private func handleDropProviders(providers: [NSItemProvider], into destinationURL: URL) -> Bool {
-        guard FileDropLoader.accepts(providers) else { return false }
+        guard FileDropPaneContext.accepts(providers, in: pane) else { return false }
         activatePane()
         let copyInstead = NSEvent.modifierFlags.contains(.option)
-        Task { @MainActor in
-            let urls = await FileDropLoader.urls(from: providers)
+        let context = FileDropPaneContext(pane: pane)
+        dropLoad.begin(providers: providers, destination: destinationURL) { urls in
+            guard context.allowsCommit(in: appState, side: paneSide) else { return }
             fileOps.handleDropURLs(urls, into: destinationURL, copyInsteadOfMove: copyInstead)
         }
         return true

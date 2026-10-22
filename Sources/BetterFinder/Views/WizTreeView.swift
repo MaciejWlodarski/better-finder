@@ -1000,7 +1000,7 @@ public struct WizTreeAnalyzerView: View {
                     Label("Pokaż na liście plików", systemImage: "list.bullet")
                 }
                 Button {
-                    performPaneAction { QuickLookCoordinator.shared.preview(urls: [block.node.url]) }
+                    performPaneAction { QuickLookCoordinator.shared.preview(ownerID: pane.id, urls: [block.node.url]) }
                 } label: {
                     Label("Quick Look (Spacja)", systemImage: "eye")
                 }

@@ -51,8 +51,16 @@ public enum SortField: String, CaseIterable, Identifiable {
 public final class PaneTabState: ObservableObject, Identifiable {
     public let id = UUID()
 
+    /// Synchronous navigation identity for pending operations. Unlike a view
+    /// onChange callback this advances before another actor task can commit.
+    public private(set) var navigationRevision: UInt64 = 0
     @Published public var currentURL: URL {
-        didSet { if oldValue != currentURL { cancelSavedSearchActivation() } }
+        didSet {
+            if oldValue != currentURL {
+                navigationRevision &+= 1
+                cancelSavedSearchActivation()
+            }
+        }
     }
     @Published public var historyBack: [URL] = []
     @Published public var historyForward: [URL] = []
@@ -83,10 +91,10 @@ public final class PaneTabState: ObservableObject, Identifiable {
 
     // Integrated fsearch state
     @Published public var searchQuery: String = "" {
-        didSet { if oldValue != searchQuery { cancelSavedSearchActivation() } }
+        didSet { if oldValue != searchQuery { cancelSavedSearchActivation(); revokeResultsIfSessionPaused() } }
     }
     @Published public var searchScope: SearchScopeMode = .wholeIndex {
-        didSet { if oldValue != searchScope { cancelSavedSearchActivation() } }
+        didSet { if oldValue != searchScope { cancelSavedSearchActivation(); revokeResultsIfSessionPaused() } }
     }
     @Published public var fuzzyEnabled: Bool = true {
         didSet { if oldValue != fuzzyEnabled { cancelSavedSearchActivation() } }
@@ -142,6 +150,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
 
     /// The only projection eligible for keyboard commands and file operations.
     public var selectableItems: [FileItem] {
+        if isSessionPaused { return [] }
         if viewMode == .wiztree && searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return analysisRootPath == currentURL.path ? analysisItems : []
         }
@@ -195,7 +204,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
         selectedPaths = Set(selected.map(\.path))
         selectionCursorPath = selected.last?.path
         selectionAnchorPath = selected.first?.path
-        QuickLookCoordinator.shared.updateIfVisible(urls: selectedItems.map(\.url))
+        QuickLookCoordinator.shared.updateIfVisible(ownerID: id, urls: selectedItems.map(\.url))
     }
 
     public func clearAnalysisSelection() {
@@ -204,6 +213,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
             selectedPaths.removeAll()
             selectionCursorPath = nil
             selectionAnchorPath = nil
+            QuickLookCoordinator.shared.updateIfVisible(ownerID: id, urls: [])
         }
         analysisRootPath = nil
         analysisGeneration = nil
@@ -222,13 +232,81 @@ public final class PaneTabState: ObservableObject, Identifiable {
         selectedPaths.formIntersection(visible)
         if let cursor = selectionCursorPath, !visible.contains(cursor) { selectionCursorPath = nil }
         if let anchor = selectionAnchorPath, !visible.contains(anchor) { selectionAnchorPath = nil }
-        QuickLookCoordinator.shared.updateIfVisible(urls: selectedItems.map(\.url))
+        QuickLookCoordinator.shared.updateIfVisible(ownerID: id, urls: selectedItems.map(\.url))
     }
 
-    public init(initialURL: URL) {
+    enum SessionAvailability: Equatable {
+        case ready, paused, loading, unavailable(String)
+    }
+    let wasRestoredFromSession: Bool
+    @Published private(set) var sessionAvailability: SessionAvailability = .ready
+    private var sessionWork: SavedSearchWork<PreparedSavedSearch>?
+    private var permitsGlobalSearchWhileBrowsingPaused = false
+    var isSessionBrowsingPaused: Bool { sessionAvailability != .ready }
+    var isSessionPaused: Bool {
+        isSessionBrowsingPaused && !(permitsGlobalSearchWhileBrowsingPaused
+            && searchScope == .wholeIndex && !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    func cancelSessionRestoration() {
+        sessionWork?.cancel()
+        sessionWork = nil
+        if sessionAvailability == .loading { sessionAvailability = .paused }
+    }
+
+    /// User-triggered only. Reuses the saved-search queue (two bounded workers),
+    /// never adds roots to the index, and commits only the captured view context.
+    @discardableResult
+    func resumeSession(timeoutNanoseconds: UInt64 = 8_000_000_000,
+                       prepare: (@Sendable (String, Bool) throws -> PreparedSavedSearch)? = nil) async -> Bool {
+        guard isSessionBrowsingPaused else { return true }
+        cancelPendingSavedSearches()
+        let context = savedSearchActivationContext
+        let path = currentURL.path
+        let hidden = showHiddenFiles
+        let request = SavedSearchWork<PreparedSavedSearch>()
+        sessionWork = request
+        sessionAvailability = .loading
+        let timeout = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+            guard !Task.isCancelled, let self, self.sessionWork === request else { return }
+            request.cancel()
+            self.sessionAvailability = .unavailable("Folder nie odpowiedział na czas. Ścieżka została zachowana; nie oznacza to, że folder nie istnieje.")
+        }
+        defer {
+            timeout.cancel()
+            if sessionWork === request { sessionWork = nil }
+        }
+        do {
+            let prepared = try await SavedSearchPreparation.run({
+                if let prepare { return try prepare(path, hidden) }
+                return try FinderSessionPreparation.prepare(path: path, hidden: hidden, isCancelled: { request.isCancelled })
+            }, request: request)
+            guard !Task.isCancelled, !request.isCancelled, sessionWork === request,
+                  context == savedSearchActivationContext else { return false }
+            sessionWork = nil
+            sessionAvailability = .ready
+            directoryLoadGeneration &+= 1
+            directoryItems = sortItems(prepared.entries.map { $0.toFileItem(treeDepth: 0, loadTags: false) })
+            directoryRevision &+= 1
+            // The Resume action explicitly authorizes this saved search/analysis.
+            triggerSearch()
+            return true
+        } catch {
+            guard sessionWork === request, context == savedSearchActivationContext else { return false }
+            if sessionAvailability == .loading {
+                sessionAvailability = request.isCancelled ? .paused : .unavailable((error as? FinderSessionReadError)?.errorDescription
+                    ?? "Folder jest niedostępny lub nie można odczytać jego zawartości. Ścieżka i ustawienia zostały zachowane.")
+            }
+            return false
+        }
+    }
+
+    public init(initialURL: URL, loadImmediately: Bool = true) {
+        self.wasRestoredFromSession = !loadImmediately
         self.currentURL = initialURL.standardizedFileURL
         self.columnTrailURLs = [initialURL.standardizedFileURL]
-        reloadDirectory()
+        if loadImmediately { reloadDirectory() } else { sessionAvailability = .paused }
     }
 
     public func navigate(to url: URL, recordHistory: Bool = true) {
@@ -240,6 +318,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
             return
         }
 
+        sessionAvailability = .ready
         let standardized = url.standardizedFileURL
         if recordHistory && standardized.path != currentURL.path {
             historyBack.append(currentURL)
@@ -335,6 +414,14 @@ public final class PaneTabState: ObservableObject, Identifiable {
         tagOperations.removeAll()
         tagCache.removeAll()
         pendingTagPaths.removeAll()
+        if prepared.root != nil {
+            sessionAvailability = .ready
+            permitsGlobalSearchWhileBrowsingPaused = false
+        } else if isSessionBrowsingPaused {
+            // Explicit whole-index search may run without activating the saved
+            // browsing location. Clearing it must reveal the paused folder again.
+            permitsGlobalSearchWhileBrowsingPaused = true
+        }
         if viewMode == .wiztree { viewMode = .list }
         searchScope = item.scope
         showHiddenFiles = item.includeHidden
@@ -347,7 +434,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
             FolderSizeCache.shared.invalidate(containing: root.path)
             directoryItems = sortItems(prepared.entries.map { $0.toFileItem(treeDepth: 0, loadTags: false) })
             AppState.shared.persistTabsState()
-        } else if hiddenChanged {
+        } else if hiddenChanged && !isSessionBrowsingPaused {
             directoryItems.removeAll()
             refreshSavedSearchBrowsingSnapshot()
         }
@@ -362,6 +449,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     private func cancelSavedSearchActivation() {
+        cancelSessionRestoration()
         savedSearchActivationGeneration &+= 1
         savedSearchPreparation?.cancel()
         savedSearchPreparation = nil
@@ -426,6 +514,11 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     public func reloadDirectory() {
+        guard !isSessionBrowsingPaused else {
+            // Refresh an explicitly opened global query, never the paused root.
+            triggerSearch()
+            return
+        }
         cancelPendingSavedSearches()
         let targetPath = currentURL.path
         let includeHidden = showHiddenFiles
@@ -497,7 +590,23 @@ public final class PaneTabState: ObservableObject, Identifiable {
         }
     }
 
+    private func revokeResultsIfSessionPaused() {
+        guard isSessionPaused else { return }
+        searchTask?.cancel()
+        searchGeneration &+= 1
+        isSearching = false
+        displayedItems.removeAll()
+        selectedPaths.removeAll()
+        selectionCursorPath = nil
+        selectionAnchorPath = nil
+        reconcileSelection()
+    }
+
     public func triggerSearch() {
+        guard !isSessionPaused else {
+            revokeResultsIfSessionPaused()
+            return
+        }
         cancelSavedSearchActivation()
         searchTask?.cancel()
         searchGeneration &+= 1
@@ -527,7 +636,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
         // Never leave results from a previous query or directory actionable.
         // Same-context refreshes may restore selection only after fresh results commit.
         displayedItems.removeAll()
-        QuickLookCoordinator.shared.updateIfVisible(urls: [])
+        QuickLookCoordinator.shared.updateIfVisible(ownerID: id, urls: [])
         if parsed.validationError != nil {
             isSearching = false
             reconcileSelection()
@@ -569,6 +678,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
     /// Native tag providers can block on cloud/network metadata. Never query them
     /// while building a view or initializing a tab on the main actor.
     public func loadTagMetadataIfNeeded(for items: [FileItem]) {
+        guard !isSessionPaused else { return }
         let pending = items.filter { tagCache[$0.path] == nil && !pendingTagPaths.contains($0.path) }
         guard !pending.isEmpty else { return }
         pendingTagPaths.formUnion(pending.map(\.path))
@@ -653,7 +763,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
             selectionAnchorPath = item.path
         }
         selectionCursorPath = item.path
-        QuickLookCoordinator.shared.updateIfVisible(urls: selectedItems.map(\.url))
+        QuickLookCoordinator.shared.updateIfVisible(ownerID: id, urls: selectedItems.map(\.url))
     }
 
     public func moveSelection(by delta: Int, extending: Bool = false) {
@@ -671,7 +781,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
         selectedPaths = Set(items.map(\.path))
         selectionAnchorPath = items.first?.path
         selectionCursorPath = items.last?.path
-        QuickLookCoordinator.shared.updateIfVisible(urls: selectedItems.map(\.url))
+        QuickLookCoordinator.shared.updateIfVisible(ownerID: id, urls: selectedItems.map(\.url))
     }
 
     public func removeFilterPill(_ pill: ActiveFilterPill) {

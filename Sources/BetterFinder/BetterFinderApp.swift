@@ -348,7 +348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        AppState.shared.persistTabsState()
+        AppState.shared.flushSessionState()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     }
 }

@@ -1,6 +1,5 @@
 import Foundation
 import AppKit
-import CryptoKit
 import Darwin
 
 public enum NewFileTemplate: String, CaseIterable, Identifiable {
@@ -1456,28 +1455,6 @@ public final class FileOperationsManager: ObservableObject {
             }
         }
         return true
-    }
-
-    /// Streams the file in 1 MB chunks so even multi-GB files can be hashed without loading them into RAM.
-    nonisolated public static func computeHashes(for url: URL) -> (sha256: String, md5: String)? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        var sha = SHA256()
-        var md5 = Insecure.MD5()
-        while true {
-            let chunk: Data
-            do {
-                guard let data = try handle.read(upToCount: 1 << 20), !data.isEmpty else { break }
-                chunk = data
-            } catch {
-                return nil
-            }
-            sha.update(data: chunk)
-            md5.update(data: chunk)
-        }
-        let shaHex = sha.finalize().map { String(format: "%02x", $0) }.joined()
-        let md5Hex = md5.finalize().map { String(format: "%02x", $0) }.joined()
-        return (shaHex, md5Hex)
     }
 
     // MARK: - Developer & Power User Actions

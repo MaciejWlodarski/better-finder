@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import AppKit
 import QuickLookUI
 
@@ -58,18 +59,74 @@ public final class AppState: ObservableObject {
         #endif
     }
 
-    @Published public var tabs: [PaneTabState] = []
-    @Published public var activeTabId: UUID
+    @Published public var tabs: [PaneTabState] = [] {
+        didSet { observeSessionPanes(); synchronizeQuickLookOwnership() }
+    }
+    @Published public var activeTabId: UUID {
+        didSet {
+            if oldValue != activeTabId { tabs.first { $0.id == oldValue }?.cancelSessionRestoration() }
+            synchronizeQuickLookOwnership()
+        }
+    }
 
     // Dual-pane mode
     @Published public var isDualPane: Bool = false {
         didSet {
             Self.preferences.set(isDualPane, forKey: "bf.isDualPane")
             if !isDualPane { rightPane.cancelPendingSavedSearches() }
+            synchronizeQuickLookOwnership()
         }
     }
-    @Published public var rightPane: PaneTabState
-    @Published public var activePaneSide: PaneSide = .left
+    @Published public var rightPane: PaneTabState {
+        didSet { observeSessionPanes(); synchronizeQuickLookOwnership() }
+    }
+    @Published public var activePaneSide: PaneSide = .left {
+        didSet {
+            if oldValue != activePaneSide {
+                (oldValue == .left ? leftTab : rightPane).cancelSessionRestoration()
+            }
+            synchronizeQuickLookOwnership()
+        }
+    }
+    @Published public private(set) var restoreSessionEnabled = true
+    @Published public private(set) var sessionPersistenceNotice: String?
+    private let sessionStore: FinderSessionStore
+    private var sessionObservers: [AnyCancellable] = []
+    private var appSessionObserver: AnyCancellable?
+    private var sessionSaveTask: Task<Void, Never>?
+    private var sessionObservationReady = false
+
+    private func observeSessionPanes() {
+        guard sessionObservationReady else { return }
+        sessionObservers = (tabs + [rightPane]).map { pane in
+            pane.objectWillChange.sink { [weak self] _ in self?.scheduleSessionSave() }
+        }
+        scheduleSessionSave()
+    }
+
+    private func scheduleSessionSave() {
+        guard sessionObservationReady, restoreSessionEnabled else { return }
+        sessionSaveTask?.cancel()
+        sessionSaveTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !Task.isCancelled else { return }
+            self?.flushSessionState()
+        }
+    }
+
+    public func setSessionRestorationEnabled(_ enabled: Bool) {
+        sessionSaveTask?.cancel()
+        sessionStore.setEnabled(enabled)
+        restoreSessionEnabled = enabled
+        if enabled { flushSessionState() }
+    }
+
+    public func clearSavedSession() {
+        sessionSaveTask?.cancel()
+        sessionStore.clearAndDisable()
+        restoreSessionEnabled = false
+        sessionPersistenceNotice = nil
+    }
 
     // UI Panels & Modals
     @Published public var showSidebar: Bool = true {
@@ -117,39 +174,35 @@ public final class AppState: ObservableObject {
 
     private init() {
         let defaults = Self.preferences
+        let store = FinderSessionStore(defaults: defaults)
+        self.sessionStore = store
         let homeURL = Self.homeDirectoryURL
         let devLabPath = homeURL.appendingPathComponent("dev").path
         let defaultStartURL = FileManager.default.fileExists(atPath: devLabPath)
             ? URL(fileURLWithPath: devLabPath, isDirectory: true)
             : homeURL
 
-        // Restore persisted tabs or create default
-        var restoredTabs: [PaneTabState] = []
-        if let savedPaths = defaults.stringArray(forKey: "bf.openTabPaths") {
-            for p in savedPaths where FileManager.default.fileExists(atPath: p) {
-                restoredTabs.append(PaneTabState(initialURL: URL(fileURLWithPath: p, isDirectory: true)))
-            }
-        }
-        if restoredTabs.isEmpty {
-            restoredTabs = [PaneTabState(initialURL: defaultStartURL)]
-        }
-
-        let secondPane = PaneTabState(initialURL: homeURL)
+        let restored = store.load(defaultRightPath: homeURL.path)
+        let snapshot = restored.snapshot
+        let restoredTabs = snapshot?.tabs.map { $0.makePausedPane() }
+            ?? [PaneTabState(initialURL: defaultStartURL)]
         self.tabs = restoredTabs
-        self.activeTabId = restoredTabs[0].id
-        self.rightPane = secondPane
+        self.activeTabId = restoredTabs[snapshot?.activeIndex ?? 0].id
+        self.rightPane = snapshot?.right.makePausedPane() ?? PaneTabState(initialURL: homeURL)
+        self.restoreSessionEnabled = store.isEnabled
+        self.sessionPersistenceNotice = restored.notice
+        if let snapshot {
+            self.isDualPane = snapshot.dualPane
+            self.activePaneSide = snapshot.activeSide == "right" ? .right : .left
+        }
 
         if defaults.object(forKey: "bf.showSidebar") != nil {
             self.showSidebar = defaults.bool(forKey: "bf.showSidebar")
         }
-        let restoredActiveIndex = defaults.integer(forKey: "bf.activeTabIndex")
-        if restoredTabs.indices.contains(restoredActiveIndex) {
-            self.activeTabId = restoredTabs[restoredActiveIndex].id
-        }
         if defaults.object(forKey: "bf.showInspector") != nil {
             self.showInspector = defaults.bool(forKey: "bf.showInspector")
         }
-        if defaults.object(forKey: "bf.isDualPane") != nil {
+        if snapshot == nil, defaults.object(forKey: "bf.isDualPane") != nil {
             self.isDualPane = defaults.bool(forKey: "bf.isDualPane")
         }
         let savedIconSize = defaults.double(forKey: "bf.iconGridSize")
@@ -163,6 +216,9 @@ public final class AppState: ObservableObject {
         refreshMountedVolumes()
         #endif
         setupIndexCallbacks()
+        sessionObservationReady = true
+        observeSessionPanes()
+        appSessionObserver = objectWillChange.sink { [weak self] _ in self?.scheduleSessionSave() }
     }
 
     private func setupIndexCallbacks() {
@@ -253,11 +309,25 @@ public final class AppState: ObservableObject {
         }
     }
 
-    public func persistTabsState() {
-        let paths = tabs.map { $0.currentURL.path }
-        Self.preferences.set(paths, forKey: "bf.openTabPaths")
-        Self.preferences.set(tabs.firstIndex(where: { $0.id == activeTabId }) ?? 0, forKey: "bf.activeTabIndex")
+    public func persistTabsState() { scheduleSessionSave() }
+
+    /// Flush synchronously at normal termination; snapshots never include runtime actions.
+    public func flushSessionState() {
+        guard sessionObservationReady, restoreSessionEnabled else { return }
+        let snapshot = FinderSessionSnapshot(tabs: tabs.map { FinderPaneSession(pane: $0) },
+            right: FinderPaneSession(pane: rightPane),
+            activeIndex: tabs.firstIndex { $0.id == activeTabId } ?? 0,
+            dualPane: isDualPane, activeSide: activePaneSide.rawValue)
+        if sessionStore.save(snapshot) {
+            if sessionPersistenceNotice != nil { sessionPersistenceNotice = nil }
+        } else if sessionPersistenceNotice == nil {
+            sessionPersistenceNotice = "Nie zapisano sesji. Poprzedni zapis został zachowany."
+        }
     }
+
+    #if BETTERFINDER_TESTING
+    var hasPersistedSessionForTesting: Bool { Self.preferences.object(forKey: FinderSessionStore.dataKey) != nil }
+    #endif
 
     public func addBookmark(for url: URL) {
         var isDir: ObjCBool = false
@@ -439,7 +509,7 @@ public final class AppState: ObservableObject {
 
     public func toggleDualPane() {
         if !isDualPane {
-            rightPane.navigate(to: leftTab.currentURL, recordHistory: false)
+            if !rightPane.wasRestoredFromSession { rightPane.navigate(to: leftTab.currentURL, recordHistory: false) }
             isDualPane = true
         } else {
             isDualPane = false
@@ -447,50 +517,143 @@ public final class AppState: ObservableObject {
         }
     }
 
+    /// A preview remains bound to its initiating pane. Explicit context changes
+    /// close it; background updates must never choose a new owner implicitly.
+    private func synchronizeQuickLookOwnership() {
+        let visibleOwner: UUID?
+        if isDualPane && activePaneSide == .right {
+            visibleOwner = rightPane.id
+        } else {
+            visibleOwner = tabs.first(where: { $0.id == activeTabId })?.id ?? tabs.first?.id
+        }
+        QuickLookCoordinator.shared.retainOwner(visibleOwner)
+    }
+
     public func toggleQuickLook() {
-        let selected = activeTab.selectedItems
+        let pane = activeTab
+        let selected = pane.selectedItems
         guard !selected.isEmpty else { return }
-        QuickLookCoordinator.shared.preview(urls: selected.map(\.url))
+        QuickLookCoordinator.shared.preview(ownerID: pane.id, urls: selected.map(\.url))
     }
 }
 
-/// Native macOS QuickLook (`QLPreviewPanel`) bridge
+/// Value-only ownership state shared by the native bridge and focused tests.
+/// URLs may change only through an explicit preview or an update by this owner.
+struct QuickLookPreviewSession {
+    private(set) var ownerID: UUID?
+    private(set) var urls: [URL] = []
+
+    mutating func open(ownerID: UUID, urls: [URL]) {
+        guard !urls.isEmpty else { close(); return }
+        self.ownerID = ownerID
+        self.urls = urls
+    }
+
+    @discardableResult
+    mutating func update(ownerID: UUID, urls: [URL]) -> Bool {
+        guard self.ownerID == ownerID else { return false }
+        if urls.isEmpty { close() } else { self.urls = urls }
+        return true
+    }
+
+    mutating func close() { ownerID = nil; urls = [] }
+}
+
+@MainActor
+protocol QuickLookPanelDriving: AnyObject {
+    var isVisible: Bool { get }
+    func show(coordinator: QuickLookCoordinator) -> Bool
+    func reload()
+    func hide()
+}
+
+/// Only this adapter touches QLPreviewPanel. Ownership transitions can be tested
+/// with an inert driver without presenting a native window or loading file data.
+@MainActor
+private final class NativeQuickLookPanelDriver: QuickLookPanelDriving {
+    var isVisible: Bool {
+        QLPreviewPanel.sharedPreviewPanelExists() && (QLPreviewPanel.shared()?.isVisible == true)
+    }
+    func show(coordinator: QuickLookCoordinator) -> Bool {
+        guard let panel = QLPreviewPanel.shared() else { return false }
+        panel.dataSource = coordinator
+        panel.delegate = coordinator
+        panel.makeKeyAndOrderFront(nil)
+        panel.reloadData()
+        return true
+    }
+    func reload() {
+        guard QLPreviewPanel.sharedPreviewPanelExists(), let panel = QLPreviewPanel.shared() else { return }
+        panel.reloadData()
+    }
+    func hide() {
+        guard QLPreviewPanel.sharedPreviewPanelExists(), let panel = QLPreviewPanel.shared() else { return }
+        panel.orderOut(nil)
+    }
+}
+
+/// Native macOS QuickLook (`QLPreviewPanel`) bridge with explicit pane ownership.
 @MainActor
 public final class QuickLookCoordinator: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    #if BETTERFINDER_TESTING
+    public static var shared = QuickLookCoordinator()
+    #else
     public static let shared = QuickLookCoordinator()
-    private var previewURLs: [URL] = []
+    #endif
+    private let panelDriver: any QuickLookPanelDriving
+    private(set) var session = QuickLookPreviewSession()
 
-    public func preview(urls: [URL]) {
-        self.previewURLs = urls
-        guard let panel = QLPreviewPanel.shared() else { return }
-        panel.dataSource = self
-        panel.delegate = self
-        if panel.isVisible {
-            panel.reloadData()
-            panel.orderOut(nil)
-        } else {
-            panel.makeKeyAndOrderFront(nil)
-            panel.reloadData()
+    override init() {
+        panelDriver = NativeQuickLookPanelDriver()
+        super.init()
+    }
+    init(panelDriver: any QuickLookPanelDriving) {
+        self.panelDriver = panelDriver
+        super.init()
+    }
+
+    public func preview(ownerID: UUID, urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        if !panelDriver.isVisible { session.close() }
+        if session.ownerID == ownerID {
+            close()
+            return
+        }
+        // A new explicit preview may transfer a visible session to another pane;
+        // background selection reconciliation cannot do so.
+        session.open(ownerID: ownerID, urls: urls)
+        if panelDriver.isVisible {
+            panelDriver.reload()
+        } else if !panelDriver.show(coordinator: self) {
+            session.close()
         }
     }
 
-    public func updateIfVisible(urls: [URL]) {
-        guard QLPreviewPanel.sharedPreviewPanelExists(),
-              let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
-        self.previewURLs = urls
-        panel.reloadData()
+    public func updateIfVisible(ownerID: UUID, urls: [URL]) {
+        guard panelDriver.isVisible else { session.close(); return }
+        guard session.update(ownerID: ownerID, urls: urls) else { return }
+        if session.ownerID == nil { panelDriver.hide() } else { panelDriver.reload() }
+    }
+
+    /// Switching context or removing/hiding the owner closes instead of rebinding.
+    public func retainOwner(_ visibleOwner: UUID?) {
+        guard let owner = session.ownerID, owner != visibleOwner else { return }
+        close()
+    }
+
+    private func close() {
+        session.close()
+        panelDriver.hide()
     }
 
     nonisolated public func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        MainActor.assumeIsolated {
-            previewURLs.count
-        }
+        MainActor.assumeIsolated { session.urls.count }
     }
 
     nonisolated public func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
         MainActor.assumeIsolated {
-            guard index >= 0 && index < previewURLs.count else { return nil }
-            return previewURLs[index] as NSURL
+            guard index >= 0 && index < session.urls.count else { return nil }
+            return session.urls[index] as NSURL
         }
     }
 }

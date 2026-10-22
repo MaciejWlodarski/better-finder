@@ -80,6 +80,11 @@ struct FileOperationSafetyTests {
     }
 
     static func runAll() async throws -> Int {
+        try await testChecksumWatchdogAndLiveOwnership()
+        try await testChecksumsMatchKnownRegularFiles()
+        try await testChecksumsRejectSpecialEntriesAndOpenRace()
+        try await testChecksumsCancelRunningAndQueuedWork()
+        try await testChecksumsRejectChangedFiles()
         try await testPermissionEditsPreserveFreshUnrequestedBits()
         try await testPermissionEditsRefuseUnsafeEntriesAndMasks()
         try await testPermissionWorkStaysResponsiveAndGated()
@@ -113,10 +118,204 @@ struct FileOperationSafetyTests {
         try testBoundedGitInspectionAndDriverNames()
         try testGitRenameRecordPairs()
         #if BETTERFINDER_TESTING
-        return 30
+        return 35
         #else
-        return 29
+        return 34
         #endif
+    }
+
+    private typealias ChecksumResult = Result<FileChecksumDigest, FileChecksumFailure>
+
+    /// Exactly-once timeout escapes an uninterruptible worker without awaiting
+    /// it. A failure reaches TestRunner's exit(1), so a blocked FIFO cannot hold
+    /// the native regression process forever. No structured child-task join.
+    @MainActor private final class ChecksumWaiter {
+        private var continuation: CheckedContinuation<ChecksumResult, Never>?
+        private var request: FileChecksumRequest?
+        private var deadline: Task<Void, Never>?
+        init(_ continuation: CheckedContinuation<ChecksumResult, Never>) { self.continuation = continuation }
+        func attach(_ request: FileChecksumRequest, timeout: Duration) {
+            guard continuation != nil else { request.cancel(); return }
+            self.request = request
+            deadline = Task { @MainActor in
+                do { try await Task.sleep(for: timeout) } catch { return }
+                self.finish(.failure(.io("Checksum watchdog timed out")), cancel: true)
+            }
+        }
+        func finish(_ result: ChecksumResult, cancel: Bool = false) {
+            guard let waiting = continuation else { return }
+            continuation = nil
+            deadline?.cancel()
+            deadline = nil
+            if cancel { request?.cancel() }
+            request = nil
+            waiting.resume(returning: result)
+        }
+    }
+
+    private static func boundedChecksum(timeout: Duration = .seconds(5),
+        start: (@escaping @MainActor @Sendable (ChecksumResult) -> Void) -> FileChecksumRequest) async -> ChecksumResult {
+        await withCheckedContinuation { continuation in
+            let waiter = ChecksumWaiter(continuation)
+            let request = start { waiter.finish($0) }
+            waiter.attach(request, timeout: timeout)
+        }
+    }
+
+    private static func checksum(_ url: URL, service: FileChecksumService = .shared,
+                                 hooks: FileChecksumHooks = FileChecksumHooks()) async -> ChecksumResult {
+        await boundedChecksum { completion in service.start(for: url, hooks: hooks, completion: completion) }
+    }
+
+    private static func testChecksumWatchdogAndLiveOwnership() async throws {
+        let abandoned = FileChecksumRequest()
+        var lateCompletion: (@MainActor @Sendable (ChecksumResult) -> Void)?
+        let timeout = await boundedChecksum(timeout: .milliseconds(30)) { completion in
+            // Inject a worker that never completes: only the independent
+            // deadline can release this await. Deliver late only afterward.
+            lateCompletion = completion
+            return abandoned
+        }
+        guard case .failure(.io(let reason)) = timeout else { throw RegressionFailure(description: "Watchdog did not fire") }
+        try expect(reason == "Checksum watchdog timed out" && abandoned.isCancelled)
+        try expect(lateCompletion != nil)
+        lateCompletion?(.success(FileChecksumDigest(sha256: "late", md5: "late")))
+
+        let paneA = UUID(), paneB = UUID(), request = UUID()
+        let context = FileChecksumPublicationContext(requestID: request, paneID: paneA, revision: 7, path: "/same-path")
+        func accepted(owner: UUID, id: UUID? = nil, revision: UInt64 = 7, path: String? = "/same-path") -> Bool {
+            context.canPublish(currentRequestID: id ?? request, activePaneID: owner, sourceRevision: revision, selectedPath: path)
+        }
+        try expect(accepted(owner: paneA))
+        // Live owner changes before deferred onChange cancellation. Old pane's
+        // path, revision, and request remain identical, but publication fails.
+        try expect(!accepted(owner: paneB))
+        let retryID = UUID()
+        // ABA: after leaving A and lifecycle cancellation, returning to A at
+        // the same path/revision cannot revive the invalidated request nonce.
+        try expect(!accepted(owner: paneA, id: retryID))
+        try expect(!accepted(owner: paneA, revision: 8))
+        try expect(!accepted(owner: paneA, path: nil))
+        try expect(!accepted(owner: paneA, path: "/other"))
+        let retry = FileChecksumPublicationContext(requestID: retryID, paneID: paneB, revision: 7, path: "/same-path")
+        try expect(retry.canPublish(currentRequestID: retryID, activePaneID: paneB, sourceRevision: 7, selectedPath: "/same-path"))
+    }
+
+    private static func checksumFinished(_ request: FileChecksumRequest) async throws {
+        let deadline = Date().addingTimeInterval(10)
+        while !request.isFinished && Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        try expect(request.isFinished)
+    }
+
+    private final class ChecksumProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var chunks = 0
+        func record() { lock.lock(); chunks += 1; lock.unlock() }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return chunks }
+    }
+
+    private static func testChecksumsMatchKnownRegularFiles() async throws {
+        let f = try Fixture()
+        let url = f.sourceDirectory.appendingPathComponent("hash.txt")
+        for (text, sha, md5) in [
+            ("", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "d41d8cd98f00b204e9800998ecf8427e"),
+            ("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "900150983cd24fb0d6963f7d28e17f72")
+        ] {
+            try f.write(text, to: url)
+            let result = await checksum(url)
+            guard case .success(let digest) = result else { throw RegressionFailure(description: "Regular file checksum failed") }
+            try expect(digest.sha256 == sha && digest.md5 == md5)
+        }
+    }
+
+    private static func testChecksumsRejectSpecialEntriesAndOpenRace() async throws {
+        let f = try Fixture()
+        let fifo = f.sourceDirectory.appendingPathComponent("fifo")
+        try expect(fifo.path.withCString { Darwin.mkfifo($0, 0o600) } == 0)
+        let link = f.sourceDirectory.appendingPathComponent("zero-link")
+        try f.fm.createSymbolicLink(atPath: link.path, withDestinationPath: "/dev/zero")
+        for url in [fifo, link, f.sourceDirectory] {
+            let result = await checksum(url)
+            guard case .failure(.notRegular) = result else { throw RegressionFailure(description: "Special entry accepted") }
+        }
+        // Race a validated regular path into a FIFO before open. NONBLOCK must
+        // prevent an indefinite FIFO open; descriptor validation rejects it.
+        let raced = f.sourceDirectory.appendingPathComponent("raced")
+        try f.write("original", to: raced)
+        let saved = f.sourceDirectory.appendingPathComponent("saved")
+        let hooks = FileChecksumHooks(beforeOpen: {
+            try FileManager.default.moveItem(at: raced, to: saved)
+            guard raced.path.withCString({ Darwin.mkfifo($0, 0o600) }) == 0 else {
+                throw RegressionFailure(description: "Cannot create race fixture")
+            }
+        })
+        let raceResult = await checksum(raced, hooks: hooks)
+        guard case .failure(.notRegular) = raceResult else { throw RegressionFailure(description: "FIFO open race accepted") }
+    }
+
+    private static func testChecksumsCancelRunningAndQueuedWork() async throws {
+        let f = try Fixture()
+        let url = f.sourceDirectory.appendingPathComponent("large")
+        try Data(repeating: 0x61, count: 3 << 20).write(to: url)
+        let service = FileChecksumService(maxConcurrentOperations: 2)
+        let control = Control()
+        defer { control.release.signal() }
+        let probe = ChecksumProbe()
+        var cancelledCallback = false
+        let running = service.start(for: url, hooks: FileChecksumHooks(afterChunk: { chunk in
+            probe.record()
+            if chunk == 1 { try control.hold() }
+        })) { _ in cancelledCallback = true }
+        try await entered(control)
+        try expect(!control.ranOnMain)
+        running.cancel()
+        control.release.signal()
+        try await checksumFinished(running)
+        try expect(probe.count == 1)
+        try await Task.sleep(for: .milliseconds(20))
+        try expect(!cancelledCallback)
+
+        let controls = [Control(), Control(), Control()]
+        defer { controls.forEach { $0.release.signal() } }
+        let first = service.start(for: url, hooks: FileChecksumHooks(beforeOpen: { try controls[0].hold() })) { _ in }
+        let second = service.start(for: url, hooks: FileChecksumHooks(beforeOpen: { try controls[1].hold() })) { _ in }
+        try await entered(controls[0]); try await entered(controls[1])
+        var queuedCallback = false
+        let queued = service.start(for: url, hooks: FileChecksumHooks(beforeOpen: { try controls[2].hold() })) { _ in queuedCallback = true }
+        try await Task.sleep(for: .milliseconds(50))
+        try expect(!controls[2].didEnter && !controls[0].ranOnMain && !controls[1].ranOnMain)
+        queued.cancel()
+        controls[0].release.signal(); controls[1].release.signal()
+        try await checksumFinished(first); try await checksumFinished(second)
+        try await checksumFinished(queued)
+        try await Task.sleep(for: .milliseconds(20))
+        try expect(!controls[2].didEnter && !queuedCallback)
+        guard case .success = await checksum(url, service: service) else {
+            throw RegressionFailure(description: "Canceled queue did not recover")
+        }
+    }
+
+    private static func testChecksumsRejectChangedFiles() async throws {
+        for replacePath in [false, true] {
+            let f = try Fixture()
+            let url = f.sourceDirectory.appendingPathComponent("changing")
+            try Data(repeating: 0x61, count: 2 << 20).write(to: url)
+            let saved = f.sourceDirectory.appendingPathComponent("saved")
+            let hooks = FileChecksumHooks(afterChunk: { chunk in
+                guard chunk == 1 else { return }
+                if replacePath {
+                    try FileManager.default.moveItem(at: url, to: saved)
+                    try Data("replacement".utf8).write(to: url)
+                } else {
+                    let writer = try FileHandle(forWritingTo: url)
+                    defer { try? writer.close() }
+                    try writer.seekToEnd()
+                    try writer.write(contentsOf: Data("appended".utf8))
+                }
+            })
+            let result = await checksum(url, hooks: hooks)
+            guard case .failure(.changed) = result else { throw RegressionFailure(description: "Changed file checksum published") }
+        }
     }
 
     private static func editPermissions(_ manager: FileOperationsManager, _ item: FileItem,

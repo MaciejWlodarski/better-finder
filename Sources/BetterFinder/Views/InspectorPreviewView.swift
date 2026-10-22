@@ -28,6 +28,7 @@ public struct InspectorPreviewView: View {
     @ViewState private var isComputingHash: Bool = false
     @ViewState private var hashErrorMessage: String? = nil
     @ViewState private var hashRequestID = UUID()
+    @ViewState private var hashRequest: FileChecksumRequest?
 
     public init(appState: AppState, activeTab: PaneTabState) {
         self.appState = appState
@@ -271,22 +272,15 @@ public struct InspectorPreviewView: View {
                     loadPreviewAndMetadata(for: item)
                 }
                 .onChange(of: item.path) { _, _ in
-                    hashRequestID = UUID()
-                    isComputingHash = false
-                    sha256Hash = nil
-                    md5Hash = nil
-                    hashErrorMessage = nil
+                    cancelHashes()
                     loadPreviewAndMetadata(for: item)
                 }
                 .onChange(of: activeTab.id) { _, _ in
+                    cancelHashes()
                     loadPermissions(for: item)
                 }
                 .onChange(of: activeTab.directoryRevision) { _, _ in
-                    hashRequestID = UUID()
-                    isComputingHash = false
-                    sha256Hash = nil
-                    md5Hash = nil
-                    hashErrorMessage = nil
+                    cancelHashes()
                     loadPreviewAndMetadata(for: item)
                 }
                 .onChange(of: folderSizes.result(for: item.path)) { _, result in
@@ -298,11 +292,7 @@ public struct InspectorPreviewView: View {
                     permissionReadOperation?.cancel()
                     permissionRequestID = UUID()
                     permissionSnapshot = nil
-                    hashRequestID = UUID()
-                    isComputingHash = false
-                    sha256Hash = nil
-                    md5Hash = nil
-                    hashErrorMessage = nil
+                    cancelHashes()
                 }
             } else {
                 // Current Folder Summary when no file is selected
@@ -466,6 +456,7 @@ public struct InspectorPreviewView: View {
         permissionError = nil
         let accepted = fileOps.updatePosixPermissions(change, for: item, expectedIdentity: snapshot.identity) { updated, error in
             guard self.permissionRequestID == requestID, self.activeTab.id == tabID,
+                  self.appState.activeTab.id == tabID,
                   self.activeTab.directoryRevision == revision,
                   self.activeTab.primarySelectedItem?.path == item.path else { return }
             self.permissionError = error
@@ -497,6 +488,7 @@ public struct InspectorPreviewView: View {
             let error = failure
             Task { @MainActor in
                 guard self.permissionRequestID == requestID, self.activeTab.id == tabID,
+                  self.appState.activeTab.id == tabID,
                       self.activeTab.directoryRevision == revision,
                       self.activeTab.primarySelectedItem?.path == item.path else { return }
                 self.permissionSnapshot = result
@@ -511,6 +503,39 @@ public struct InspectorPreviewView: View {
 
     // MARK: - Checksums Section (SHA-256 / MD5)
 
+    private func cancelHashes() {
+        hashRequest?.cancel()
+        hashRequest = nil
+        hashRequestID = UUID()
+        isComputingHash = false
+        sha256Hash = nil
+        md5Hash = nil
+        hashErrorMessage = nil
+    }
+
+    private func startHashes(for item: FileItem) {
+        cancelHashes()
+        isComputingHash = true
+        let context = FileChecksumPublicationContext(requestID: hashRequestID, paneID: activeTab.id,
+                                                     revision: activeTab.directoryRevision, path: item.path)
+        hashRequest = FileChecksumService.shared.start(for: item.url) { result in
+            guard context.canPublish(currentRequestID: self.hashRequestID,
+                                     activePaneID: self.appState.activeTab.id,
+                                     sourceRevision: self.activeTab.directoryRevision,
+                                     selectedPath: self.activeTab.primarySelectedItem?.path) else { return }
+            self.hashRequest = nil
+            self.isComputingHash = false
+            switch result {
+            case .success(let digest):
+                self.sha256Hash = digest.sha256
+                self.md5Hash = digest.md5
+                self.hashErrorMessage = nil
+            case .failure(let error):
+                self.hashErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
     private func checksumsSection(for item: FileItem) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
@@ -520,22 +545,7 @@ public struct InspectorPreviewView: View {
                     .accessibilityAddTraits(.isHeader)
                 if sha256Hash == nil {
                     Button {
-                        isComputingHash = true
-                        hashErrorMessage = nil
-                        let requestID = UUID()
-                        hashRequestID = requestID
-                        let url = item.url
-                        DispatchQueue.global(qos: .userInitiated).async {
-                            let hashes = FileOperationsManager.computeHashes(for: url)
-                            Task { @MainActor in
-                                guard self.hashRequestID == requestID,
-                                      self.activeTab.primarySelectedItem?.path == url.path else { return }
-                                self.sha256Hash = hashes?.sha256
-                                self.md5Hash = hashes?.md5
-                                self.hashErrorMessage = hashes == nil ? "Nie udało się odczytać pliku. Spróbuj ponownie." : nil
-                                self.isComputingHash = false
-                            }
-                        }
+                        startHashes(for: item)
                     } label: {
                         HStack(spacing: 4) {
                             if isComputingHash {
@@ -551,6 +561,11 @@ public struct InspectorPreviewView: View {
                     .controlSize(.small)
                     .disabled(isComputingHash)
                     .accessibilityLabel(isComputingHash ? "Obliczanie sum kontrolnych" : "Oblicz sumy kontrolne SHA-256 i MD5")
+                    if isComputingHash {
+                        Button("Anuluj obliczanie", systemImage: "xmark.circle") { cancelHashes() }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                    }
                 }
             }
 

@@ -266,6 +266,9 @@ struct SearchIndexRegressionTests {
             print("Git fixture diagnostic: root=\(root.path); candidates=\(entries.map(\.fullPath)); results=\(modified.items.map(\.path)); partial=\(modified.isPartial); diagnostic=\(modified.diagnostic ?? "none"); snapshotRoot=\(snapshot?.repositoryRoot ?? "unavailable"); statuses=\(snapshot?.statuses.description ?? "unavailable")")
         }
         try expect(modified.items.map(\.name) == ["tracked.txt"])
+        let modifiedSnapshot = FileOperationsManager.fetchGitStatusSnapshot(for: root.path)
+        try expect(modifiedSnapshot?.repositoryRoot == root.path)
+        try expect(modifiedSnapshot?.statuses[file.path] == .modified)
         try write("original", to: file)
         try expect(query(index, "git:modified", root, scope: .currentFolder).items.isEmpty)
         let snapshot = FileOperationsManager.fetchGitStatusSnapshot(for: root.path)

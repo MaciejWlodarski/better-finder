@@ -59,6 +59,7 @@ public final class FSearchIndex: @unchecked Sendable {
     var refreshReadHookForTesting: (@Sendable (String) -> Void)?
     var crawlProgressHookForTesting: (@Sendable (Int) -> Void)?
     var beforeCrawlLockHookForTesting: (@Sendable () -> Void)?
+    var beforeCacheWriteHookForTesting: (@Sendable () -> Void)?
     var pendingRefreshPathCountForTesting: Int {
         stateLock.lock(); defer { stateLock.unlock() }
         return pendingRefreshPaths.count + (pendingRefreshAllRoots ? 1 : 0)
@@ -284,7 +285,7 @@ public final class FSearchIndex: @unchecked Sendable {
                 let configuredEntries = result.entries.filter { entry in
                     normalizedConfiguredRoots.contains { Self.isWithin(entry.fullPath, root: $0) }
                 }
-                self.saveIndexToDiskMMapCache(configuredEntries)
+                self.saveIndexToDiskMMapCache(configuredEntries, configuration: configuration)
             }
             self.stateLock.lock()
             let repeatCrawl = self.pendingReindex || configurationChanged
@@ -299,16 +300,21 @@ public final class FSearchIndex: @unchecked Sendable {
 
     // MARK: - Persistent Binary MMap Index Serialization
 
-    private func saveIndexToDiskMMapCache(_ list: [IndexedFileEntry]) {
+    private func saveIndexToDiskMMapCache(_ list: [IndexedFileEntry], configuration: Data) {
         guard let path = validatedCacheFilePath() else { return }
-        let data = encodeIndexCache(list)
+        #if BETTERFINDER_TESTING
+        beforeCacheWriteHookForTesting?()
+        #endif
+        // The label belongs to the crawl that produced these entries. Settings
+        // may change after the earlier freshness check, even during encoding.
+        let data = encodeIndexCache(list, configuration: configuration)
         try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
         _ = chmod(path, 0o600)
     }
 
     // Shared with the native regression harness; production persistence uses
     // these exact all-or-nothing codec paths, not a duplicated test model.
-    func encodeIndexCache(_ list: [IndexedFileEntry]) -> Data {
+    func encodeIndexCache(_ list: [IndexedFileEntry], configuration: Data? = nil) -> Data {
         var data = Data()
         data.reserveCapacity(list.count * 64)
 
@@ -323,7 +329,7 @@ public final class FSearchIndex: @unchecked Sendable {
         withUnsafeBytes(of: &version) { data.append(contentsOf: $0) }
         withUnsafeBytes(of: &count) { data.append(contentsOf: $0) }
 
-        let context = cacheConfigurationData()
+        let context = configuration ?? cacheConfigurationData()
         var contextLength = UInt32(context.count)
         withUnsafeBytes(of: &contextLength) { data.append(contentsOf: $0) }
         data.append(context)

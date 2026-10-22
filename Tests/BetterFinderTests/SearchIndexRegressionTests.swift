@@ -20,6 +20,7 @@ struct SearchIndexRegressionTests {
         try refreshStormCoalescesAndRetainsSecondPass()
         try await eventsDuringInitialCrawlAreReconciled()
         try await supplementalScopesSurviveFullRebuildInterleavings()
+        try await cacheRetainsCrawlConfigurationWhenSettingsChangeBeforeWrite()
         #endif
         print("PASS search/index parser, crawl, rename, memory, grep, cache, Git and serialization regressions")
     }
@@ -428,6 +429,30 @@ struct SearchIndexRegressionTests {
         gate.release.signal()
         try expect(completed.wait(timeout: .now() + 10) == .success)
         try expect(query(index, "^queued-new.txt", root).items.count == 1)
+    }
+
+    private static func cacheRetainsCrawlConfigurationWhenSettingsChangeBeforeWrite() async throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = root.appendingPathComponent("original", isDirectory: true)
+        let replacement = root.appendingPathComponent("replacement", isDirectory: true)
+        try write("old snapshot", to: original.appendingPathComponent("original.txt"))
+        try write("new scope", to: replacement.appendingPathComponent("replacement.txt"))
+        let index = engine(original)
+        index.usePersistentMMapCache = true
+        // Deterministically change settings AFTER the crawl's freshness check,
+        // before the encoder labels its payload. Never label A's entries as B.
+        index.beforeCacheWriteHookForTesting = { [weak index] in
+            index?.configuredRoots = [replacement.path]
+        }
+        index.startIndexing()
+        for _ in 0..<1000 where index.isIndexing { try await Task.sleep(for: .milliseconds(10)) }
+        try expect(!index.isIndexing)
+        let data = try Data(contentsOf: URL(fileURLWithPath: index.cacheFilePath))
+        try expect(index.configuredRoots == [replacement.path])
+        try expect(index.decodeIndexCache(data) == nil)
+        index.configuredRoots = [original.path]
+        try expect(index.decodeIndexCache(data)?.map(\.name) == ["original.txt"])
     }
 
     private static func supplementalScopesSurviveFullRebuildInterleavings() async throws {

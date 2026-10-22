@@ -5,6 +5,7 @@ public struct InspectorPreviewView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var activeTab: PaneTabState
     @ObservedObject var folderSizes = FolderSizeCache.shared
+    @ViewState private var folderSizeOwner = UUID()
     @ObservedObject var fileOps = FileOperationsManager.shared
     @ObservedObject private var iconCache = FileIconCache.shared
 
@@ -40,6 +41,14 @@ public struct InspectorPreviewView: View {
     public init(appState: AppState, activeTab: PaneTabState) {
         self.appState = appState
         self.activeTab = activeTab
+    }
+
+    private var folderSizeDemandPaths: [String] {
+        activeTab.selectedItems.filter(\.isDirectory).map(\.path).sorted()
+    }
+
+    private func updateFolderSizeDemand() {
+        folderSizes.updateDemand(owner: folderSizeOwner, paths: folderSizeDemandPaths)
     }
 
     public var body: some View {
@@ -172,9 +181,19 @@ public struct InspectorPreviewView: View {
                             metadataRow(
                                 label: "Rozmiar",
                                 value: item.isDirectory
-                                    ? (folderSizes.displaySize(for: item.path) ?? "Obliczanie…")
+                                    ? (folderSizes.displaySize(for: item.path) ?? folderSizes.statusText(for: item.path))
                                     : FormatHelpers.formatBytes(item.size)
                             )
+                            if item.isDirectory && folderSizes.status(for: item.path) == .deferred {
+                                Text("Limit aktywnych folderów. Zamknij inne widoki i ponów.")
+                                    .font(FinderUI.captionFont)
+                                Button("Ponów rozmiar") { updateFolderSizeDemand() }
+                            } else if item.isDirectory, let result = folderSizes.result(for: item.path), !result.isComplete {
+                                Text(result.unreadableDirectoryCount > 0
+                                    ? "Dolne oszacowanie: części katalogów nie można odczytać."
+                                    : "Dolne oszacowanie: skan osiągnął limit.")
+                                    .font(FinderUI.captionFont)
+                            }
                             metadataRow(label: "Zmodyfikowano", value: FormatHelpers.formatDate(item.modificationDate))
 
                             // The editable value has its own line so the narrow inspector stays readable.
@@ -290,11 +309,6 @@ public struct InspectorPreviewView: View {
                     cancelHashes()
                     loadPreviewAndMetadata(for: item)
                 }
-                .onChange(of: folderSizes.result(for: item.path)) { _, result in
-                    if item.isDirectory && result == nil {
-                        folderSizes.requestSizeIfNeeded(for: item.path)
-                    }
-                }
                 .onDisappear {
                     cancelPreview()
                     permissionReadOperation?.cancel()
@@ -349,13 +363,23 @@ public struct InspectorPreviewView: View {
             }
         }
         .background(VisualEffectBackground(material: .sidebar, blendingMode: .withinWindow))
+        .onAppear { updateFolderSizeDemand() }
+        .onChange(of: folderSizeDemandPaths) { _, _ in updateFolderSizeDemand() }
+        .onChange(of: activeTab.id) { _, _ in updateFolderSizeDemand() }
+        .onChange(of: activeTab.directoryRevision) { _, _ in updateFolderSizeDemand() }
+        .onDisappear { folderSizes.release(owner: folderSizeOwner) }
     }
 
     private var selectionSummary: some View {
         let items = activeTab.selectedItems
         let folders = items.filter(\.isDirectory)
-        let knownBytes = items.reduce(Int64(0)) { $0 + ($1.isDirectory ? (folderSizes.result(for: $1.path)?.bytes ?? 0) : $1.size) }
-        let hasUnknownSize = folders.contains { folderSizes.size(for: $0.path) == nil }
+        let observed = items.reduce((bytes: Int64(0), overflowed: false)) { total, item in
+            let bytes = max(0, item.isDirectory ? (folderSizes.result(for: item.path)?.bytes ?? 0) : item.size)
+            let (sum, overflow) = total.bytes.addingReportingOverflow(bytes)
+            return (overflow ? Int64.max : sum, total.overflowed || overflow)
+        }
+        let knownBytes = observed.bytes
+        let hasUnknownSize = observed.overflowed || folders.contains { folderSizes.size(for: $0.path) == nil }
         return VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
             Image(systemName: "doc.on.doc")
                 .font(.system(size: 40, weight: .light))
@@ -370,6 +394,14 @@ public struct InspectorPreviewView: View {
                 metadataRow(label: "Rozmiar", value: "\(hasUnknownSize ? "≥ " : "")\(FormatHelpers.formatBytes(knownBytes))")
             }
             .font(FinderUI.detailFont)
+            if folders.contains(where: { folderSizes.status(for: $0.path) == .deferred }) {
+                Text("Suma częściowa: limit aktywnych folderów. Zmniejsz zaznaczenie lub zamknij inne widoki, a następnie ponów.")
+                    .font(FinderUI.captionFont)
+                Button("Ponów rozmiary") { updateFolderSizeDemand() }
+            } else if hasUnknownSize {
+                Text("Suma jest dolnym oszacowaniem; część folderów oczekuje na skan lub ma niepełny odczyt.")
+                    .font(FinderUI.captionFont)
+            }
             Divider()
             Button("Podgląd zaznaczenia", systemImage: "eye") { appState.toggleQuickLook() }
             Button("Udostępnij…", systemImage: "square.and.arrow.up") { fileOps.showShareSheet(for: items) }
@@ -379,14 +411,6 @@ public struct InspectorPreviewView: View {
         .controlSize(.small)
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .task(id: items.map(\.path)) {
-            for folder in folders { folderSizes.requestSizeIfNeeded(for: folder.path) }
-        }
-        .onChange(of: folderSizes.results) { _, _ in
-            for folder in folders where folderSizes.result(for: folder.path) == nil {
-                folderSizes.requestSizeIfNeeded(for: folder.path)
-            }
-        }
     }
 
     // MARK: - Interactive chmod Box
@@ -760,10 +784,6 @@ public struct InspectorPreviewView: View {
     }
 
     private func loadPreviewAndMetadata(for item: FileItem) {
-        if item.isDirectory {
-            folderSizes.requestSizeIfNeeded(for: item.path)
-        }
-
         loadPermissions(for: item)
 
         startPreview(for: item)

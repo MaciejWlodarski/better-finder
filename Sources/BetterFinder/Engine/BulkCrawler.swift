@@ -48,6 +48,11 @@ public struct IndexedFileEntry: Sendable {
         return "\(parentPath)/\(name)"
     }
 
+    /// Shared by display and age predicates; retain the crawler/cache subsecond value.
+    public var modificationDate: Date {
+        Date(timeIntervalSince1970: TimeInterval(mtimeEpoch) + TimeInterval(mtimeNanoseconds) / 1_000_000_000)
+    }
+
     public func toFileItem(
         grepMatch: GrepMatchSnippet? = nil,
         gitStatus: GitFileStatus? = nil,
@@ -57,7 +62,7 @@ public struct IndexedFileEntry: Sendable {
     ) -> FileItem {
         let p = fullPath
         let url = URL(fileURLWithPath: p, isDirectory: isDirectory)
-        let modDate = Date(timeIntervalSince1970: TimeInterval(mtimeEpoch) + TimeInterval(mtimeNanoseconds) / 1_000_000_000)
+        let modDate = modificationDate
         let tags = loadTags ? FinderTagColor.readTags(for: url) : []
         return FileItem(
             url: url,

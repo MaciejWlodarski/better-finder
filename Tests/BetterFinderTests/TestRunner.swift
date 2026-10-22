@@ -49,6 +49,8 @@ func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath
             try await tests.testExternalChangeInvalidatesFolderSizeWithoutVisiblePane()
             try tests.testColumnSortUsesPaneRulesAndUnknownSizesSortLast()
             try tests.testInvalidSearchClearsActionTargetsAndShowsDiagnostic()
+            try await SearchQuerySafetyRegressionTests.runAll()
+            try SearchMatchingPrecisionRegressionTests.runAll()
             try await SearchIndexRegressionTests.runAll()
             print("Search/index regression suite passed")
             try await SavedSearchRegressionTests().runAll()

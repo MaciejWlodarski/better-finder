@@ -147,7 +147,7 @@ extension NavigationTests {
         try Data("image".utf8).write(to: imageURL)
         let item = BulkCrawler.readDirectoryFast(at: root.path).first!.toFileItem()
         var completions: [(NSImage?) -> Void] = []
-        let cache = FileIconCache(thumbnailGenerator: { _, completion in completions.append(completion) })
+        let cache = FileIconCache(thumbnailGenerator: { _, completion in completions.append(completion); return {} })
         let oldImage = NSImage(size: NSSize(width: 1, height: 1))
         let newImage = NSImage(size: NSSize(width: 2, height: 2))
         cache.requestThumbnailIfNeeded(for: item)

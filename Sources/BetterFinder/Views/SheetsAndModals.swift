@@ -80,6 +80,7 @@ enum QuickSearchSelection {
 
 @MainActor
 public struct QuickFSearchSpotlightModal: View {
+    @ObservedObject private var iconCache = FileIconCache.shared
     @ObservedObject var appState: AppState
     @ObservedObject var activeTab: PaneTabState
 
@@ -182,7 +183,7 @@ public struct QuickFSearchSpotlightModal: View {
                             ForEach(Array(results.prefix(QuickSearchSelection.visibleResultLimit).enumerated()), id: \.element.id) { idx, item in
                                 let isHighlighted = (idx == selectedIndex)
                                 HStack(spacing: 10) {
-                                    Image(nsImage: FileIconCache.shared.icon(for: item))
+                                    Image(nsImage: iconCache.icon(for: item))
                                         .resizable()
                                         .frame(width: 24, height: 24)
                                         .accessibilityHidden(true)

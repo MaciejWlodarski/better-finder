@@ -319,38 +319,104 @@ public final class FileIconCache: ObservableObject {
         return queue
     }()
     @Published public private(set) var thumbnails: [String: NSImage] = [:]
-    private var inFlightThumbnails: [String: UUID] = [:]
+    // Work and result budgets are independent. Rejected demand is not retained;
+    // observers retry it when a completion/cancellation publishes capacity.
+    @Published private(set) var thumbnailCapacityRevision: UInt64 = 0
+    struct ThumbnailLimits {
+        var active = 4
+        var queued = 64
+        var cached = 800
+        var timeout: Duration = .seconds(10)
+        var maxQueueAge: Duration = .seconds(10)
+        var retryDelay: Duration = .seconds(2)
+        var retries = 2
+    }
     private struct ThumbnailVersion: Equatable {
         let size: Int64
         let modified: Date
         let created: Date
     }
-    private var thumbnailVersions: [String: ThumbnailVersion] = [:]
-    // Injection exercises the actual cache and publication path without requiring
-    // a Quick Look extension in deterministic regression tests.
-    private let thumbnailGenerator: ((FileItem, @escaping (NSImage?) -> Void) -> Void)?
-
-    init(thumbnailGenerator: ((FileItem, @escaping (NSImage?) -> Void) -> Void)? = nil) {
-        self.thumbnailGenerator = thumbnailGenerator
+    private struct ThumbnailWork {
+        let id: UUID
+        let item: FileItem
+        let version: ThumbnailVersion
+        let attempt: Int
+        let admittedAt = ContinuousClock.now
+        var cancel: (() -> Void)?
+        var deadline: Task<Void, Never>?
     }
+    private let thumbnailLimits: ThumbnailLimits
+    private var capacityNotificationPending = false
+    private var activeThumbnails: [String: ThumbnailWork] = [:]
+    private var queuedThumbnails: [ThumbnailWork] = []
+    private var thumbnailVersions: [String: ThumbnailVersion] = [:]
+    // Includes negative results: a failed provider must not create a redraw loop.
+    private var completedThumbnailPaths: [String] = []
+    private struct ThumbnailFailure {
+        let attempt: Int
+        let retryAt: ContinuousClock.Instant?
+    }
+    private var thumbnailFailures: [String: ThumbnailFailure] = [:]
+    private var retryWake: Task<Void, Never>?
+    typealias ThumbnailGenerator = @MainActor (FileItem, @escaping (NSImage?) -> Void) -> (() -> Void)
+    private let thumbnailGenerator: ThumbnailGenerator
+
+    init(thumbnailLimits: ThumbnailLimits = ThumbnailLimits(),
+         thumbnailGenerator: ThumbnailGenerator? = nil) {
+        precondition(thumbnailLimits.active > 0 && thumbnailLimits.queued >= 0 && thumbnailLimits.cached > 0 && thumbnailLimits.retries >= 0 && thumbnailLimits.retryDelay > .zero)
+        self.thumbnailLimits = thumbnailLimits
+        self.thumbnailGenerator = thumbnailGenerator ?? { item, completion in
+            FileIconCache.generateThumbnail(for: item, completion: completion)
+        }
+    }
+
+    private static func generateThumbnail(for item: FileItem, completion: @escaping (NSImage?) -> Void) -> (() -> Void) {
+        let request = QLThumbnailGenerator.Request(
+            fileAt: item.url, size: CGSize(width: 160, height: 160), scale: 2.0,
+            representationTypes: .thumbnail
+        )
+        let generator = QLThumbnailGenerator.shared
+        generator.generateBestRepresentation(for: request) { representation, _ in
+            completion(representation?.nsImage)
+        }
+        // Retain the exact native handle until completion or cancellation.
+        return { generator.cancel(request) }
+    }
+
+    var activeThumbnailCount: Int { activeThumbnails.count }
+    var queuedThumbnailCount: Int { queuedThumbnails.count }
+    var completedThumbnailCount: Int { completedThumbnailPaths.count }
+    var retainedThumbnailVersionCount: Int { thumbnailVersions.count }
 
     public func invalidate(containing changedPath: String) {
         let path = URL(fileURLWithPath: changedPath).standardizedFileURL.path
-        let candidates = Set(thumbnails.keys).union(inFlightThumbnails.keys).union(thumbnailVersions.keys)
+        let candidates = Set(thumbnailVersions.keys)
         for candidate in candidates where candidate == path || candidate.hasPrefix(path == "/" ? "/" : path + "/") {
-            thumbnails.removeValue(forKey: candidate)
-            inFlightThumbnails.removeValue(forKey: candidate)
-            thumbnailVersions.removeValue(forKey: candidate)
+            discardThumbnail(path: candidate)
             cache.removeValue(forKey: candidate)
         }
+        drainThumbnailQueue()
+        scheduleThumbnailRetryWake()
+        publishThumbnailCapacity()
+    }
+
+    private func discardThumbnail(path: String) {
+        // Remove identity BEFORE invoking cancel: cancellation can race completion.
+        let work = activeThumbnails.removeValue(forKey: path)
+        queuedThumbnails.removeAll { $0.item.path == path }
+        thumbnailVersions.removeValue(forKey: path)
+        completedThumbnailPaths.removeAll { $0 == path }
+        thumbnailFailures.removeValue(forKey: path)
+        if thumbnails[path] != nil { thumbnails.removeValue(forKey: path) }
+        work?.deadline?.cancel()
+        work?.cancel?()
     }
 
     private func synchronizeThumbnailVersion(for item: FileItem) {
         let version = ThumbnailVersion(size: item.size, modified: item.modificationDate, created: item.creationDate)
-        if thumbnailVersions[item.path] != version {
-            thumbnails.removeValue(forKey: item.path)
-            inFlightThumbnails.removeValue(forKey: item.path)
-            thumbnailVersions[item.path] = version
+        if let existing = thumbnailVersions[item.path], existing != version {
+            discardThumbnail(path: item.path)
+            drainThumbnailQueue()
         }
     }
 
@@ -390,35 +456,119 @@ public final class FileIconCache: ObservableObject {
         guard item.supportsRichThumbnail else { return }
         synchronizeThumbnailVersion(for: item)
         let path = item.path
-        guard thumbnails[path] == nil, inFlightThumbnails[path] == nil else { return }
-        let requestID = UUID()
-        inFlightThumbnails[path] = requestID
-        let completion: (NSImage?) -> Void = { [weak self] image in
-            Task { @MainActor in
-                guard let self, self.inFlightThumbnails[path] == requestID else { return }
-                self.inFlightThumbnails.removeValue(forKey: path)
-                guard let image else {
-                    self.thumbnailVersions.removeValue(forKey: path)
-                    return
-                }
-                if self.thumbnails.count >= 800 {
-                    self.thumbnails.removeAll(keepingCapacity: true)
-                    // Keep version tokens for in-flight requests only.
-                    self.thumbnailVersions = self.thumbnailVersions.filter { self.inFlightThumbnails[$0.key] != nil || $0.key == path }
-                }
-                self.thumbnails[path] = image
+        let retry = thumbnailFailures[path]
+        if thumbnailVersions[path] != nil {
+            guard let retryAt = retry?.retryAt, retryAt <= .now else { return }
+        }
+        // Keep admitted work FIFO. Never evict queued work silently: callers that
+        // were not admitted get another chance on the next capacity notification.
+        guard activeThumbnails.count < thumbnailLimits.active || queuedThumbnails.count < thumbnailLimits.queued else { return }
+        let version = ThumbnailVersion(size: item.size, modified: item.modificationDate, created: item.creationDate)
+        let work = ThumbnailWork(id: UUID(), item: item, version: version, attempt: retry.map { $0.attempt + 1 } ?? 0)
+        completedThumbnailPaths.removeAll { $0 == path }
+        thumbnailFailures.removeValue(forKey: path)
+        thumbnailVersions[path] = version
+        if activeThumbnails.count < thumbnailLimits.active {
+            startThumbnail(work)
+        } else {
+            queuedThumbnails.append(work)
+        }
+    }
+
+    private func startThumbnail(_ work: ThumbnailWork) {
+        let path = work.item.path
+        activeThumbnails[path] = work
+        let cancel = thumbnailGenerator(work.item) { [weak self] image in
+            Task { @MainActor [weak self] in
+                self?.completeThumbnail(path: path, id: work.id, version: work.version, image: image)
             }
         }
-        if let thumbnailGenerator {
-            thumbnailGenerator(item, completion)
-        } else {
-            let request = QLThumbnailGenerator.Request(
-                fileAt: item.url, size: CGSize(width: 160, height: 160), scale: 2.0,
-                representationTypes: .thumbnail
-            )
-            QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
-                completion(representation?.nsImage)
+        // Also safe with an injected generator that invokes completion inline:
+        // completion is always delivered through the main actor task above.
+        if activeThumbnails[path]?.id == work.id {
+            activeThumbnails[path]?.cancel = cancel
+            let timeout = thumbnailLimits.timeout
+            activeThumbnails[path]?.deadline = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: timeout) } catch { return }
+                guard let self, self.activeThumbnails[path]?.id == work.id else { return }
+                // A provider need not ever call back. Release logical admission
+                // after cancellation; framework cancellation remains best effort.
+                self.activeThumbnails[path]?.cancel?()
+                self.completeThumbnail(path: path, id: work.id, version: work.version, image: nil)
             }
+        } else {
+            cancel()
+        }
+    }
+
+    private func completeThumbnail(path: String, id: UUID, version: ThumbnailVersion, image: NSImage?) {
+        guard activeThumbnails[path]?.id == id, thumbnailVersions[path] == version else { return }
+        guard let finished = activeThumbnails.removeValue(forKey: path) else { return }
+        finished.deadline?.cancel()
+        while completedThumbnailPaths.count >= thumbnailLimits.cached {
+            let evicted = completedThumbnailPaths.removeFirst()
+            if thumbnails[evicted] != nil { thumbnails.removeValue(forKey: evicted) }
+            thumbnailVersions.removeValue(forKey: evicted)
+            thumbnailFailures.removeValue(forKey: evicted)
+        }
+        completedThumbnailPaths.append(path)
+        if let image {
+            thumbnails[path] = image
+        } else {
+            // A nil representation does not prove permanent lack of support:
+            // provider busy/errors and our deadline receive bounded delayed retries.
+            // Exhausted failures remain stable until invalidation/version change
+            // or ordinary bounded-cache eviction, avoiding a malformed-file loop.
+            let retryAt: ContinuousClock.Instant? = finished.attempt < thumbnailLimits.retries
+                ? .now.advanced(by: thumbnailLimits.retryDelay * (finished.attempt + 1)) : nil
+            thumbnailFailures[path] = ThumbnailFailure(attempt: finished.attempt, retryAt: retryAt)
+        }
+        scheduleThumbnailRetryWake()
+        drainThumbnailQueue()
+        // Success, error and cancellation must all wake rejected visible demand.
+        // No rejected-key set or scheduled retry tasks can grow without bound.
+        publishThumbnailCapacity()
+    }
+
+    private func scheduleThumbnailRetryWake() {
+        retryWake?.cancel()
+        retryWake = nil
+        let now = ContinuousClock.now
+        // Due failures remain cached until visible demand actually retries them.
+        // Do not spin or retain a task per failed file.
+        guard let next = thumbnailFailures.values.compactMap(\.retryAt).filter({ $0 > now }).min() else { return }
+        retryWake = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: now.duration(to: next)) } catch { return }
+            guard let self else { return }
+            self.publishThumbnailCapacity()
+            self.scheduleThumbnailRetryWake()
+        }
+    }
+
+    private func publishThumbnailCapacity() {
+        guard !capacityNotificationPending else { return }
+        capacityNotificationPending = true
+        Task { @MainActor [weak self] in
+            // Batch completions/invalidation bursts into one observer wake-up.
+            await Task.yield()
+            guard let self else { return }
+            self.capacityNotificationPending = false
+            self.thumbnailCapacityRevision &+= 1
+        }
+    }
+
+    private func drainThumbnailQueue() {
+        while activeThumbnails.count < thumbnailLimits.active && !queuedThumbnails.isEmpty {
+            let work = queuedThumbnails.removeFirst()
+            if work.admittedAt.duration(to: .now) >= thumbnailLimits.maxQueueAge {
+                // No per-view ownership exists in this shared cache. Expire old
+                // queued demand instead of letting a previous folder monopolize
+                // admission; still-visible views may re-admit after notification.
+                thumbnailVersions.removeValue(forKey: work.item.path)
+                publishThumbnailCapacity()
+                continue
+            }
+            startThumbnail(work)
         }
     }
 }

@@ -15,7 +15,8 @@ func section(_ text: String, from start: String, to end: String) -> String {
     }
     return String(text[a.lowerBound..<b.lowerBound])
 }
-let core = section(manager, from: "public enum FileHistoryAction", to: "/// Thread-safe cancellation flag")
+// Include the entry identity dependency introduced by guarded history actions.
+let core = section(manager, from: "struct FileEntryIdentity", to: "/// Thread-safe cancellation flag")
 let tags = section(model, from: "public enum FinderTagColor", to: "public enum FileKindCategory")
 let harness = #"""
 import Foundation

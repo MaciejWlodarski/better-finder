@@ -9,6 +9,13 @@ public struct InspectorPreviewView: View {
     @ObservedObject private var iconCache = FileIconCache.shared
 
     @ViewState private var textPreviewLines: [(Int, String)] = []
+    @ViewState private var preparedPreviewImage: NSImage?
+    @ViewState private var previewPixelWidth = 0
+    @ViewState private var previewPixelHeight = 0
+    @ViewState private var previewMessage: String?
+    @ViewState private var isPreparingPreview = false
+    @ViewState private var previewRequestID = UUID()
+    @ViewState private var previewRequest: InspectorPreviewRequest?
     @ViewState private var posixPermissionsString: String = "—"
     @ViewState private var currentModeBits: UInt16 = 0
     @ViewState private var permissionSnapshot: PosixPermissionSnapshot?
@@ -277,7 +284,7 @@ public struct InspectorPreviewView: View {
                 }
                 .onChange(of: activeTab.id) { _, _ in
                     cancelHashes()
-                    loadPermissions(for: item)
+                    loadPreviewAndMetadata(for: item)
                 }
                 .onChange(of: activeTab.directoryRevision) { _, _ in
                     cancelHashes()
@@ -289,6 +296,7 @@ public struct InspectorPreviewView: View {
                     }
                 }
                 .onDisappear {
+                    cancelPreview()
                     permissionReadOperation?.cancel()
                     permissionRequestID = UUID()
                     permissionSnapshot = nil
@@ -616,7 +624,12 @@ public struct InspectorPreviewView: View {
 
     @ViewBuilder
     private func livePreviewBox(for item: FileItem) -> some View {
-        if item.kindCategory == .image, let nsImg = NSImage(contentsOf: item.url) {
+        if isPreparingPreview {
+            ProgressView("Przygotowywanie podglądu…")
+                .controlSize(.small)
+                .frame(maxWidth: .infinity)
+                .padding(FinderUI.rowSpacing)
+        } else if let nsImg = preparedPreviewImage {
             VStack(spacing: 4) {
                 Image(nsImage: nsImg)
                     .resizable()
@@ -624,7 +637,7 @@ public struct InspectorPreviewView: View {
                     .frame(maxHeight: 190)
                     .clipShape(RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
                     .accessibilityLabel("Podgląd: \(item.name)")
-                Text("\(Int(nsImg.size.width)) × \(Int(nsImg.size.height)) px")
+                Text("\(previewPixelWidth) × \(previewPixelHeight) px")
                     .font(FinderUI.detailFont.monospaced())
                     .foregroundStyle(.secondary)
             }
@@ -676,13 +689,24 @@ public struct InspectorPreviewView: View {
                 .overlay(RoundedRectangle(cornerRadius: FinderUI.cornerRadius).stroke(Color.primary.opacity(0.1), lineWidth: 1))
             }
         } else if !item.isDirectory {
-            Label(item.size == 0 ? "Plik jest pusty." : "Podgląd treści jest niedostępny. Wypróbuj Quick Look.", systemImage: "doc.text.magnifyingglass")
+            VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+                Label(previewMessage ?? "Podgląd treści jest niedostępny. Wypróbuj Quick Look.", systemImage: "doc.text.magnifyingglass")
+                    .font(FinderUI.detailFont)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(FinderUI.rowSpacing)
+                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
+                Button("Ponów podgląd") {
+                    // Retry only preview preparation, never checksum or permissions.
+                    let livePane = appState.activeTab
+                    guard livePane.id == activeTab.id,
+                          let selected = livePane.primarySelectedItem,
+                          selected.path == item.path else { return }
+                    startPreview(for: selected)
+                }
                 .font(FinderUI.detailFont)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(FinderUI.rowSpacing)
-                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
+            }
         }
     }
 
@@ -742,33 +766,44 @@ public struct InspectorPreviewView: View {
 
         loadPermissions(for: item)
 
-        guard !item.isDirectory && item.size > 0 && item.size <= 2 * 1024 * 1024 else {
-            textPreviewLines = []
-            return
-        }
+        startPreview(for: item)
+    }
 
-        guard let fh = try? FileHandle(forReadingFrom: item.url),
-              let sampleData = try? fh.read(upToCount: 24 * 1024) else {
-            textPreviewLines = []
-            return
-        }
-        try? fh.close()
+    private func cancelPreview() {
+        previewRequest?.cancel()
+        previewRequest = nil
+        previewRequestID = UUID()
+        preparedPreviewImage = nil
+        textPreviewLines = []
+        previewMessage = nil
+        isPreparingPreview = false
+    }
 
-        if sampleData.prefix(512).contains(0) {
-            textPreviewLines = []
-            return
+    private func startPreview(for item: FileItem) {
+        cancelPreview()
+        guard !item.isDirectory else { return }
+        isPreparingPreview = true
+        // Reuse the tested request/live-owner/revision/path publication fence.
+        let context = FileChecksumPublicationContext(requestID: previewRequestID, paneID: activeTab.id,
+                                                     revision: activeTab.directoryRevision, path: item.path)
+        let input = InspectorPreviewInput(url: item.url, isImage: item.kindCategory == .image,
+                                          targetLine: item.grepMatch?.lineNumber ?? 1)
+        previewRequest = InspectorPreviewService.shared.start(input) { result in
+            guard context.canPublish(currentRequestID: self.previewRequestID,
+                                     activePaneID: self.appState.activeTab.id,
+                                     sourceRevision: self.activeTab.directoryRevision,
+                                     selectedPath: self.activeTab.primarySelectedItem?.path) else { return }
+            self.previewRequest = nil
+            self.isPreparingPreview = false
+            switch result {
+            case .image(let image, let width, let height):
+                self.preparedPreviewImage = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+                self.previewPixelWidth = width
+                self.previewPixelHeight = height
+            case .text(let lines): self.textPreviewLines = lines
+            case .unavailable(let message): self.previewMessage = message
+            }
         }
-
-        let str = String(decoding: sampleData, as: UTF8.self)
-        let rawLines = str.components(separatedBy: .newlines)
-        let targetLine = item.grepMatch?.lineNumber ?? 1
-        let startIdx = min(rawLines.count, max(0, targetLine - 15))
-        let endIdx = min(rawLines.count, startIdx + 90)
-        var numbered: [(Int, String)] = []
-        for idx in startIdx..<endIdx {
-            numbered.append((idx + 1, rawLines[idx]))
-        }
-        textPreviewLines = numbered
     }
 
 

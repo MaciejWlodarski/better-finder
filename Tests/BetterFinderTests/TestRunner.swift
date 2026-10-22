@@ -54,6 +54,8 @@ func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath
             try AnalysisViewBindingRegressionTests().runAll()
             try await DiskAnalysisRegressionTests().runAll()
             print("Disk analysis/terminal regression suite passed")
+            let previewChecks = try await InspectorPreviewRegressionTests.runAll()
+            print("\(previewChecks) inspector preview checks passed")
             let fileOperationChecks = try await FileOperationSafetyTests.runAll()
             print("\(fileOperationChecks) file-operation safety checks passed")
             print("20 navigation/cache regression checks passed")

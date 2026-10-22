@@ -1,6 +1,6 @@
 import Foundation
 
-public enum SearchScopeMode: String, CaseIterable, Identifiable, Sendable {
+public enum SearchScopeMode: String, CaseIterable, Identifiable, Sendable, Codable {
     case currentFolder = "Current Folder"
     case recursiveFolder = "Subfolders"
     case wholeIndex = "Whole Disk (fsearch)"

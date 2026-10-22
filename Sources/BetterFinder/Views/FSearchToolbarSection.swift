@@ -123,8 +123,13 @@ public struct FSearchToolbarSection: View {
                     Button("Nowy plik…", systemImage: "doc.badge.plus") { appState.showNewFileSheet = true }
                     Divider()
                     Button("Odśwież", systemImage: "arrow.clockwise") { activeTab.refresh() }
-                    Toggle("Pokaż ukryte pliki", isOn: $activeTab.showHiddenFiles)
-                        .onChange(of: activeTab.showHiddenFiles) { _, _ in activeTab.refresh() }
+                    Toggle("Pokaż ukryte pliki", isOn: Binding(
+                        get: { activeTab.showHiddenFiles },
+                        set: { value in
+                            activeTab.showHiddenFiles = value
+                            activeTab.refresh()
+                        }
+                    ))
                     Button("Dodaj folder do ulubionych", systemImage: "star") {
                         appState.addBookmark(for: activeTab.currentURL)
                     }
@@ -174,14 +179,15 @@ public struct FSearchToolbarSection: View {
                     isSearchFocused = false
                 }
                 .accessibilityLabel("Szukaj plików i folderów")
-            if activeTab.isSearching {
+            if activeTab.isSearching || activeTab.isActivatingSavedSearch {
                 ProgressView().controlSize(.small)
-                    .accessibilityLabel("Wyszukiwanie plików")
+                    .accessibilityLabel(activeTab.isActivatingSavedSearch ? "Otwieranie zapisanego wyszukiwania" : "Wyszukiwanie plików")
             } else if !activeTab.searchQuery.isEmpty {
-                Button { appState.saveSmartFolder(query: activeTab.searchQuery) } label: {
+                Button { appState.saveSmartFolder(from: activeTab) } label: {
                     Image(systemName: "star").frame(width: 24, height: 24)
                 }
-                .help("Zapisz wyszukiwanie w pasku bocznym")
+                .disabled(appState.isCurrentSearchSaved(in: activeTab))
+                .help("Zapisz wyszukiwanie wraz z zakresem i opcjami w pasku bocznym")
                 .accessibilityLabel("Zapisz wyszukiwanie")
                 Button { activeTab.clearSearch() } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).frame(width: 24, height: 24)

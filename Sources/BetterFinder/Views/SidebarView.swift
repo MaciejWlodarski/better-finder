@@ -129,18 +129,16 @@ public struct SidebarView: View {
                 Spacer(minLength: 0)
                 if !activeTab.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     sidebarActionButton(icon: "plus", label: "Zapisz bieżące wyszukiwanie") {
-                        appState.saveSmartFolder(query: activeTab.searchQuery)
+                        appState.saveSmartFolder(from: activeTab)
                     }
-                    .disabled(appState.savedSmartFolders.contains {
-                        $0.query == activeTab.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-                    })
+                    .disabled(activeTab.isActivatingSavedSearch || appState.isCurrentSearchSaved(in: activeTab))
                 }
             }
             ForEach(smartPresets) { preset in
                 smartPresetRow(title: preset.title, icon: preset.icon, color: preset.color, query: preset.query)
             }
             ForEach(appState.savedSmartFolders) { folder in
-                smartPresetRow(title: folder.title, icon: "folder.badge.gearshape", color: .accentColor, query: folder.query)
+                smartPresetRow(title: folder.title, icon: "folder.badge.gearshape", color: .accentColor, query: folder.query, savedFolder: folder)
                     .contextMenu {
                         Button(role: .destructive) {
                             appState.removeSmartFolder(folder)
@@ -152,19 +150,28 @@ public struct SidebarView: View {
         }
     }
 
-    private func smartPresetRow(title: String, icon: String, color: Color, query: String) -> some View {
-        let isSelected = isSearchSelected(query)
+    private func smartPresetRow(title: String, icon: String, color: Color, query: String, savedFolder: SavedSmartFolderItem? = nil) -> some View {
+        let isSelected = savedFolder.map { $0.matches(activeTab) } ?? isSearchSelected(query)
 
         return Button {
-            runSearch(query)
+            if let savedFolder { appState.openSmartFolder(savedFolder) }
+            else { runSearch(query) }
         } label: {
             HStack(spacing: FinderUI.rowSpacing) {
                 Image(systemName: icon)
                     .foregroundStyle(isSelected ? selectedTextColor : color)
                     .frame(width: 18)
                     .accessibilityHidden(true)
-                Text(title)
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).lineLimit(1)
+                    if let savedFolder {
+                        Text(savedFolder.scopeDescription)
+                            .font(FinderUI.captionFont)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .opacity(0.8)
+                    }
+                }
                 Spacer(minLength: 0)
             }
             .foregroundStyle(isSelected ? selectedTextColor : Color.primary)
@@ -174,9 +181,9 @@ public struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("\(title) — \(query)")
-        .accessibilityLabel(title)
-        .accessibilityHint("Wyszukuje w całym indeksie. Zapytanie: \(query)")
+        .help("\(title) · \(savedFolder?.scopeDescription ?? "Cały indeks") · \(query)")
+        .accessibilityLabel(savedFolder.map { "\(title), \($0.scopeDescription)" } ?? title)
+        .accessibilityHint("\(savedFolder?.scopeDescription ?? "Cały indeks"). Zapytanie: \(query)")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 

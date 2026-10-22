@@ -15,12 +15,6 @@ public struct SidebarLocationItem: Identifiable, Hashable {
     public let isCustomBookmark: Bool
 }
 
-public struct SavedSmartFolderItem: Identifiable, Codable, Hashable {
-    public let id: String
-    public let title: String
-    public let query: String
-}
-
 public struct VolumeInfoItem: Identifiable {
     public var id: String { url.path }
     public let name: String
@@ -69,7 +63,10 @@ public final class AppState: ObservableObject {
 
     // Dual-pane mode
     @Published public var isDualPane: Bool = false {
-        didSet { Self.preferences.set(isDualPane, forKey: "bf.isDualPane") }
+        didSet {
+            Self.preferences.set(isDualPane, forKey: "bf.isDualPane")
+            if !isDualPane { rightPane.cancelPendingSavedSearches() }
+        }
     }
     @Published public var rightPane: PaneTabState
     @Published public var activePaneSide: PaneSide = .left
@@ -103,6 +100,8 @@ public final class AppState: ObservableObject {
     @Published public var favorites: [SidebarLocationItem] = []
     @Published public var customBookmarks: [SidebarLocationItem] = []
     @Published public var savedSmartFolders: [SavedSmartFolderItem] = []
+    private var savedSearchArchive: SavedSearchArchive? = SavedSearchArchive()
+    private var savedSearchLaunchSerials: [UUID: UInt64] = [:]
     @Published public var mountedVolumes: [VolumeInfoItem] = []
 
     public var activeTab: PaneTabState {
@@ -248,9 +247,9 @@ public final class AppState: ObservableObject {
                 return SidebarLocationItem(title: url.lastPathComponent, iconName: "bookmark.fill", url: url, isCustomBookmark: true)
             }
         }
-        if let data = defaults.data(forKey: "bf.savedSmartFolders"),
-           let decoded = try? JSONDecoder().decode([SavedSmartFolderItem].self, from: data) {
-            savedSmartFolders = decoded
+        if let data = defaults.data(forKey: "bf.savedSmartFolders") {
+            savedSearchArchive = try? SavedSearchArchive(data: data)
+            savedSmartFolders = savedSearchArchive?.items ?? []
         }
     }
 
@@ -278,27 +277,57 @@ public final class AppState: ObservableObject {
         Self.preferences.set(customBookmarks.map { $0.url.path }, forKey: "bf.customBookmarks")
     }
 
-    public func saveSmartFolder(query: String, title: String? = nil) {
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        guard !savedSmartFolders.contains(where: { $0.query == trimmed }) else { return }
-        let item = SavedSmartFolderItem(
-            id: UUID().uuidString,
-            title: title ?? trimmed,
-            query: trimmed
-        )
-        savedSmartFolders.append(item)
-        if let data = try? JSONEncoder().encode(savedSmartFolders) {
-            Self.preferences.set(data, forKey: "bf.savedSmartFolders")
+    public func isCurrentSearchSaved(in pane: PaneTabState) -> Bool {
+        let candidate = SavedSmartFolderItem.capture(from: pane)
+        return savedSmartFolders.contains { $0.hasSameSearch(as: candidate) }
+    }
+
+    public func saveSmartFolder(from pane: PaneTabState, title: String? = nil) {
+        let item = SavedSmartFolderItem.capture(from: pane, title: title)
+        guard !item.query.isEmpty else { return }
+        guard !savedSmartFolders.contains(where: { $0.hasSameSearch(as: item) }) else { return }
+        guard persistSmartFolders(savedSmartFolders + [item]) else { return }
+        FileOperationsManager.shared.lastStatusMessage = "Zapisano inteligentny folder: \(item.title)"
+    }
+
+    public func openSmartFolder(_ item: SavedSmartFolderItem) {
+        let pane = activeTab
+        pane.cancelPendingSavedSearches()
+        let serial = (savedSearchLaunchSerials[pane.id] ?? 0) &+ 1
+        savedSearchLaunchSerials[pane.id] = serial
+        let context = pane.savedSearchActivationContext
+        Task { @MainActor in
+            guard self.savedSearchLaunchSerials[pane.id] == serial,
+                  pane.savedSearchActivationContext == context else { return }
+            do {
+                guard try await pane.applySavedSearch(item, shouldApply: { [weak self, weak pane] in
+                    guard let self, let pane else { return false }
+                    return self.savedSearchLaunchSerials[pane.id] == serial &&
+                        (self.tabs.contains { $0.id == pane.id } || (self.isDualPane && self.rightPane.id == pane.id))
+                }) else { return }
+                guard self.activeTab.id == pane.id else { return }
+                FileOperationsManager.shared.lastStatusMessage = "Wyszukiwanie: \(item.title) · \(item.scopeDescription)"
+            } catch {
+                guard self.activeTab.id == pane.id else { return }
+                FileOperationsManager.shared.lastStatusMessage = error.localizedDescription
+            }
         }
-        FileOperationsManager.shared.lastStatusMessage = "Zapisano Smart Folder: \(item.title)"
     }
 
     public func removeSmartFolder(_ item: SavedSmartFolderItem) {
-        savedSmartFolders.removeAll { $0.id == item.id }
-        if let data = try? JSONEncoder().encode(savedSmartFolders) {
-            Self.preferences.set(data, forKey: "bf.savedSmartFolders")
+        _ = persistSmartFolders(savedSmartFolders.filter { $0.id != item.id }, removingID: item.id)
+    }
+
+    private func persistSmartFolders(_ items: [SavedSmartFolderItem], removingID: String? = nil) -> Bool {
+        guard let archive = savedSearchArchive,
+              let data = try? archive.encoded(replacingItems: items, removingID: removingID) else {
+            FileOperationsManager.shared.lastStatusMessage = "Nie zapisano zmiany: dane inteligentnych folderów są uszkodzone lub nieobsługiwane. Oryginalny zapis pozostał nietknięty."
+            return false
         }
+        Self.preferences.set(data, forKey: "bf.savedSmartFolders")
+        savedSmartFolders = items
+        savedSearchArchive = try? SavedSearchArchive(data: data)
+        return true
     }
 
     // MARK: - Volumes & Eject (`⏏`)
@@ -368,6 +397,8 @@ public final class AppState: ObservableObject {
     public func closeTab(_ id: UUID) {
         guard tabs.count > 1 else { return }
         if let idx = tabs.firstIndex(where: { $0.id == id }) {
+            tabs[idx].cancelPendingSavedSearches()
+            savedSearchLaunchSerials.removeValue(forKey: id)
             recentlyClosedTabs.append(tabs[idx])
             if recentlyClosedTabs.count > 10 { recentlyClosedTabs.removeFirst() }
             tabs.remove(at: idx)

@@ -51,7 +51,9 @@ public enum SortField: String, CaseIterable, Identifiable {
 public final class PaneTabState: ObservableObject, Identifiable {
     public let id = UUID()
 
-    @Published public var currentURL: URL
+    @Published public var currentURL: URL {
+        didSet { if oldValue != currentURL { cancelSavedSearchActivation() } }
+    }
     @Published public var historyBack: [URL] = []
     @Published public var historyForward: [URL] = []
 
@@ -64,6 +66,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
     @Published public var viewMode: FinderViewMode = .list {
         didSet {
             guard oldValue != viewMode else { return }
+            cancelSavedSearchActivation()
             clearAnalysisSelection()
             if viewMode != .list { expandedFolderPaths.removeAll() }
             rebuildDisplayedItemsWithExpandedTree()
@@ -74,13 +77,25 @@ public final class PaneTabState: ObservableObject, Identifiable {
     @Published public var sortField: SortField = .name
     @Published public var sortAscending: Bool = true
     @Published public var foldersOnTop: Bool = true
-    @Published public var showHiddenFiles: Bool = false
+    @Published public var showHiddenFiles: Bool = false {
+        didSet { if oldValue != showHiddenFiles { cancelSavedSearchActivation() } }
+    }
 
     // Integrated fsearch state
-    @Published public var searchQuery: String = ""
-    @Published public var searchScope: SearchScopeMode = .wholeIndex
-    @Published public var fuzzyEnabled: Bool = true
+    @Published public var searchQuery: String = "" {
+        didSet { if oldValue != searchQuery { cancelSavedSearchActivation() } }
+    }
+    @Published public var searchScope: SearchScopeMode = .wholeIndex {
+        didSet { if oldValue != searchScope { cancelSavedSearchActivation() } }
+    }
+    @Published public var fuzzyEnabled: Bool = true {
+        didSet { if oldValue != fuzzyEnabled { cancelSavedSearchActivation() } }
+    }
     @Published public var isSearching: Bool = false
+    @Published public private(set) var isActivatingSavedSearch: Bool = false
+    private var savedSearchActivationGeneration: UInt64 = 0
+    private var savedSearchPreparation: SavedSearchWork<PreparedSavedSearch>?
+    private var savedSearchBrowsingPreparation: SavedSearchWork<[IndexedFileEntry]>?
     @Published public var lastSearchLatencyMs: Double = 0
     @Published public var activeFilterPills: [ActiveFilterPill] = []
     @Published public var searchBackendName: String = "fsearch-native"
@@ -217,6 +232,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     public func navigate(to url: URL, recordHistory: Bool = true) {
+        cancelPendingSavedSearches()
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
         if !isDir.boolValue {
@@ -252,6 +268,124 @@ public final class PaneTabState: ObservableObject, Identifiable {
         updateColumnTrail(for: standardized)
         FSearchIndex.shared.ensureDirectoryIndexed(standardized.path)
         AppState.shared.persistTabsState()
+    }
+
+    var savedSearchActivationContext: String {
+        "\(currentURL.path)\u{0}\(searchQuery)\u{0}\(searchScope.rawValue)\u{0}\(showHiddenFiles)\u{0}\(fuzzyEnabled)\u{0}\(viewMode.rawValue)\u{0}\(directoryLoadGeneration)\u{0}\(savedSearchActivationGeneration)"
+    }
+
+    /// Validate and list off the main actor. Commit only if this exact request
+    /// still owns the captured pane context; navigation and newer queries win.
+    @discardableResult
+    func applySavedSearch(
+        _ item: SavedSmartFolderItem,
+        prepare: (@Sendable (SavedSmartFolderItem) throws -> PreparedSavedSearch)? = nil,
+        shouldApply: @escaping @MainActor () -> Bool = { true }
+    ) async throws -> Bool {
+        cancelPendingSavedSearches()
+        savedSearchActivationGeneration &+= 1
+        let generation = savedSearchActivationGeneration
+        let context = savedSearchActivationContext
+        isActivatingSavedSearch = true
+        let request = SavedSearchWork<PreparedSavedSearch>()
+        savedSearchPreparation = request
+        defer {
+            if generation == savedSearchActivationGeneration {
+                isActivatingSavedSearch = false
+                savedSearchPreparation = nil
+            }
+        }
+        let prepared: PreparedSavedSearch
+        do {
+            // Global activation requires no directory probe/listing. A changed
+            // hidden-file option refreshes its browsing snapshot separately.
+            if item.scope == .wholeIndex {
+                prepared = PreparedSavedSearch(root: nil, entries: [])
+            } else {
+                prepared = try await SavedSearchPreparation.run({
+                    if let prepare { return try prepare(item) }
+                    return try SavedSearchPreparation.prepare(item, isCancelled: { request.isCancelled })
+                }, request: request)
+            }
+        } catch {
+            guard generation == savedSearchActivationGeneration,
+                  context == savedSearchActivationContext, !Task.isCancelled, shouldApply() else { return false }
+            throw error
+        }
+        guard generation == savedSearchActivationGeneration,
+              context == savedSearchActivationContext, !Task.isCancelled, shouldApply() else { return false }
+        let hiddenChanged = showHiddenFiles != item.includeHidden
+        if let root = prepared.root, root.path != currentURL.path {
+            historyBack.append(currentURL)
+            historyForward.removeAll()
+        }
+        searchTask?.cancel()
+        searchGeneration &+= 1
+        clearAnalysisSelection()
+        displayedItems.removeAll()
+        selectedPaths.removeAll()
+        selectionCursorPath = nil
+        selectionAnchorPath = nil
+        expandedFolderPaths.removeAll()
+        renamingItemPath = nil
+        searchContext = nil
+        directoryLoadGeneration &+= 1
+        metadataGeneration &+= 1
+        for operation in tagOperations { operation.cancel() }
+        tagOperations.removeAll()
+        tagCache.removeAll()
+        pendingTagPaths.removeAll()
+        if viewMode == .wiztree { viewMode = .list }
+        searchScope = item.scope
+        showHiddenFiles = item.includeHidden
+        fuzzyEnabled = item.fuzzyEnabled
+        searchQuery = item.query
+        if let root = prepared.root {
+            currentURL = root
+            updateColumnTrail(for: root)
+            FileIconCache.shared.invalidate(containing: root.path)
+            FolderSizeCache.shared.invalidate(containing: root.path)
+            directoryItems = sortItems(prepared.entries.map { $0.toFileItem(treeDepth: 0, loadTags: false) })
+            AppState.shared.persistTabsState()
+        } else if hiddenChanged {
+            directoryItems.removeAll()
+            refreshSavedSearchBrowsingSnapshot()
+        }
+        triggerSearch()
+        return true
+    }
+
+    func cancelPendingSavedSearches() {
+        cancelSavedSearchActivation()
+        savedSearchBrowsingPreparation?.cancel()
+        savedSearchBrowsingPreparation = nil
+    }
+
+    private func cancelSavedSearchActivation() {
+        savedSearchActivationGeneration &+= 1
+        savedSearchPreparation?.cancel()
+        savedSearchPreparation = nil
+        isActivatingSavedSearch = false
+    }
+
+    private func refreshSavedSearchBrowsingSnapshot() {
+        savedSearchBrowsingPreparation?.cancel()
+        let request = SavedSearchWork<[IndexedFileEntry]>()
+        savedSearchBrowsingPreparation = request
+        let path = currentURL.path
+        let hidden = showHiddenFiles
+        let generation = directoryLoadGeneration
+        Task { @MainActor [weak self] in
+            guard let entries = try? await SavedSearchPreparation.run({
+                BulkCrawler.readDirectoryResult(at: path, includeHidden: hidden,
+                                                isCancelled: { request.isCancelled }).entries
+            }, request: request), let self, self.directoryLoadGeneration == generation,
+                  self.currentURL.path == path, self.showHiddenFiles == hidden else { return }
+            self.directoryItems = self.sortItems(entries.map { $0.toFileItem(treeDepth: 0, loadTags: false) })
+            if self.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.triggerSearch()
+            }
+        }
     }
 
     public func goBack() {
@@ -292,6 +426,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     public func reloadDirectory() {
+        cancelPendingSavedSearches()
         let targetPath = currentURL.path
         let includeHidden = showHiddenFiles
         directoryLoadGeneration &+= 1
@@ -363,6 +498,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     public func triggerSearch() {
+        cancelSavedSearchActivation()
         searchTask?.cancel()
         searchGeneration &+= 1
         let generation = searchGeneration

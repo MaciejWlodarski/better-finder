@@ -61,6 +61,23 @@ final class QuickSearchModel: ObservableObject {
 
 // MARK: - 1. Instant Cmd+P Spotlight fsearch Modal
 
+/// Pure selection movement shared by the quick-search keyboard callbacks and tests.
+enum QuickSearchSelection {
+    enum Direction { case up, down }
+    static let visibleResultLimit = 100
+
+    static func movedIndex(from index: Int, count: Int, direction: Direction) -> Int? {
+        guard count > 0 else { return nil }
+        let lastIndex = count - 1
+        switch direction {
+        case .up:
+            return index <= 0 ? 0 : min(index - 1, lastIndex)
+        case .down:
+            return index >= lastIndex ? lastIndex : max(index + 1, 0)
+        }
+    }
+}
+
 @MainActor
 public struct QuickFSearchSpotlightModal: View {
     @ObservedObject var appState: AppState
@@ -70,6 +87,7 @@ public struct QuickFSearchSpotlightModal: View {
     @StateObject private var search = QuickSearchModel()
     private var results: [FileItem] { search.results }
     private var elapsedMs: Double { search.elapsedMs }
+    private var hasQuery: Bool { !queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     @ViewState private var selectedIndex: Int = 0
     @FocusState private var isFocused: Bool
 
@@ -84,10 +102,13 @@ public struct QuickFSearchSpotlightModal: View {
                 Image(systemName: "bolt.horizontal.circle.fill")
                     .font(.system(size: 18))
                     .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
 
-                TextField("Szybki skok fsearch (nazwa, ext:swift, grep:tekst, size:>10mb, tag:red)...", text: $queryText)
+                TextField("Szukaj w indeksie plików…", text: $queryText)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 15, weight: .medium))
+                    .font(.title3)
+                    .accessibilityLabel("Szybkie wyszukiwanie w indeksie plików")
+                    .help("Wpisz nazwę lub filtr, np. ext:swift, grep:tekst, size:>10mb, tag:red")
                     .focused($isFocused)
                     .onChange(of: queryText) { _, newValue in
                         runSpotlightQuery(newValue)
@@ -95,15 +116,26 @@ public struct QuickFSearchSpotlightModal: View {
                     .onSubmit {
                         activateSelectedResult(revealInFolder: false)
                     }
-
-                if !queryText.isEmpty {
-                    HStack(spacing: 4) {
-                        Image(systemName: "bolt.fill")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.yellow)
-                        Text(FormatHelpers.formatLatency(elapsedMs))
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .onKeyPress(keys: [.upArrow, .downArrow], phases: [.down, .repeat]) { press in
+                        guard press.modifiers.intersection([.command, .control, .option, .shift]).isEmpty else {
+                            return .ignored
+                        }
+                        return moveSelection(press.key == .upArrow ? .up : .down)
                     }
+
+                if search.isSearching {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Wyszukiwanie")
+                } else if hasQuery {
+                    HStack(spacing: FinderUI.compactSpacing) {
+                        Image(systemName: "bolt.fill")
+                            .accessibilityHidden(true)
+                        Text(FormatHelpers.formatLatency(elapsedMs))
+                            .monospacedDigit()
+                    }
+                    .font(FinderUI.captionFont)
+                    .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
                     .background(Color.accentColor.opacity(0.15), in: Capsule())
@@ -114,107 +146,132 @@ public struct QuickFSearchSpotlightModal: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .keyboardShortcut(.cancelAction)
             }
-            .padding(14)
+            .padding(FinderUI.sectionSpacing)
             .background(VisualEffectBackground(material: .headerView, blendingMode: .withinWindow))
 
             Divider()
 
             if results.isEmpty {
-                VStack(spacing: 8) {
+                VStack(spacing: FinderUI.rowSpacing) {
                     Image(systemName: "sparkle.magnifyingglass")
                         .font(.system(size: 28))
                         .foregroundStyle(.secondary)
-                    Text(search.isSearching ? "Wyszukiwanie…" : (queryText.isEmpty
-                         ? "Wpisz zapytanie fsearch, aby przeszukać \(appState.indexedFileCount.formatted()) plików"
+                        .accessibilityHidden(true)
+                    Text(search.isSearching ? "Wyszukiwanie…" : (!hasQuery
+                         ? "Wpisz zapytanie, aby przeszukać indeks. Pliki: \(appState.indexedFileCount.formatted())"
                          : (search.diagnostic == nil ? "Brak pasujących wyników" : "Brak wyników w sprawdzonym zakresie")))
-                        .font(.system(size: 12.5))
+                        .font(FinderUI.detailFont)
                         .foregroundStyle(.secondary)
-                    HStack(spacing: 8) {
+                        .multilineTextAlignment(.center)
+                    HStack(spacing: FinderUI.rowSpacing) {
                         quickSampleButton("ext:swift")
                         quickSampleButton("type:code grep:struct")
                         quickSampleButton("git:modified")
                         quickSampleButton("mtime:<24h")
                     }
-                    .padding(.top, 4)
+                    .padding(.top, FinderUI.compactSpacing)
                 }
+                .padding(FinderUI.sheetPadding)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(Array(results.prefix(100).enumerated()), id: \.element.id) { idx, item in
-                            let isHighlighted = (idx == selectedIndex)
-                            HStack(spacing: 10) {
-                                Image(nsImage: FileIconCache.shared.icon(for: item))
-                                    .resizable()
-                                    .frame(width: 24, height: 24)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 2) {
+                            ForEach(Array(results.prefix(QuickSearchSelection.visibleResultLimit).enumerated()), id: \.element.id) { idx, item in
+                                let isHighlighted = (idx == selectedIndex)
+                                HStack(spacing: 10) {
+                                    Image(nsImage: FileIconCache.shared.icon(for: item))
+                                        .resizable()
+                                        .frame(width: 24, height: 24)
+                                        .accessibilityHidden(true)
 
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack(spacing: 6) {
-                                        Text(item.name)
-                                            .font(.system(size: 13, weight: .semibold))
-                                            .foregroundStyle(isHighlighted ? .white : .primary)
-                                        if !item.tags.isEmpty {
-                                            ForEach(item.tags) { tag in
-                                                Circle().fill(tag.swiftUIColor).frame(width: 7, height: 7)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack(spacing: 6) {
+                                            Text(item.name)
+                                                .font(FinderUI.bodyFont.weight(.medium))
+                                                .foregroundStyle(isHighlighted ? Color(nsColor: .alternateSelectedControlTextColor) : .primary)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                                .help(item.name)
+                                            if !item.tags.isEmpty {
+                                                ForEach(item.tags) { tag in
+                                                    Circle().fill(tag.swiftUIColor).frame(width: 7, height: 7)
+                                                        .accessibilityLabel("Tag: \(tag.displayName)")
+                                                }
                                             }
+                                            Text(FormatHelpers.formatBytes(item.size))
+                                                .font(FinderUI.captionFont.monospacedDigit())
+                                                .foregroundStyle(isHighlighted ? Color(nsColor: .alternateSelectedControlTextColor) : .secondary)
                                         }
-                                        Text(FormatHelpers.formatBytes(item.size))
-                                            .font(.system(size: 10.5, design: .monospaced))
-                                            .foregroundStyle(isHighlighted ? .white.opacity(0.8) : .secondary)
-                                    }
-                                    Text(item.parentPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(isHighlighted ? .white.opacity(0.8) : .secondary)
-                                        .lineLimit(1)
-
-                                    if let grep = item.grepMatch {
-                                        Text("L\(grep.lineNumber): \(grep.lineText)")
-                                            .font(.system(size: 10.5, design: .monospaced))
-                                            .foregroundStyle(isHighlighted ? .white : Color.accentColor)
+                                        Text(item.parentPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                                            .font(FinderUI.captionFont)
+                                            .foregroundStyle(isHighlighted ? Color(nsColor: .alternateSelectedControlTextColor) : .secondary)
                                             .lineLimit(1)
+                                            .truncationMode(.middle)
+                                            .help(item.parentPath)
+
+                                        if let grep = item.grepMatch {
+                                            Text("L\(grep.lineNumber): \(grep.lineText)")
+                                                .font(.system(.caption, design: .monospaced))
+                                                .foregroundStyle(isHighlighted ? Color(nsColor: .alternateSelectedControlTextColor) : Color.accentColor)
+                                                .lineLimit(1)
+                                        }
                                     }
+
+                                    Spacer()
+
+                                    Button("Pokaż w karcie") {
+                                        selectedIndex = idx
+                                        activateSelectedResult(revealInFolder: true)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                    .accessibilityLabel("Pokaż \(item.name) w karcie")
+                                    .help("Pokaż w karcie: \(item.path)")
                                 }
-
-                                Spacer()
-
-                                Button("Pokaż w karcie") {
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(
+                                    RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
+                                        .fill(isHighlighted ? Color(nsColor: .selectedContentBackgroundColor) : Color.clear)
+                                )
+                                .contentShape(Rectangle())
+                                .accessibilityElement(children: .contain)
+                                .accessibilityAddTraits(isHighlighted ? .isSelected : [])
+                                .onTapGesture(count: 2) {
                                     selectedIndex = idx
-                                    activateSelectedResult(revealInFolder: true)
+                                    activateSelectedResult(revealInFolder: false)
                                 }
-                                .buttonStyle(.bordered)
-                                .controlSize(.mini)
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 7)
-                                    .fill(isHighlighted ? Color.accentColor : Color.clear)
-                            )
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                selectedIndex = idx
-                                activateSelectedResult(revealInFolder: true)
+                                .onTapGesture(count: 1) {
+                                    selectedIndex = idx
+                                    isFocused = true
+                                }
+                                .id(idx)
                             }
                         }
+                        .padding(FinderUI.rowSpacing)
                     }
-                    .padding(8)
+                    .onChange(of: selectedIndex) { _, index in
+                        proxy.scrollTo(index)
+                    }
                 }
             }
 
             Divider()
 
             HStack {
-                Text(search.diagnostic ?? "Kliknij lub Enter aby przejść do pliku/folderu · Esc aby zamknąć")
-                    .font(.system(size: 11))
+                Text(search.diagnostic ?? "↑↓ wybór · Return lub dwuklik: przejdź · Esc: zamknij")
+                    .font(FinderUI.captionFont)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("Indeks RAM/mmap: \(appState.indexedFileCount.formatted()) obiektów")
-                    .font(.system(size: 11, design: .monospaced))
+                Text("W indeksie: \(appState.indexedFileCount.formatted())")
+                    .font(FinderUI.captionFont.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 7)
+            .padding(.horizontal, FinderUI.sectionSpacing)
+            .padding(.vertical, FinderUI.rowSpacing)
             .background(Color(nsColor: .windowBackgroundColor))
         }
         .frame(width: 680, height: 440)
@@ -227,6 +284,7 @@ public struct QuickFSearchSpotlightModal: View {
     private func quickSampleButton(_ sample: String) -> some View {
         Button(sample) {
             queryText = sample
+            isFocused = true
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
@@ -235,6 +293,17 @@ public struct QuickFSearchSpotlightModal: View {
     private func runSpotlightQuery(_ q: String) {
         selectedIndex = 0
         search.schedule(q, rootPath: activeTab.currentURL.path, includeHidden: activeTab.showHiddenFiles)
+    }
+
+    private func moveSelection(_ direction: QuickSearchSelection.Direction) -> KeyPress.Result {
+        guard isFocused, !search.isSearching,
+              let index = QuickSearchSelection.movedIndex(
+                from: selectedIndex,
+                count: min(results.count, QuickSearchSelection.visibleResultLimit),
+                direction: direction
+              ) else { return .ignored }
+        selectedIndex = index
+        return .handled
     }
 
     private func activateSelectedResult(revealInFolder: Bool) {
@@ -262,6 +331,8 @@ public struct NewFileSheetView: View {
     @ViewState private var selectedTemplate: NewFileTemplate = .emptyText
     @ViewState private var filename: String = "Untitled.txt"
     @ViewState private var customContent: String = ""
+    @ViewState private var errorMessage: String?
+    @FocusState private var isNameFocused: Bool
 
     public init(appState: AppState, activeTab: PaneTabState) {
         self.appState = appState
@@ -269,17 +340,18 @@ public struct NewFileSheetView: View {
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
             HStack {
                 Image(systemName: "doc.badge.plus")
                     .font(.system(size: 18))
                     .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
                 Text("Utwórz nowy plik")
-                    .font(.system(size: 15, weight: .bold))
+                    .font(FinderUI.titleFont)
                 Spacer()
             }
 
-            Picker("Szablon pliku:", selection: $selectedTemplate) {
+            Picker("Szablon pliku", selection: $selectedTemplate) {
                 ForEach(NewFileTemplate.allCases) { tpl in
                     Text(tpl.rawValue).tag(tpl)
                 }
@@ -289,48 +361,72 @@ public struct NewFileSheetView: View {
                 customContent = newValue.initialContent
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Nazwa pliku:")
-                    .font(.system(size: 12, weight: .medium))
+            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                Text("Nazwa pliku")
+                    .font(FinderUI.detailFont)
                 TextField("Nazwa pliku", text: $filename)
                     .textFieldStyle(.roundedBorder)
+                    .focused($isNameFocused)
+                    .onSubmit(createAndClose)
+                    .onChange(of: filename) { _, _ in errorMessage = nil }
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Początkowa zawartość (opcjonalnie):")
-                    .font(.system(size: 12, weight: .medium))
+            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                Text("Początkowa zawartość (opcjonalnie)")
+                    .font(FinderUI.detailFont)
                 TextEditor(text: $customContent)
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(.body, design: .monospaced))
+                    .accessibilityLabel("Początkowa zawartość pliku")
                     .frame(height: 110)
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.15)))
+                    .overlay(RoundedRectangle(cornerRadius: FinderUI.cornerRadius).stroke(Color(nsColor: .separatorColor)))
+            }
+
+            Text("Lokalizacja: \(activeTab.currentURL.path)")
+                .font(FinderUI.captionFont)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(activeTab.currentURL.path)
+
+            if let errorMessage {
+                Label(errorMessage, systemImage: "exclamationmark.circle")
+                    .font(FinderUI.detailFont)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             HStack {
-                Text("Lokalizacja: \(activeTab.currentURL.path)")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
                 Spacer()
                 Button("Anuluj") {
                     appState.showNewFileSheet = false
                 }
-                Button("Utwórz plik") {
-                    if let created = FileOperationsManager.shared.createFile(
-                        named: filename,
-                        content: customContent,
-                        in: activeTab.currentURL
-                    ) {
-                        activeTab.reloadDirectory()
-                        activeTab.selectedPaths = [created.path]
-                    }
-                    appState.showNewFileSheet = false
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(filename.trimmingCharacters(in: .whitespaces).isEmpty)
+                .keyboardShortcut(.cancelAction)
+                Button("Utwórz plik", action: createAndClose)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
-        .padding(18)
-        .frame(width: 440)
+        .font(FinderUI.bodyFont)
+        .controlSize(.regular)
+        .padding(FinderUI.sheetPadding)
+        .frame(width: 480)
+        .onAppear { isNameFocused = true }
+    }
+
+    private func createAndClose() {
+        guard !filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if let created = FileOperationsManager.shared.createFile(
+            named: filename,
+            content: customContent,
+            in: activeTab.currentURL
+        ) {
+            activeTab.reloadDirectory()
+            activeTab.selectedPaths = [created.path]
+            appState.showNewFileSheet = false
+        } else {
+            errorMessage = FileOperationsManager.shared.lastStatusMessage ?? "Nie udało się utworzyć pliku."
+            isNameFocused = true
+        }
     }
 }
 
@@ -341,6 +437,8 @@ public struct NewFolderSheetView: View {
     @ObservedObject var activeTab: PaneTabState
 
     @ViewState private var folderName: String = "Nowy folder"
+    @ViewState private var errorMessage: String?
+    @FocusState private var isNameFocused: Bool
 
     public init(appState: AppState, activeTab: PaneTabState) {
         self.appState = appState
@@ -348,44 +446,71 @@ public struct NewFolderSheetView: View {
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
             HStack {
                 Image(systemName: "folder.badge.plus")
                     .font(.system(size: 18))
                     .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
                 Text("Utwórz nowy folder")
-                    .font(.system(size: 15, weight: .bold))
+                    .font(FinderUI.titleFont)
                 Spacer()
             }
 
-            TextField("Nazwa folderu", text: $folderName)
-                .textFieldStyle(.roundedBorder)
-                .onSubmit {
-                    createAndClose()
-                }
+            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                Text("Nazwa folderu")
+                    .font(FinderUI.detailFont)
+                TextField("Nazwa folderu", text: $folderName)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($isNameFocused)
+                    .onSubmit(createAndClose)
+                    .onChange(of: folderName) { _, _ in errorMessage = nil }
+            }
+
+            Text("Lokalizacja: \(activeTab.currentURL.path)")
+                .font(FinderUI.captionFont)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(activeTab.currentURL.path)
+
+            if let errorMessage {
+                Label(errorMessage, systemImage: "exclamationmark.circle")
+                    .font(FinderUI.detailFont)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             HStack {
                 Spacer()
                 Button("Anuluj") {
                     appState.showNewFolderSheet = false
                 }
+                .keyboardShortcut(.cancelAction)
                 Button("Utwórz") {
                     createAndClose()
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(folderName.trimmingCharacters(in: .whitespaces).isEmpty)
+                .keyboardShortcut(.defaultAction)
+                .disabled(folderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
-        .padding(18)
-        .frame(width: 360)
+        .font(FinderUI.bodyFont)
+        .controlSize(.regular)
+        .padding(FinderUI.sheetPadding)
+        .frame(width: 420)
+        .onAppear { isNameFocused = true }
     }
 
     private func createAndClose() {
+        guard !folderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         if let created = FileOperationsManager.shared.createFolder(named: folderName, in: activeTab.currentURL) {
             activeTab.reloadDirectory()
             activeTab.selectedPaths = [created.path]
+            appState.showNewFolderSheet = false
+        } else {
+            errorMessage = FileOperationsManager.shared.lastStatusMessage ?? "Nie udało się utworzyć folderu."
+            isNameFocused = true
         }
-        appState.showNewFolderSheet = false
     }
 }
 
@@ -506,6 +631,7 @@ private struct FolderComparisonContentView: View {
     @ViewState private var isComparing = false
     @ViewState private var compareDiagnostic: String?
     @ViewState private var comparedContext: FolderComparisonContext?
+    @ViewState private var ownedConflictID: UUID?
 
     init(appState: AppState, leftPane: PaneTabState, rightPane: PaneTabState) {
         self.appState = appState
@@ -521,30 +647,48 @@ private struct FolderComparisonContentView: View {
         hideIdentical ? entries.filter { $0.status != .identical } : entries
     }
 
+    private var ownedConflict: Binding<PendingTransferConflict?> {
+        Binding(
+            get: {
+                guard let id = ownedConflictID, fileOps.pendingConflict?.id == id else { return nil }
+                return fileOps.pendingConflict
+            },
+            set: { value in
+                if value == nil { cancelOwnedConflict() }
+            }
+        )
+    }
+
     public var body: some View {
         let leftURL = leftPane.currentURL
         let rightURL = rightPane.currentURL
 
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
             HStack {
                 Image(systemName: "arrow.left.arrow.right.square.fill")
                     .font(.system(size: 18))
                     .foregroundStyle(Color.accentColor)
-                Text("Porównanie bezpośredniej zawartości katalogów")
-                    .font(.system(size: 15, weight: .bold))
+                    .accessibilityHidden(true)
+                Text("Porównaj zawartość katalogów")
+                    .font(FinderUI.titleFont)
                 Spacer()
                 Toggle("Ukryj identyczne", isOn: $hideIdentical)
-                    .font(.system(size: 11.5))
+                    .font(FinderUI.detailFont)
+                    .fixedSize()
             }
 
             HStack(spacing: 12) {
                 Label("Lewy: \(leftURL.path)", systemImage: "folder.fill")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(FinderUI.detailFont)
                     .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(leftURL.path)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Label("Prawy: \(rightURL.path)", systemImage: "folder.fill")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(FinderUI.detailFont)
                     .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(rightURL.path)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .foregroundStyle(.secondary)
@@ -552,57 +696,90 @@ private struct FolderComparisonContentView: View {
             Divider()
 
             Text(compareDiagnostic ?? (isComparing ? "Porównywanie treści plików…" : "Porównanie treści i czasu plików, bez rekurencji. Wspólne podfoldery i konflikty typów wymagają osobnego porównania. Kopiowanie nie usuwa pozycji docelowych."))
-                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .font(FinderUI.detailFont)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             ScrollView {
                 LazyVStack(spacing: 3) {
                     ForEach(filteredEntries) { entry in
                         HStack(spacing: 10) {
                             Text(entry.leftItem?.name ?? "—")
-                                .font(.system(size: 12, design: .monospaced))
+                                .font(FinderUI.detailFont)
                                 .foregroundStyle(entry.leftItem == nil ? .tertiary : .primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(entry.leftItem?.path ?? "Brak w lewym katalogu")
                                 .frame(maxWidth: .infinity, alignment: .leading)
 
                             Text(entry.status.rawValue)
-                                .font(.system(size: 10, weight: .bold))
+                                .font(FinderUI.captionFont.weight(.medium))
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 2)
                                 .background(statusColor(entry.status).opacity(0.16), in: Capsule())
                                 .foregroundStyle(statusColor(entry.status))
 
                             Text(entry.rightItem?.name ?? "—")
-                                .font(.system(size: 12, design: .monospaced))
+                                .font(FinderUI.detailFont)
                                 .foregroundStyle(entry.rightItem == nil ? .tertiary : .primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(entry.rightItem?.path ?? "Brak w prawym katalogu")
                                 .frame(maxWidth: .infinity, alignment: .trailing)
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
-                        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 5))
+                        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
                     }
                 }
             }
             .frame(height: 230)
+            .overlay {
+                if isComparing {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Porównywanie katalogów")
+                } else if compareDiagnostic == nil && filteredEntries.isEmpty {
+                    Text(entries.isEmpty ? "Brak elementów do porównania" : "Brak różnic w porównanych plikach")
+                        .font(FinderUI.detailFont)
+                        .foregroundStyle(.secondary)
+                }
+            }
 
             HStack {
-                Button("Kopiuj różnice Lewy → Prawy") { copyDifferences(leftToRight: true) }
+                Text("Kopiuj różnice:")
+                    .font(FinderUI.detailFont)
+                Button("Lewy → Prawy") { copyDifferences(leftToRight: true) }
                     .buttonStyle(.bordered)
-                    .disabled(isComparing || compareDiagnostic != nil || comparedContext != comparisonContext || fileOps.isBusy)
-                Button("Kopiuj różnice Prawy → Lewy") { copyDifferences(leftToRight: false) }
+                    .accessibilityLabel("Kopiuj różnice z lewego katalogu do prawego")
+                    .help("Kopiuj różniące się elementy z lewego katalogu do prawego. Istniejące pliki wymagają rozstrzygnięcia konfliktu.")
+                    .disabled(isComparing || compareDiagnostic != nil || comparedContext != comparisonContext || fileOps.isBusy || FolderComparison.copyCandidates(entries, leftToRight: true).isEmpty)
+                Button("Prawy → Lewy") { copyDifferences(leftToRight: false) }
                     .buttonStyle(.bordered)
-                    .disabled(isComparing || compareDiagnostic != nil || comparedContext != comparisonContext || fileOps.isBusy)
+                    .accessibilityLabel("Kopiuj różnice z prawego katalogu do lewego")
+                    .help("Kopiuj różniące się elementy z prawego katalogu do lewego. Istniejące pliki wymagają rozstrzygnięcia konfliktu.")
+                    .disabled(isComparing || compareDiagnostic != nil || comparedContext != comparisonContext || fileOps.isBusy || FolderComparison.copyCandidates(entries, leftToRight: false).isEmpty)
 
                 Spacer()
 
                 Button("Zamknij") {
+                    cancelOwnedConflict()
                     appState.showCompareSheet = false
                 }
-                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.cancelAction)
             }
         }
-        .padding(18)
-        .frame(width: 620)
+        .font(FinderUI.bodyFont)
+        .controlSize(.regular)
+        .padding(FinderUI.sheetPadding)
+        .frame(width: 740)
         .onAppear { computeDiff() }
         .onChange(of: comparisonContext) { _, _ in computeDiff() }
-        .onDisappear { compareToken?.cancel(); compareTask?.cancel() }
+        .onDisappear {
+            cancelOwnedConflict()
+            compareToken?.cancel()
+            compareTask?.cancel()
+        }
+        .sheet(item: ownedConflict) { ConflictResolutionSheetView(conflict: $0) }
     }
 
     private func statusColor(_ status: FolderCompareEntry.Status) -> Color {
@@ -617,6 +794,7 @@ private struct FolderComparisonContentView: View {
     }
 
     private func computeDiff() {
+        cancelOwnedConflict()
         compareToken?.cancel()
         compareTask?.cancel()
         let context = comparisonContext
@@ -644,6 +822,7 @@ private struct FolderComparisonContentView: View {
 
     private func copyDifferences(leftToRight: Bool) {
         guard !isComparing, compareDiagnostic == nil, comparedContext == comparisonContext,
+              fileOps.pendingConflict == nil,
               let token = compareToken, token.canPublish(active: compareToken, rootPath: leftPane.currentURL.path) else { return }
         let candidates = FolderComparison.copyCandidates(entries, leftToRight: leftToRight)
         let destination = leftToRight ? rightPane.currentURL : leftPane.currentURL
@@ -653,6 +832,15 @@ private struct FolderComparisonContentView: View {
             self.rightPane.reloadDirectory()
             self.computeDiff()
         }
+        // performTransfer creates a conflict synchronously, before any file mutation.
+        ownedConflictID = fileOps.pendingConflict?.id
+    }
+
+    private func cancelOwnedConflict() {
+        if let id = ownedConflictID, fileOps.pendingConflict?.id == id {
+            fileOps.pendingConflict = nil
+        }
+        ownedConflictID = nil
     }
 
 }
@@ -668,17 +856,20 @@ public struct ConflictResolutionSheetView: View {
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
             HStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 22))
                     .foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 2) {
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
                     Text("Wykryto konflikt nazw plików (\(conflict.conflictingNames.count))")
-                        .font(.system(size: 14.5, weight: .bold))
+                        .font(FinderUI.titleFont)
                     Text("W folderze docelowym '\(conflict.destinationDirectory.lastPathComponent)' istnieją już pliki o tych samych nazwach:")
-                        .font(.system(size: 11.5))
+                        .font(FinderUI.detailFont)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(conflict.destinationDirectory.path)
                 }
             }
 
@@ -687,23 +878,29 @@ public struct ConflictResolutionSheetView: View {
                     ForEach(conflict.conflictingNames, id: \.self) { name in
                         HStack(spacing: 6) {
                             Image(systemName: "doc.fill")
-                                .font(.system(size: 11))
                                 .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
                             Text(name)
-                                .font(.system(size: 11.5, design: .monospaced))
+                                .font(FinderUI.detailFont)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(name)
                             Spacer()
                         }
                     }
                 }
-                .padding(8)
+                .padding(FinderUI.rowSpacing)
             }
             .frame(maxHeight: 110)
-            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
 
             HStack(spacing: 10) {
                 Button("Anuluj") {
-                    fileOps.pendingConflict = nil
+                    if fileOps.pendingConflict?.id == conflict.id {
+                        fileOps.pendingConflict = nil
+                    }
                 }
+                .keyboardShortcut(.cancelAction)
 
                 Spacer()
 
@@ -711,24 +908,30 @@ public struct ConflictResolutionSheetView: View {
                     resolveWith(.skip)
                 }
                 .buttonStyle(.bordered)
+                .disabled(fileOps.isBusy)
 
-                Button("Zastąp istniejące") {
+                Button("Zastąp istniejące", role: .destructive) {
                     resolveWith(.overwrite)
                 }
                 .buttonStyle(.bordered)
-                .foregroundStyle(.red)
+                .disabled(fileOps.isBusy)
 
-                Button("Zachowaj oba (dopisz licznik)") {
+                Button("Zachowaj oba") {
                     resolveWith(.keepBoth)
                 }
-                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .help("Zachowaj istniejące pliki i dopisz licznik do nazw kopiowanych lub przenoszonych elementów")
+                .disabled(fileOps.isBusy)
             }
         }
-        .padding(18)
-        .frame(width: 500)
+        .font(FinderUI.bodyFont)
+        .controlSize(.regular)
+        .padding(FinderUI.sheetPadding)
+        .frame(width: 560)
     }
 
     private func resolveWith(_ policy: FileConflictPolicy) {
+        guard fileOps.pendingConflict?.id == conflict.id, !fileOps.isBusy else { return }
         let c = conflict
         fileOps.pendingConflict = nil
         fileOps.performTransfer(
@@ -756,29 +959,32 @@ public struct FSearchSettingsSheetView: View {
     @ViewState private var skippedDirsText: String = FSearchIndex.shared.skippedDirectoryNames.sorted().joined(separator: ", ")
     @ViewState private var skipHeavyDirs: Bool = FSearchIndex.shared.skipHeavyDevDirs
     @ViewState private var useMMapCache: Bool = FSearchIndex.shared.usePersistentMMapCache
+    @ViewState private var conflictPolicy: FileConflictPolicy = FileOperationsManager.shared.defaultConflictPolicy
     @ViewState private var newRootPath: String = ""
+    @ViewState private var rootPathError: String?
 
     public init(appState: AppState) {
         self.appState = appState
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
             HStack {
                 Image(systemName: "gearshape.2.fill")
                     .font(.system(size: 18))
                     .foregroundStyle(Color.accentColor)
-                Text("Ustawienia BetterFinder & Silnika fsearch")
-                    .font(.system(size: 15, weight: .bold))
+                    .accessibilityHidden(true)
+                Text("Ustawienia BetterFinder")
+                    .font(FinderUI.titleFont)
                 Spacer()
             }
 
             Divider()
 
             // Indexed Roots
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Indeksowane katalogi (getattrlistbulk + FSEvents):")
-                    .font(.system(size: 12, weight: .semibold))
+            VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+                Text("Indeksowane katalogi")
+                    .font(FinderUI.bodyFont.weight(.medium))
 
                 ScrollView {
                     VStack(spacing: 4) {
@@ -786,36 +992,54 @@ public struct FSearchSettingsSheetView: View {
                             HStack {
                                 Image(systemName: "folder.fill")
                                     .foregroundStyle(Color.accentColor)
+                                    .accessibilityHidden(true)
                                 Text(root)
-                                    .font(.system(size: 11.5, design: .monospaced))
+                                    .font(FinderUI.detailFont)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .help(root)
                                 Spacer()
-                                Button {
+                                Button(role: .destructive) {
                                     roots.removeAll { $0 == root }
                                 } label: {
                                     Image(systemName: "minus.circle.fill")
                                         .foregroundStyle(.red)
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel("Usuń \(root) z indeksowanych katalogów")
+                                .help("Usuń z indeksu; pliki pozostaną na dysku")
                             }
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
-                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 5))
+                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
                         }
                     }
                 }
                 .frame(height: 115)
-
-                HStack(spacing: 6) {
-                    TextField("Dodaj ścieżkę folderu (np. ~/Work)...", text: $newRootPath)
-                        .textFieldStyle(.roundedBorder)
-                    Button("Dodaj") {
-                        let exp = (newRootPath as NSString).expandingTildeInPath
-                        if FileManager.default.fileExists(atPath: exp) && !roots.contains(exp) {
-                            roots.append(exp)
-                            newRootPath = ""
-                        }
+                .overlay {
+                    if roots.isEmpty {
+                        Text("Dodaj katalog, aby uwzględnić jego pliki w indeksie.")
+                            .font(FinderUI.detailFont)
+                            .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.bordered)
+                }
+
+                HStack(spacing: FinderUI.rowSpacing) {
+                    TextField("Ścieżka folderu, np. ~/Work", text: $newRootPath)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityLabel("Nowy indeksowany katalog")
+                        .onSubmit(addRoot)
+                        .onChange(of: newRootPath) { _, _ in rootPathError = nil }
+                    Button("Dodaj", action: addRoot)
+                        .buttonStyle(.bordered)
+                        .disabled(newRootPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+
+                if let rootPathError {
+                    Label(rootPathError, systemImage: "exclamationmark.circle")
+                        .font(FinderUI.detailFont)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -823,43 +1047,46 @@ public struct FSearchSettingsSheetView: View {
 
             // Exclusions & MMap Cache
             Toggle("Pomijaj ciężkie katalogi deweloperskie i pamięć podręczną", isOn: $skipHeavyDirs)
-                .font(.system(size: 12))
+                .font(FinderUI.bodyFont)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Ignorowane nazwy katalogów (oddzielone przecinkami):")
-                    .font(.system(size: 11.5, weight: .medium))
+            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                Text("Ignorowane nazwy katalogów (oddzielone przecinkami)")
+                    .font(FinderUI.detailFont)
                     .foregroundStyle(.secondary)
                 TextField("node_modules, .git, .build...", text: $skippedDirsText)
                     .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11.5, design: .monospaced))
+                    .font(.system(.body, design: .monospaced))
+                    .accessibilityLabel("Ignorowane nazwy katalogów")
             }
 
-            Toggle("Trwały indeks binarny na dysku (mmap cache — start w 0 ms)", isOn: $useMMapCache)
-                .font(.system(size: 12))
+            Toggle("Zapisuj indeks na dysku, aby przyspieszyć uruchamianie", isOn: $useMMapCache)
+                .font(FinderUI.bodyFont)
+                .help("Korzystaj z trwałej pamięci podręcznej indeksu mmap")
 
-            Picker("Domyślna akcja przy konflikcie plików:", selection: $fileOps.defaultConflictPolicy) {
+            Picker("Domyślna akcja przy konflikcie plików", selection: $conflictPolicy) {
                 ForEach(FileConflictPolicy.allCases) { p in
                     Text(p.rawValue).tag(p)
                 }
             }
-            .font(.system(size: 12))
+            .font(FinderUI.bodyFont)
 
             // Engine Diagnostics Footer
-            HStack(spacing: 12) {
-                Text("Plików w indeksie: \(appState.indexedFileCount.formatted())")
-                Text("·")
-                Text("Filtry Blooma trigramów: \(FSearchIndex.shared.trigramCacheCount)")
-                Text("·")
-                Text("Plik mmap: \((FSearchIndex.shared.cacheFilePath as NSString).lastPathComponent)")
+            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                Text("Plików w indeksie: \(appState.indexedFileCount.formatted()) · Filtry Blooma: \(FSearchIndex.shared.trigramCacheCount)")
+                Text("Pamięć podręczna: \((FSearchIndex.shared.cacheFilePath as NSString).lastPathComponent)")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(FSearchIndex.shared.cacheFilePath)
             }
-            .font(.system(size: 10.5, design: .monospaced))
+            .font(FinderUI.captionFont.monospacedDigit())
             .foregroundStyle(.secondary)
 
             HStack {
                 Spacer()
-                Button("Zamknij") {
+                Button("Anuluj") {
                     appState.showSettingsSheet = false
                 }
+                .keyboardShortcut(.cancelAction)
                 Button("Zapisz i przebuduj indeks") {
                     let parsedSkip = Set(
                         skippedDirsText
@@ -870,14 +1097,34 @@ public struct FSearchSettingsSheetView: View {
                     FSearchIndex.shared.skippedDirectoryNames = parsedSkip
                     FSearchIndex.shared.skipHeavyDevDirs = skipHeavyDirs
                     FSearchIndex.shared.usePersistentMMapCache = useMMapCache
+                    fileOps.defaultConflictPolicy = conflictPolicy
                     appState.isIndexing = true
                     FSearchIndex.shared.startIndexing(roots: roots)
                     appState.showSettingsSheet = false
                 }
-                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
             }
         }
-        .padding(18)
-        .frame(width: 540)
+        .font(FinderUI.bodyFont)
+        .controlSize(.regular)
+        .padding(FinderUI.sheetPadding)
+        .frame(width: 580)
+    }
+
+    private func addRoot() {
+        guard !newRootPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let expandedPath = (newRootPath as NSString).expandingTildeInPath
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory), isDirectory.boolValue else {
+            rootPathError = "Nie znaleziono folderu pod podaną ścieżką."
+            return
+        }
+        guard !roots.contains(expandedPath) else {
+            rootPathError = "Ta ścieżka jest już na liście indeksowanych katalogów."
+            return
+        }
+        roots.append(expandedPath)
+        newRootPath = ""
+        rootPathError = nil
     }
 }

@@ -9,7 +9,18 @@ private struct IconFramePreferenceKey: PreferenceKey {
     }
 }
 
+/// Pointer, menu and accessibility actions must activate their owning pane before
+/// changing selection or navigation, so global commands observe the same target.
+@MainActor
+enum FinderPaneActionRouting {
+    static func perform(appState: AppState, paneSide: PaneSide, action: () -> Void) {
+        appState.activePaneSide = paneSide
+        action()
+    }
+}
+
 public struct FilePaneView: View {
+    @Environment(\.controlActiveState) private var controlActiveState
     @ObservedObject var appState: AppState
     @ObservedObject var pane: PaneTabState
     @ObservedObject var folderSizes = FolderSizeCache.shared
@@ -39,22 +50,49 @@ public struct FilePaneView: View {
         self.isFocusedPane = isFocusedPane
     }
 
+    // Keep foreground/background colors paired for inactive panes and windows.
+    private var emphasizesSelection: Bool {
+        isFocusedPane && controlActiveState != .inactive
+    }
+
+    private var selectionBackgroundColor: Color {
+        Color(nsColor: emphasizesSelection ? .selectedContentBackgroundColor : .unemphasizedSelectedContentBackgroundColor)
+    }
+
+    private var selectionForegroundColor: Color {
+        Color(nsColor: emphasizesSelection ? .alternateSelectedControlTextColor : .unemphasizedSelectedTextColor)
+    }
+
+    private var hasSearchQuery: Bool {
+        !pane.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    // Column placeholders belong to their own column, not over the whole trail.
+    private var showsPanePlaceholder: Bool {
+        hasSearchQuery || (pane.viewMode != .wiztree && pane.viewMode != .columns)
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             PathBreadcrumbBar(appState: appState, pane: pane)
 
             if let diagnostic = pane.searchDiagnostic {
-                Label(diagnostic, systemImage: "exclamationmark.triangle")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
+                searchNotice(diagnostic)
             } else if pane.searchIsPartial {
-                Text("Wyniki częściowe: nie przeszukano wszystkich plików.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.orange)
-                    .padding(6)
+                searchNotice("Wyniki częściowe: nie przeszukano wszystkich plików.")
+            }
+
+            if pane.isSearching && !pane.displayedItems.isEmpty {
+                HStack(spacing: FinderUI.rowSpacing) {
+                    ProgressView().controlSize(.small)
+                    Text("Aktualizowanie wyników…")
+                        .font(FinderUI.captionFont)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, FinderUI.sectionSpacing)
+                .padding(.vertical, FinderUI.compactSpacing)
+                .accessibilityElement(children: .combine)
             }
 
             if pane.currentURL.path == "\(NSHomeDirectory())/.Trash" {
@@ -68,17 +106,27 @@ public struct FilePaneView: View {
                 case .icons:
                     iconGridBrowserView
                 case .columns:
-                    if pane.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if !hasSearchQuery {
                         millerColumnsBrowserView
                     } else { listBrowserView }
                 case .wiztree:
-                    if pane.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        WizTreeAnalyzerView(appState: appState, pane: pane)
+                    if !hasSearchQuery {
+                        WizTreeAnalyzerView(
+                            appState: appState,
+                            pane: pane,
+                            paneSide: paneSide,
+                            selectionBackgroundColor: selectionBackgroundColor,
+                            selectionForegroundColor: selectionForegroundColor
+                        )
                     } else { listBrowserView }
                 }
 
-                if (pane.viewMode != .wiztree || !pane.searchQuery.isEmpty) && pane.displayedItems.isEmpty && !pane.isSearching {
-                    emptyStatePlaceholder
+                if showsPanePlaceholder && pane.displayedItems.isEmpty {
+                    if pane.isSearching {
+                        searchLoadingPlaceholder
+                    } else {
+                        emptyStatePlaceholder
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -87,6 +135,7 @@ public struct FilePaneView: View {
                 RoundedRectangle(cornerRadius: 4)
                     .stroke(isPaneDropTargeted ? Color.accentColor : Color.clear, lineWidth: 2.5)
                     .padding(2)
+                    .allowsHitTesting(false)
             )
             .onDrop(of: [.fileURL], isTargeted: $isPaneDropTargeted) { providers in
                 handleDropProviders(providers: providers, into: pane.currentURL)
@@ -101,6 +150,7 @@ public struct FilePaneView: View {
                     appState.isDualPane && isFocusedPane ? Color.accentColor.opacity(0.65) : Color.clear,
                     lineWidth: 2
                 )
+                .allowsHitTesting(false)
         )
         .coordinateSpace(name: "FilePaneSpace")
         .background(NativeFileDragSource(pane: pane, frames: dragFrames, isActive: isFocusedPane, activate: activatePane))
@@ -176,7 +226,7 @@ public struct FilePaneView: View {
         } label: {
             HStack(spacing: 4) {
                 Text(title)
-                    .font(.system(size: 11, weight: pane.sortField == field ? .bold : .medium))
+                    .font(FinderUI.captionFont.weight(pane.sortField == field ? .semibold : .medium))
                     .foregroundStyle(pane.sortField == field ? .primary : .secondary)
                 if pane.sortField == field {
                     Image(systemName: pane.sortAscending ? "chevron.up" : "chevron.down")
@@ -187,13 +237,16 @@ public struct FilePaneView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help("Sortuj według: \(title)")
+        .accessibilityLabel("Sortuj według: \(title)")
+        .accessibilityValue(pane.sortField == field ? (pane.sortAscending ? "Rosnąco" : "Malejąco") : "Nieaktywne sortowanie")
     }
 
     private func fileListRow(item: FileItem, index: Int, showDate: Bool, showKind: Bool) -> some View {
         let isSelected = pane.selectedPaths.contains(item.path)
         let isCutItem = fileOps.isCut(item.path)
         let isFolderDropTarget = (dropTargetFolderPath == item.path)
-        let showSubpath = !pane.searchQuery.isEmpty && pane.searchScope != .currentFolder
+        let showSubpath = hasSearchQuery && pane.searchScope != .currentFolder
 
         return HStack(spacing: 0) {
             // Tree Indentation + Disclosure Triangle (`▸` / `▾`) + Icon + Name + Tags
@@ -204,18 +257,20 @@ public struct FilePaneView: View {
                 }
 
                 // Outline disclosure triangle for folders when browsing directory
-                if pane.searchQuery.isEmpty {
+                if !hasSearchQuery {
                     if item.isDirectory && item.fileExtension.lowercased() != "app" {
                         Button {
-                            pane.toggleFolderExpansion(for: item)
+                            performPaneAction { pane.toggleFolderExpansion(for: item) }
                         } label: {
                             Image(systemName: pane.isExpanded(item.path) ? "chevron.down" : "chevron.right")
                                 .font(.system(size: 9.5, weight: .bold))
-                                .foregroundStyle(isSelected ? Color.white.opacity(0.9) : Color.secondary)
+                                .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
                                 .frame(width: 14, height: 14)
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .help(pane.isExpanded(item.path) ? "Zwiń folder" : "Rozwiń folder")
+                        .accessibilityLabel("\(pane.isExpanded(item.path) ? "Zwiń" : "Rozwiń") folder \(item.name)")
                     } else {
                         Spacer()
                             .frame(width: 14)
@@ -231,8 +286,8 @@ public struct FilePaneView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Text(item.name)
-                            .font(.system(size: 13, weight: item.isDirectory ? .medium : .regular))
-                            .foregroundStyle(isSelected ? Color.white : (item.isHidden ? Color.secondary : Color.primary))
+                            .font(FinderUI.bodyFont.weight(item.isDirectory ? .medium : .regular))
+                            .foregroundStyle(isSelected ? selectionForegroundColor : (item.isHidden ? Color.secondary : Color.primary))
                             .lineLimit(1)
                             .truncationMode(.middle)
 
@@ -251,7 +306,7 @@ public struct FilePaneView: View {
                         if item.isSymlink {
                             Image(systemName: "arrow.turn.up.right")
                                 .font(.system(size: 9, weight: .bold))
-                                .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
+                                .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
                         }
 
                         if let git = item.gitStatus {
@@ -261,8 +316,8 @@ public struct FilePaneView: View {
 
                     if showSubpath {
                         Text(item.parentPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(isSelected ? Color.white.opacity(0.8) : Color.secondary)
+                            .font(FinderUI.captionFont)
+                            .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
                             .lineLimit(1)
                     }
 
@@ -270,10 +325,10 @@ public struct FilePaneView: View {
                         HStack(spacing: 5) {
                             Text("L\(grep.lineNumber):")
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundStyle(isSelected ? Color.white : Color.accentColor)
+                                .foregroundStyle(isSelected ? selectionForegroundColor : Color.accentColor)
                             Text(grep.lineText)
                                 .font(.system(size: 10.5, design: .monospaced))
-                                .foregroundStyle(isSelected ? Color.white.opacity(0.9) : Color.primary.opacity(0.85))
+                                .foregroundStyle(isSelected ? selectionForegroundColor : Color.primary.opacity(0.85))
                                 .lineLimit(1)
                         }
                         .padding(.horizontal, 6)
@@ -304,21 +359,21 @@ public struct FilePaneView: View {
                 }
             }
             .font(.system(size: 11.5, design: .monospaced))
-            .foregroundStyle(isSelected ? Color.white.opacity(0.9) : Color.secondary)
+            .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
             .frame(width: 85, alignment: .trailing)
             .padding(.trailing, 14)
 
             if showDate {
                 Text(FormatHelpers.formatDate(item.modificationDate))
-                    .font(.system(size: 12))
-                    .foregroundStyle(isSelected ? Color.white.opacity(0.9) : Color.secondary)
+                    .font(FinderUI.detailFont)
+                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
                     .lineLimit(1)
                     .frame(width: 145, alignment: .leading)
             }
             if showKind {
                 Text(item.kindDisplayString)
-                    .font(.system(size: 12))
-                    .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.secondary)
+                    .font(FinderUI.detailFont)
+                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
                     .lineLimit(1)
                     .frame(width: 110, alignment: .leading)
             }
@@ -327,7 +382,7 @@ public struct FilePaneView: View {
         .padding(.vertical, showSubpath || item.grepMatch != nil ? 6 : 5)
         .opacity(isCutItem ? 0.5 : 1.0)
         .background(
-            isSelected ? Color.accentColor : (isFolderDropTarget ? Color.accentColor.opacity(0.18)
+            isSelected ? selectionBackgroundColor : (isFolderDropTarget ? Color.accentColor.opacity(0.18)
                 : (index.isMultiple(of: 2) ? Color.clear : Color(nsColor: .alternatingContentBackgroundColors[1]))),
             in: RoundedRectangle(cornerRadius: 5)
         )
@@ -362,6 +417,12 @@ public struct FilePaneView: View {
         .contextMenu {
             itemContextMenu(for: item)
         }
+        .help(item.path)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(item.name)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityAction(named: Text("Zaznacz")) { handleSelectionClick(item: item) }
+        .accessibilityAction(named: Text("Otwórz")) { openOrEnterItem(item) }
     }
 
     // MARK: - 2. Native Icon Grid View with Rubber-Band Marquee Selection & Drag/Drop
@@ -382,7 +443,7 @@ public struct FilePaneView: View {
         let columns = [GridItem(.adaptive(minimum: cellWidth, maximum: cellWidth + 24), spacing: 14)]
         return ScrollView {
             ZStack(alignment: .topLeading) {
-                LazyVGrid(columns: columns, spacing: 16) {
+                LazyVGrid(columns: columns, spacing: FinderUI.sectionSpacing) {
                     ForEach(pane.displayedItems) { item in
                         let isSelected = pane.selectedPaths.contains(item.path)
                         let isCutItem = fileOps.isCut(item.path)
@@ -404,7 +465,7 @@ public struct FilePaneView: View {
                             .padding(6)
                             .background(
                                 RoundedRectangle(cornerRadius: 10)
-                                    .fill(isSelected || isFolderDropTarget ? Color.accentColor.opacity(0.22) : Color.clear)
+                                    .fill(isFolderDropTarget ? Color.accentColor.opacity(0.22) : (isSelected ? selectionBackgroundColor.opacity(0.22) : Color.clear))
                             )
 
                             HStack(spacing: 3) {
@@ -416,8 +477,8 @@ public struct FilePaneView: View {
                                     }
                                 }
                                 Text(item.name)
-                                    .font(.system(size: 12, weight: item.isDirectory ? .medium : .regular))
-                                    .foregroundStyle(isSelected ? Color.white : Color.primary)
+                                    .font(FinderUI.detailFont.weight(item.isDirectory ? .medium : .regular))
+                                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.primary)
                                     .lineLimit(2)
                                     .multilineTextAlignment(.center)
                             }
@@ -425,7 +486,7 @@ public struct FilePaneView: View {
                             .padding(.vertical, 2)
                             .background(
                                 RoundedRectangle(cornerRadius: 5)
-                                    .fill(isSelected ? Color.accentColor : Color.clear)
+                                    .fill(isSelected ? selectionBackgroundColor : Color.clear)
                             )
 
                             Text(
@@ -433,7 +494,7 @@ public struct FilePaneView: View {
                                 ? (folderSizes.displaySize(for: item.path) ?? "Folder")
                                 : FormatHelpers.formatBytes(item.size)
                             )
-                            .font(.system(size: 10))
+                            .font(FinderUI.captionFont)
                             .foregroundStyle(.secondary)
                             .onAppear {
                                 if item.isDirectory {
@@ -479,9 +540,14 @@ public struct FilePaneView: View {
                         .contextMenu {
                             itemContextMenu(for: item)
                         }
+                        .help(item.path)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityAddTraits(isSelected ? .isSelected : [])
+                        .accessibilityAction(named: Text("Zaznacz")) { handleSelectionClick(item: item) }
+                        .accessibilityAction(named: Text("Otwórz")) { openOrEnterItem(item) }
                     }
                 }
-                .padding(16)
+                .padding(FinderUI.sectionSpacing)
 
                 // Rubber-band Marquee Selection Box Overlay
                 if let rect = marqueeRect {
@@ -534,14 +600,17 @@ public struct FilePaneView: View {
                     MillerColumnSingleListView(
                         columnURL: colURL,
                         pane: pane,
+                        selectionBackgroundColor: selectionBackgroundColor,
+                        selectionForegroundColor: selectionForegroundColor,
                         onSelectDirectory: { selectedDirURL in
-                            pane.navigate(to: selectedDirURL)
+                            performPaneAction { pane.navigate(to: selectedDirURL) }
                         },
                         onSelectFile: { fileItem in
-                            activatePane()
-                            let parent = fileItem.url.deletingLastPathComponent()
-                            if pane.currentURL.path != parent.path { pane.navigate(to: parent) }
-                            pane.select(fileItem)
+                            performPaneAction {
+                                let parent = fileItem.url.deletingLastPathComponent()
+                                if pane.currentURL.path != parent.path { pane.navigate(to: parent) }
+                                pane.select(fileItem)
+                            }
                         }
                     )
                     .frame(width: 245)
@@ -558,11 +627,11 @@ public struct FilePaneView: View {
             Image(systemName: "trash.fill")
                 .font(.system(size: 13))
                 .foregroundStyle(.secondary)
-            Text("Kosz systemowy (\(pane.displayedItems.count) elementów)")
-                .font(.system(size: 12, weight: .semibold))
+            Text("Kosz systemowy · Elementy: \(pane.displayedItems.count)")
+                .font(FinderUI.detailFont.weight(.semibold))
             Spacer()
             if !pane.displayedItems.isEmpty {
-                Button("Opróżnij Kosz...", role: .destructive) {
+                Button("Opróżnij Kosz…", role: .destructive) {
                     fileOps.emptySystemTrash()
                     pane.reloadDirectory()
                 }
@@ -577,28 +646,55 @@ public struct FilePaneView: View {
         .overlay(alignment: .bottom) { Divider() }
     }
 
-    // MARK: - Empty State
+    // MARK: - Search Status & Empty State
+
+    private func searchNotice(_ message: String) -> some View {
+        Label(message, systemImage: "exclamationmark.triangle")
+            .font(FinderUI.captionFont)
+            .foregroundStyle(.orange)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, FinderUI.sectionSpacing)
+            .padding(.vertical, FinderUI.rowSpacing)
+            .accessibilityElement(children: .combine)
+    }
+
+    private var searchLoadingPlaceholder: some View {
+        VStack(spacing: FinderUI.rowSpacing) {
+            ProgressView()
+                .controlSize(.regular)
+                .accessibilityLabel("Wyszukiwanie plików")
+            Text("Wyszukiwanie…")
+                .font(FinderUI.titleFont)
+            Text("Wyniki pojawią się po zakończeniu wyszukiwania.")
+                .font(FinderUI.detailFont)
+                .foregroundStyle(.secondary)
+        }
+        .multilineTextAlignment(.center)
+        .padding(FinderUI.sheetPadding)
+        .allowsHitTesting(false)
+    }
 
     private var emptyStatePlaceholder: some View {
-        VStack(spacing: 12) {
-            Image(systemName: pane.searchQuery.isEmpty ? "folder" : "magnifyingglass")
-                .font(.system(size: 42, weight: .ultraLight))
+        VStack(spacing: FinderUI.rowSpacing) {
+            Image(systemName: hasSearchQuery ? "magnifyingglass" : "folder")
+                .font(.system(size: 36, weight: .light))
                 .foregroundStyle(.tertiary)
-            Text(pane.searchQuery.isEmpty ? "Ten folder jest pusty" : (pane.searchDiagnostic != nil || pane.searchIsPartial ? "Brak wyników w sprawdzonym zakresie" : "Brak pasujących plików"))
-                .font(.system(size: 17, weight: .semibold))
-            Text(pane.searchQuery.isEmpty ? "Przeciągnij tutaj pliki lub utwórz nowy folder."
+                .accessibilityHidden(true)
+            Text(!hasSearchQuery ? "Brak widocznych elementów" : (pane.searchDiagnostic != nil || pane.searchIsPartial ? "Brak wyników w sprawdzonym zakresie" : "Brak pasujących plików"))
+                .font(FinderUI.titleFont)
+            Text(!hasSearchQuery ? "Przeciągnij tutaj pliki, utwórz folder lub sprawdź ustawienie ukrytych plików."
                  : "Zmień zapytanie, usuń filtry lub poszerz zakres wyszukiwania.")
-                .font(.system(size: 12))
+                .font(FinderUI.detailFont)
                 .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
                 .frame(maxWidth: 300)
-            if pane.searchQuery.isEmpty {
+            if !hasSearchQuery {
                 Button("Nowy folder…") { activatePane(); appState.showNewFolderSheet = true }
             } else {
                 Button("Wyczyść wyszukiwanie") { pane.clearSearch() }
             }
         }
-        .padding(24)
+        .multilineTextAlignment(.center)
+        .padding(FinderUI.sheetPadding)
     }
 
     // MARK: - Git Badge
@@ -615,7 +711,7 @@ public struct FilePaneView: View {
         }()
         return Text(git.rawValue)
             .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-            .foregroundStyle(isSelected ? .white : color)
+            .foregroundStyle(isSelected ? selectionForegroundColor : color)
             .padding(.horizontal, 4)
             .padding(.vertical, 1)
             .background(
@@ -638,22 +734,29 @@ public struct FilePaneView: View {
         return true
     }
 
+    private func performPaneAction(_ action: () -> Void) {
+        FinderPaneActionRouting.perform(appState: appState, paneSide: paneSide, action: action)
+    }
+
     private func activatePane() {
-        appState.activePaneSide = paneSide
+        performPaneAction {}
     }
 
     private func handleSelectionClick(item: FileItem) {
-        activatePane()
         let flags = NSEvent.modifierFlags
-        pane.select(item, extending: flags.contains(.shift), toggling: flags.contains(.command))
+        performPaneAction {
+            pane.select(item, extending: flags.contains(.shift), toggling: flags.contains(.command))
+        }
     }
 
     private func openOrEnterItem(_ item: FileItem) {
         guard !pane.actionItems(for: item).isEmpty else { return }
-        if item.isDirectory && item.fileExtension.lowercased() != "app" {
-            pane.navigate(to: item.url)
-        } else {
-            NSWorkspace.shared.open(item.url)
+        performPaneAction {
+            if item.isDirectory && item.fileExtension.lowercased() != "app" {
+                pane.navigate(to: item.url)
+            } else {
+                NSWorkspace.shared.open(item.url)
+            }
         }
     }
 
@@ -686,10 +789,12 @@ public struct FilePaneView: View {
         if !pane.searchQuery.isEmpty {
             Button {
                 guard !pane.actionItems(for: item).isEmpty else { return }
-                let parentURL = URL(fileURLWithPath: item.parentPath, isDirectory: true)
-                pane.searchQuery = ""
-                pane.navigate(to: parentURL)
-                pane.selectedPaths = [item.path]
+                performPaneAction {
+                    let parentURL = URL(fileURLWithPath: item.parentPath, isDirectory: true)
+                    pane.searchQuery = ""
+                    pane.navigate(to: parentURL)
+                    pane.selectedPaths = [item.path]
+                }
             } label: {
                 Label("Pokaż w folderze nadrzędnym", systemImage: "folder.fill.badge.person.crop")
             }
@@ -869,7 +974,7 @@ public struct FilePaneView: View {
         Divider()
 
         Button {
-            appState.showTerminalDrawer.toggle()
+            performPaneAction { appState.showTerminalDrawer.toggle() }
         } label: {
             Label("Wbudowany panel Terminala (Ctrl+`)", systemImage: "terminal.fill")
         }
@@ -887,6 +992,8 @@ private struct MillerColumnSingleListView: View {
     @ObservedObject var pane: PaneTabState
     @ObservedObject private var iconCache = FileIconCache.shared
     @ObservedObject private var folderSizes = FolderSizeCache.shared
+    let selectionBackgroundColor: Color
+    let selectionForegroundColor: Color
     let onSelectDirectory: (URL) -> Void
     let onSelectFile: (FileItem) -> Void
 
@@ -899,10 +1006,12 @@ private struct MillerColumnSingleListView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(Color.accentColor)
                 Text(columnURL.lastPathComponent.isEmpty ? "/" : columnURL.lastPathComponent)
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(FinderUI.captionFont.weight(.semibold))
                     .lineLimit(1)
+                    .truncationMode(.middle)
                 Spacer()
             }
+            .help(columnURL.path)
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .background(Color(nsColor: .windowBackgroundColor))
@@ -919,8 +1028,8 @@ private struct MillerColumnSingleListView: View {
                                 .resizable()
                                 .frame(width: 16, height: 16)
                             Text(item.name)
-                                .font(.system(size: 12))
-                                .foregroundStyle(isInTrail ? Color.white : Color.primary)
+                                .font(FinderUI.detailFont)
+                                .foregroundStyle(isInTrail ? selectionForegroundColor : Color.primary)
                                 .lineLimit(1)
                             Spacer()
                             let tags = pane.cachedTags(for: item.path) ?? item.tags
@@ -932,14 +1041,14 @@ private struct MillerColumnSingleListView: View {
                             if item.isDirectory {
                                 Image(systemName: "chevron.right")
                                     .font(.system(size: 9, weight: .bold))
-                                    .foregroundStyle(isInTrail ? Color.white.opacity(0.8) : .secondary)
+                                    .foregroundStyle(isInTrail ? selectionForegroundColor : Color.secondary)
                             }
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
                         .background(
                             RoundedRectangle(cornerRadius: 5)
-                                .fill(isInTrail ? Color.accentColor : Color.clear)
+                                .fill(isInTrail ? selectionBackgroundColor : Color.clear)
                         )
                         .contentShape(Rectangle())
                         .onDrag {
@@ -952,9 +1061,34 @@ private struct MillerColumnSingleListView: View {
                                 onSelectFile(item)
                             }
                         }
+                        .help(item.path)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityAddTraits(isInTrail ? .isSelected : [])
+                        .accessibilityAction {
+                            if item.isDirectory && item.fileExtension.lowercased() != "app" {
+                                onSelectDirectory(item.url)
+                            } else {
+                                onSelectFile(item)
+                            }
+                        }
                     }
                 }
-                .padding(4)
+                .padding(FinderUI.compactSpacing)
+            }
+            .overlay {
+                if items.isEmpty {
+                    VStack(spacing: FinderUI.rowSpacing) {
+                        Image(systemName: "folder")
+                            .font(.title2)
+                            .accessibilityHidden(true)
+                        Text("Brak widocznych elementów")
+                            .font(FinderUI.detailFont)
+                    }
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(FinderUI.sectionSpacing)
+                    .allowsHitTesting(false)
+                }
             }
         }
         .onAppear {

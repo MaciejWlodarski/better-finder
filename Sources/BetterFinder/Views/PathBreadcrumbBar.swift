@@ -59,13 +59,15 @@ public struct PathBreadcrumbBar: View {
             }
 
             if pane.isEditingPathBar, let pathValidationMessage {
-                Text(pathValidationMessage)
+                Label(pathValidationMessage, systemImage: "exclamationmark.circle")
                     .foregroundStyle(.red)
+                    .font(FinderUI.captionFont)
+                    .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 8)
             }
         }
-        .font(.system(size: 13))
+        .font(FinderUI.bodyFont)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -132,7 +134,7 @@ public struct PathBreadcrumbBar: View {
             .frame(minHeight: 28)
             .background {
                 if isCurrent {
-                    RoundedRectangle(cornerRadius: 5)
+                    RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
                         .fill(Color(nsColor: .controlBackgroundColor))
                 }
             }
@@ -157,7 +159,7 @@ public struct PathBreadcrumbBar: View {
 
             TextField("Ścieżka folderu, np. ~/Documents", text: $editablePathText)
                 .textFieldStyle(.plain)
-                .font(.system(size: 13))
+                .font(FinderUI.bodyFont)
                 .focused($isPathFieldFocused)
                 .accessibilityLabel("Ścieżka folderu")
                 .accessibilityHint(pathValidationMessage ?? "Return otwiera folder, Escape anuluje. Możesz użyć ~ lub ścieżki względnej.")
@@ -185,9 +187,9 @@ public struct PathBreadcrumbBar: View {
         }
         .padding(.horizontal, 8)
         .frame(minHeight: 30)
-        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 5))
+        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
         .overlay {
-            RoundedRectangle(cornerRadius: 5)
+            RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
                 .strokeBorder(pathValidationMessage == nil ? Color.accentColor : Color.red, lineWidth: 1)
         }
         .onAppear {
@@ -225,7 +227,7 @@ public struct PathBreadcrumbBar: View {
             }
         } label: {
             Image(systemName: "ellipsis.circle")
-                .frame(width: 28, height: 28)
+                .frame(width: FinderUI.iconButtonSize, height: FinderUI.iconButtonSize)
                 .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
@@ -276,7 +278,7 @@ public struct PathBreadcrumbBar: View {
         Button(action: action) {
             Image(systemName: icon)
                 .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
+                .frame(width: FinderUI.iconButtonSize, height: FinderUI.iconButtonSize)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.borderless)

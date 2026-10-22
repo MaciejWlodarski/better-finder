@@ -159,95 +159,76 @@ public struct EmbeddedTerminalDrawerView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
-            // Terminal Header Bar
-            HStack(spacing: 10) {
-                Image(systemName: "terminal.fill")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(Color.accentColor)
-
-                Text("Terminal")
-                    .font(.system(size: 11.5, weight: .bold))
+            HStack(spacing: FinderUI.rowSpacing) {
+                Label("Terminal", systemImage: "terminal")
+                    .font(FinderUI.titleFont)
+                    .fixedSize()
 
                 Text(activeTab.currentURL.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(FinderUI.detailFont.monospaced())
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 1.5)
-                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
                     .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .help(activeTab.currentURL.path)
+                    .accessibilityLabel("Bieżący folder: \(activeTab.currentURL.path)")
 
-                Divider()
-                    .frame(height: 12)
-
-                // Quick Command Chips
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 5) {
-                        ForEach(quickCommands, id: \.self) { cmd in
-                            Button(cmd) {
-                                executeCommand(cmd)
-                            }
-                            .font(.system(size: 10, design: .monospaced))
-                            .buttonStyle(.bordered)
-                            .controlSize(.mini)
-                            .disabled(isRunning)
-                        }
-                    }
-                }
-
-                Spacer()
-
-                Button {
+                terminalIconButton("Wyczyść wyjście terminala", icon: "trash") {
                     outputLines.removeAll()
-                } label: {
-                    Image(systemName: "trash")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
-                .help("Wyczyść wyjście terminala")
+                .disabled(outputLines.isEmpty)
 
-                Button {
+                terminalIconButton("Otwórz folder w zewnętrznym terminalu", icon: "arrow.up.forward.app") {
                     FileOperationsManager.shared.openInTerminal(at: activeTab.currentURL)
-                } label: {
-                    Image(systemName: "arrow.up.forward.app")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
-                .help("Otwórz w zewnętrznym Terminalu / iTerm2")
 
-                if isRunning {
-                    Button("Przerwij") { session?.cancel() }
-                        .buttonStyle(.bordered).controlSize(.small)
-                }
-                Button {
+                terminalIconButton("Ukryj terminal (Ctrl+`)", icon: "xmark") {
                     session?.cancel()
                     appState.showTerminalDrawer = false
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
-                .help("Ukryj panel terminala (Ctrl+`)")
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 5)
+            .padding(.vertical, FinderUI.compactSpacing)
+            .background(Color(nsColor: .windowBackgroundColor))
+
+            // A separate horizontal strip keeps shortcuts from squeezing the path and controls.
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: FinderUI.compactSpacing) {
+                    ForEach(quickCommands, id: \.self) { cmd in
+                        Button(cmd) { executeCommand(cmd) }
+                            .font(FinderUI.detailFont.monospaced())
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(isRunning)
+                            .help("Uruchom w bieżącym folderze: \(cmd)")
+                            .accessibilityLabel("Uruchom polecenie: \(cmd)")
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, FinderUI.compactSpacing)
+            }
+            .frame(height: 32)
             .background(Color(nsColor: .windowBackgroundColor))
 
             Divider()
 
-            // Output Scroll Area
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
+                    LazyVStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                        if outputLines.isEmpty {
+                            Text(isRunning ? "Polecenie jest wykonywane…" : "Brak wyjścia. Wpisz polecenie poniżej lub wybierz skrót.")
+                                .font(FinderUI.detailFont)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                         ForEach(outputLines) { line in
                             Text(line.text)
-                                .font(.system(size: 11.5, weight: line.isCommand ? .bold : .regular, design: .monospaced))
+                                .font(FinderUI.detailFont.monospaced().weight(line.isCommand ? .semibold : .regular))
                                 .foregroundStyle(
                                     line.isCommand
                                     ? Color.accentColor
-                                    : (line.isError ? Color.orange : Color.primary.opacity(0.9))
+                                    : (line.isError ? Color.red : Color.primary)
                                 )
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -255,7 +236,7 @@ public struct EmbeddedTerminalDrawerView: View {
                         }
                     }
                     .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
+                    .padding(.vertical, FinderUI.rowSpacing)
                 }
                 .background(Color(nsColor: .textBackgroundColor))
                 .onChange(of: outputLines.count) { _, _ in
@@ -267,19 +248,26 @@ public struct EmbeddedTerminalDrawerView: View {
 
             Divider()
 
-            // Prompt Input Row
-            HStack(spacing: 8) {
+            HStack(spacing: FinderUI.rowSpacing) {
                 Text("\(activeTab.currentURL.lastPathComponent) %")
-                    .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                    .font(FinderUI.detailFont.monospaced().weight(.semibold))
                     .foregroundStyle(Color.accentColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 100, alignment: .leading)
+                    .help(activeTab.currentURL.path)
+                    .accessibilityHidden(true)
 
-                TextField("Wpisz polecenie zsh i naciśnij Enter (np. cd .., ls -la, git status)...", text: $commandInput)
+                TextField("Wpisz polecenie zsh…", text: $commandInput)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(FinderUI.bodyFont.monospaced())
                     .focused($isInputFocused)
+                    .disabled(isRunning)
+                    .accessibilityLabel("Polecenie terminala")
+                    .help("Naciśnij Return, aby uruchomić polecenie w bieżącym folderze. Polecenia interaktywne wymagają zewnętrznego terminala.")
                     .onSubmit {
                         let cmd = commandInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !cmd.isEmpty else { return }
+                        guard !isRunning, !cmd.isEmpty else { return }
                         commandInput = ""
                         executeCommand(cmd)
                     }
@@ -287,19 +275,36 @@ public struct EmbeddedTerminalDrawerView: View {
                 if isRunning {
                     ProgressView()
                         .controlSize(.small)
+                        .accessibilityLabel("Wykonywanie polecenia")
+                    Button("Przerwij") { session?.cancel() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Przerwij bieżące polecenie")
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .padding(.vertical, FinderUI.rowSpacing)
             .background(Color(nsColor: .controlBackgroundColor))
         }
-        .frame(height: 185)
+        .frame(height: 220)
         .onAppear { isInputFocused = true }
         .onDisappear {
             session?.cancel()
             session = nil
             isRunning = false
         }
+    }
+
+    private func terminalIconButton(_ label: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(FinderUI.detailFont)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .help(label)
+        .accessibilityLabel(label)
     }
 
     private func executeCommand(_ rawCmd: String) {

@@ -28,7 +28,7 @@ public struct FSearchToolbarSection: View {
                     Toggle("Toleruj literówki", isOn: $activeTab.fuzzyEnabled)
                 } label: {
                     Label(scopeLabel(activeTab.searchScope), systemImage: activeTab.searchScope.iconName)
-                        .font(.system(size: 12))
+                        .font(FinderUI.detailFont)
                 }
                 .fixedSize()
                 .help("Wybierz, gdzie szukać plików")
@@ -54,6 +54,7 @@ public struct FSearchToolbarSection: View {
                     Label("Pasek boczny", systemImage: "sidebar.left")
                 }
                 .help("Pokaż lub ukryj pasek boczny (⌃⌘S)")
+                .accessibilityValue(appState.showSidebar ? "Widoczny" : "Ukryty")
             }
             ToolbarItemGroup(placement: .navigation) {
                 Button { activeTab.goBack() } label: {
@@ -148,11 +149,13 @@ public struct FSearchToolbarSection: View {
                 }
                 .tint(appState.isDualPane ? .accentColor : .secondary)
                 .help("Widok dwupanelowy (⇧⌘D)")
+                .accessibilityValue(appState.isDualPane ? "Włączony" : "Wyłączony")
                 Button { appState.showInspector.toggle() } label: {
                     Label("Inspektor", systemImage: "sidebar.right")
                 }
                 .tint(appState.showInspector ? .accentColor : .secondary)
                 .help("Pokaż lub ukryj inspektor (⌘I)")
+                .accessibilityValue(appState.showInspector ? "Widoczny" : "Ukryty")
             }
         }
         .onChange(of: appState.focusSearchFieldTrigger) { _, _ in isSearchFocused = true }
@@ -172,23 +175,24 @@ public struct FSearchToolbarSection: View {
                 }
                 .accessibilityLabel("Szukaj plików i folderów")
             if activeTab.isSearching {
-                ProgressView().controlSize(.small).scaleEffect(0.75).frame(width: 16, height: 16)
+                ProgressView().controlSize(.small)
+                    .accessibilityLabel("Wyszukiwanie plików")
             } else if !activeTab.searchQuery.isEmpty {
                 Button { appState.saveSmartFolder(query: activeTab.searchQuery) } label: {
-                    Image(systemName: "star")
+                    Image(systemName: "star").frame(width: 24, height: 24)
                 }
                 .help("Zapisz wyszukiwanie w pasku bocznym")
                 .accessibilityLabel("Zapisz wyszukiwanie")
                 Button { activeTab.clearSearch() } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).frame(width: 24, height: 24)
                 }
                 .help("Wyczyść wyszukiwanie (Esc)")
                 .accessibilityLabel("Wyczyść wyszukiwanie")
             } else if !isSearchFocused {
-                Text("⌘F").font(.system(size: 11)).foregroundStyle(.tertiary)
+                Text("⌘F").font(FinderUI.captionFont).foregroundStyle(.tertiary)
             }
         }
-        .font(.system(size: 13))
+        .font(FinderUI.bodyFont)
         .buttonStyle(.plain)
         .padding(.horizontal, 10)
         .frame(height: 30)
@@ -220,7 +224,7 @@ public struct FSearchToolbarSection: View {
             }
         } label: {
             Label("Filtry", systemImage: "line.3.horizontal.decrease.circle")
-                .font(.system(size: 12))
+                .font(FinderUI.detailFont)
         }
         .fixedSize()
         .popover(isPresented: $appState.showFSearchHelpPopover) {
@@ -254,9 +258,10 @@ public struct FSearchToolbarSection: View {
                     .buttonStyle(.plain)
                     .foregroundStyle(Color.accentColor)
                     .help("Usuń filtr \(pill.rawToken)")
+                    .accessibilityLabel("Usuń filtr \(pill.rawToken)")
                 }
             }
-            .font(.system(size: 11))
+            .font(FinderUI.captionFont)
             .padding(.horizontal, 16)
             .padding(.bottom, 9)
         }
@@ -295,11 +300,11 @@ public struct FSearchSyntaxCheatsheetView: View {
             HStack {
                 Image(systemName: "bolt.horizontal.circle.fill")
                     .foregroundStyle(Color.accentColor)
-                Text("Składnia wyszukiwania fsearch")
-                    .font(.system(size: 13, weight: .bold))
+                Text("Składnia wyszukiwania")
+                    .font(FinderUI.titleFont)
                 Spacer()
                 Text("Kliknij, aby wypróbować")
-                    .font(.system(size: 10.5))
+                    .font(FinderUI.captionFont)
                     .foregroundStyle(.secondary)
             }
 
@@ -321,7 +326,7 @@ public struct FSearchSyntaxCheatsheetView: View {
                             .frame(width: 175, alignment: .leading)
 
                         Text(desc)
-                            .font(.system(size: 11.5))
+                            .font(FinderUI.detailFont)
                             .foregroundStyle(.primary)
                         Spacer()
                     }

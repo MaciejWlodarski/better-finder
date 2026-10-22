@@ -17,7 +17,7 @@ struct BetterFinderApp: App {
         .commands {
             // App Settings (Cmd+,)
             CommandGroup(replacing: .appSettings) {
-                Button("Ustawienia BetterFinder & fsearch...") {
+                Button("Ustawienia…") {
                     appState.showSettingsSheet = true
                 }
                 .keyboardShortcut(",", modifiers: [.command])
@@ -34,12 +34,12 @@ struct BetterFinderApp: App {
                     .keyboardShortcut("t", modifiers: [.command, .shift])
                     .disabled(appState.recentlyClosedTabs.isEmpty)
 
-                Button("Nowy folder...") {
+                Button("Nowy folder…") {
                     appState.showNewFolderSheet = true
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
 
-                Button("Nowy plik z szablonu...") {
+                Button("Nowy plik…") {
                     appState.showNewFileSheet = true
                 }
                 .keyboardShortcut("n", modifiers: [.command, .option])
@@ -79,7 +79,7 @@ struct BetterFinderApp: App {
             CommandGroup(replacing: .pasteboard) {
                 Divider()
 
-                Button("Wytnij pliki (Cut)") {
+                Button("Wytnij pliki") {
                     if !routeTextAction(#selector(NSText.cut(_:))), canUseFileCommands { fileOps.cutItems(appState.activeTab.selectedItems) }
                 }
                 .keyboardShortcut("x", modifiers: [.command])
@@ -134,12 +134,12 @@ struct BetterFinderApp: App {
 
             // fsearch & Navigation Menu
             CommandMenu("Przejdź") {
-                Button("Szukaj na pasku fsearch") {
+                Button("Szukaj plików i folderów") {
                     appState.focusSearchFieldTrigger += 1
                 }
                 .keyboardShortcut("f", modifiers: [.command])
 
-                Button("Błyskawiczne okno Spotlight fsearch...") {
+                Button("Szybkie wyszukiwanie…") {
                     appState.showQuickFSearchModal.toggle()
                 }
                 .keyboardShortcut("p", modifiers: [.command])
@@ -191,7 +191,7 @@ struct BetterFinderApp: App {
 
                 Divider()
 
-                Button("Przebuduj indeks RAM/mmap fsearch") {
+                Button("Przebuduj indeks plików") {
                     appState.isIndexing = true
                     FSearchIndex.shared.startIndexing()
                 }
@@ -213,24 +213,24 @@ struct BetterFinderApp: App {
                 }
                 .keyboardShortcut("2", modifiers: [.command])
 
-                Button("Widok kolumn (Miller Columns)") {
+                Button("Widok kolumn") {
                     appState.activeTab.viewMode = .columns
                 }
                 .keyboardShortcut("3", modifiers: [.command])
 
-                Button("Widok WizTree Treemap & Analizator dysku") {
+                Button("Mapa dysku") {
                     appState.activeTab.viewMode = .wiztree
                 }
                 .keyboardShortcut("4", modifiers: [.command])
 
                 Divider()
 
-                Button("Przełącz widok dwupanelowy (Dual-Pane)") {
+                Button("Przełącz widok dwupanelowy") {
                     appState.toggleDualPane()
                 }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
 
-                Button("Wbudowany dolny panel Terminala") {
+                Button("Pokaż/ukryj terminal") {
                     appState.showTerminalDrawer.toggle()
                 }
                 .keyboardShortcut("`", modifiers: [.control])
@@ -241,12 +241,12 @@ struct BetterFinderApp: App {
                 }
                 .keyboardShortcut(".", modifiers: [.command, .shift])
 
-                Button("Pokaż/ukryj Inspektora") {
+                Button("Pokaż/ukryj inspektor") {
                     appState.showInspector.toggle()
                 }
                 .keyboardShortcut("i", modifiers: [.command])
 
-                Button("Quick Look (Podgląd)") {
+                Button("Szybki podgląd (Quick Look)") {
                     appState.toggleQuickLook()
                 }
                 .keyboardShortcut("y", modifiers: [.command])

@@ -45,6 +45,7 @@ func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath
             try tests.testInvalidSearchClearsActionTargetsAndShowsDiagnostic()
             try await SearchIndexRegressionTests.runAll()
             print("Search/index regression suite passed")
+            try GUIPresentationRegressionTests().runAll()
             try AnalysisViewBindingRegressionTests().runAll()
             try await DiskAnalysisRegressionTests().runAll()
             print("Disk analysis/terminal regression suite passed")

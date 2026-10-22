@@ -406,6 +406,9 @@ enum WizTreeSelectionProjection {
 public struct WizTreeAnalyzerView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var pane: PaneTabState
+    public let paneSide: PaneSide
+    private let selectionBackgroundColor: Color
+    private let selectionForegroundColor: Color
     @ObservedObject private var iconCache = FileIconCache.shared
 
     @ViewState private var subMode: WizTreeSubMode = .treemap
@@ -425,9 +428,38 @@ public struct WizTreeAnalyzerView: View {
     @ViewState private var isValidatingDuplicates = false
     @ViewState private var hoveredBlock: TreemapPlacedBlock? = nil
 
-    public init(appState: AppState, pane: PaneTabState) {
+    public init(
+        appState: AppState,
+        pane: PaneTabState,
+        paneSide: PaneSide,
+        selectionBackgroundColor: Color,
+        selectionForegroundColor: Color
+    ) {
         self.appState = appState
         self.pane = pane
+        self.paneSide = paneSide
+        self.selectionBackgroundColor = selectionBackgroundColor
+        self.selectionForegroundColor = selectionForegroundColor
+    }
+
+    private func performPaneAction(_ action: () -> Void) {
+        FinderPaneActionRouting.perform(appState: appState, paneSide: paneSide, action: action)
+    }
+
+    private func selectAnalyzedItem(_ item: FileItem) {
+        performPaneAction {
+            pane.setAnalysisSelection([item], rootPath: pane.currentURL.path)
+        }
+    }
+
+    private func openAnalyzedNode(_ node: WizTreeNode) {
+        performPaneAction {
+            if node.isDirectory {
+                pane.navigate(to: node.url)
+            } else {
+                NSWorkspace.shared.open(node.url)
+            }
+        }
     }
 
     public var body: some View {
@@ -444,31 +476,56 @@ public struct WizTreeAnalyzerView: View {
             }
 
             if let diagnostic = scanDiagnostic {
-                Text(diagnostic).font(.system(size: 11)).foregroundStyle(.orange)
-                    .padding(.horizontal, 14).padding(.vertical, 5)
+                analysisNotice(diagnostic)
             }
             if let error = duplicateActionError {
-                Text(error).font(.system(size: 11)).foregroundStyle(.red)
-                    .padding(.horizontal, 14).padding(.vertical, 5)
+                analysisNotice(error, isError: true)
             }
             Text("Zakres: \(pane.showHiddenFiles ? "z ukrytymi plikami" : "bez ukrytych plików"), bez śledzenia dowiązań. Limit: 60 000 wpisów.")
-                .font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 14)
+                .font(FinderUI.captionFont)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, FinderUI.sectionSpacing)
+                .padding(.vertical, FinderUI.compactSpacing)
             // Main Content
             if isScanning {
-                VStack(spacing: 12) {
+                VStack(spacing: FinderUI.rowSpacing) {
                     ProgressView()
                         .controlSize(.regular)
-                    Text("Skanowanie i weryfikacja drzewa (\(pane.currentURL.lastPathComponent))...")
-                        .font(.system(size: 13, weight: .medium))
+                        .accessibilityLabel("Skanowanie folderu")
+                    Text(subMode == .duplicates ? "Skanowanie i weryfikacja plików…" : "Skanowanie folderu…")
+                        .font(FinderUI.titleFont)
+                    Text(pane.currentURL.path)
+                        .font(FinderUI.detailFont)
                         .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
                 }
+                .multilineTextAlignment(.center)
+                .padding(FinderUI.sheetPadding)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 switch subMode {
                 case .treemap:
-                    wizTreeSplitWorkspace
+                    if topBranches.isEmpty {
+                        analysisEmptyState(
+                            title: scanIsComplete ? "Brak elementów do analizy" : "Brak danych w sprawdzonym zakresie",
+                            message: "Sprawdź zakres skanowania lub wybierz inny folder.",
+                            systemImage: "chart.pie"
+                        )
+                    } else {
+                        wizTreeSplitWorkspace
+                    }
                 case .largestFiles:
-                    largestFilesTableView
+                    if largestFiles.isEmpty {
+                        analysisEmptyState(
+                            title: scanIsComplete ? "Brak plików do wyświetlenia" : "Brak plików w sprawdzonym zakresie",
+                            message: "Skan nie znalazł zwykłych plików. Dowiązania symboliczne nie są uwzględniane.",
+                            systemImage: "doc.text.magnifyingglass"
+                        )
+                    } else {
+                        largestFilesTableView
+                    }
                 case .duplicates:
                     duplicatesScannerView
                 }
@@ -476,6 +533,9 @@ public struct WizTreeAnalyzerView: View {
         }
         .onAppear {
             runActiveScan(for: pane.currentURL)
+        }
+        .onChange(of: subMode) { _, _ in
+            performPaneAction { runActiveScan(for: pane.currentURL) }
         }
         .onChange(of: pane.currentURL.path) { _, _ in runActiveScan(for: pane.currentURL) }
         .onChange(of: pane.showHiddenFiles) { _, _ in runActiveScan(for: pane.currentURL) }
@@ -490,58 +550,119 @@ public struct WizTreeAnalyzerView: View {
     // MARK: - Top Control Bar
 
     private var analyzerHeaderBar: some View {
-        HStack(spacing: 12) {
-            HStack(spacing: 6) {
-                Image(systemName: "square.grid.3x1.below.line.grid.1x2.fill")
-                    .font(.system(size: 14))
-                    .foregroundStyle(Color.accentColor)
-                Text("WizTree macOS")
-                    .font(.system(size: 13, weight: .bold))
-            }
-
-            Picker("", selection: $subMode) {
-                ForEach(WizTreeSubMode.allCases) { mode in
-                    Text(mode.rawValue).tag(mode)
+        VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: FinderUI.sectionSpacing) {
+                    analyzerTitle
+                    analysisModePicker
+                        .pickerStyle(.segmented)
+                        .frame(width: 420)
+                    Spacer(minLength: 0)
+                    refreshScanButton
+                }
+                VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+                    HStack {
+                        analyzerTitle
+                        Spacer()
+                        refreshScanButton
+                    }
+                    analysisModePicker
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            .pickerStyle(.segmented)
-            .frame(width: 420)
-            .onChange(of: subMode) { _, _ in
-                runActiveScan(for: pane.currentURL)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: FinderUI.rowSpacing) { analysisTelemetry }
+                VStack(alignment: .leading, spacing: FinderUI.compactSpacing) { analysisTelemetry }
             }
-
-            Spacer()
-
-            HStack(spacing: 8) {
-                Text("\(scanIsComplete ? "Łącznie" : "Co najmniej"): \(FormatHelpers.formatBytes(totalScannedBytes))")
-                    .font(.system(size: 11.5, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.primary)
-                Text("· \(totalScannedFiles.formatted()) plików")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                if scanDurationMs > 0 {
-                    Text("· ⚡ \(FormatHelpers.formatLatency(scanDurationMs))")
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(Color.accentColor)
-                }
-            }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 3.5)
-            .background(Color.primary.opacity(0.05), in: Capsule())
-
-            Button {
-                runActiveScan(for: pane.currentURL)
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 11.5, weight: .semibold))
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Odśwież skan WizTree")
+            .font(FinderUI.captionFont)
+            .monospacedDigit()
+            .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
+        .padding(.horizontal, FinderUI.sectionSpacing)
+        .padding(.vertical, FinderUI.rowSpacing)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var analyzerTitle: some View {
+        Label("Analiza miejsca", systemImage: "square.grid.3x1.below.line.grid.1x2.fill")
+            .font(FinderUI.titleFont)
+            .fixedSize()
+    }
+
+    private var analysisModePicker: some View {
+        Picker("Tryb analizy", selection: $subMode) {
+            ForEach(WizTreeSubMode.allCases) { mode in
+                Text(analysisModeTitle(mode)).tag(mode)
+            }
+        }
+        .labelsHidden()
+        .accessibilityLabel("Tryb analizy miejsca")
+        .help("Wybierz mapę miejsca, największe pliki lub duplikaty")
+    }
+
+    private func analysisModeTitle(_ mode: WizTreeSubMode) -> String {
+        switch mode {
+        case .treemap: return "Mapa i drzewo"
+        case .largestFiles: return "Największe pliki"
+        case .duplicates: return "Duplikaty"
+        }
+    }
+
+    @ViewBuilder
+    private var analysisTelemetry: some View {
+        Text("\(scanIsComplete ? "Łącznie" : "Co najmniej"): \(FormatHelpers.formatBytes(totalScannedBytes))")
+            .fontWeight(.semibold)
+            .foregroundStyle(.primary)
+            .fixedSize()
+        Text("Pliki: \(totalScannedFiles.formatted())")
+            .fixedSize()
+        if scanDurationMs > 0 {
+            Text("Czas: \(FormatHelpers.formatLatency(scanDurationMs))")
+                .fixedSize()
+        }
+    }
+
+    private var refreshScanButton: some View {
+        Button {
+            performPaneAction { runActiveScan(for: pane.currentURL) }
+        } label: {
+            Label("Odśwież skan", systemImage: "arrow.clockwise")
+                .labelStyle(.iconOnly)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .help("Odśwież analizę miejsca")
+        .accessibilityLabel("Odśwież analizę miejsca")
+    }
+
+    private func analysisNotice(_ message: String, isError: Bool = false) -> some View {
+        Label(message, systemImage: isError ? "exclamationmark.circle" : "exclamationmark.triangle")
+            .font(FinderUI.captionFont)
+            .foregroundStyle(isError ? Color.red : Color.orange)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, FinderUI.sectionSpacing)
+            .padding(.vertical, FinderUI.rowSpacing)
+            .accessibilityElement(children: .combine)
+    }
+
+    private func analysisEmptyState(title: String, message: String, systemImage: String) -> some View {
+        VStack(spacing: FinderUI.rowSpacing) {
+            Image(systemName: systemImage)
+                .font(.system(size: 36, weight: .light))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(title)
+                .font(FinderUI.titleFont)
+            Text(message)
+                .font(FinderUI.detailFont)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 360)
+            Button("Skanuj ponownie") { performPaneAction { runActiveScan(for: pane.currentURL) } }
+        }
+        .multilineTextAlignment(.center)
+        .padding(FinderUI.sheetPadding)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - Category Legend & Proportional Bar
@@ -573,13 +694,15 @@ public struct WizTreeAnalyzerView: View {
                                 .fill(cat.treemapColor)
                                 .frame(width: 8, height: 8)
                             Text(cat.rawValue)
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(FinderUI.captionFont.weight(.semibold))
                             Text("\(FormatHelpers.formatBytes(bytes)) (\(String(format: "%.1f%%", pct)))")
-                                .font(.system(size: 10.5, design: .monospaced))
+                                .font(FinderUI.captionFont)
+                                .monospacedDigit()
                                 .foregroundStyle(.secondary)
-                            Text("[\(count)]")
-                                .font(.system(size: 9.5, design: .monospaced))
-                                .foregroundStyle(.tertiary)
+                            Text("Pliki: \(count)")
+                                .font(FinderUI.captionFont)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -594,75 +717,13 @@ public struct WizTreeAnalyzerView: View {
 
     private var wizTreeSplitWorkspace: some View {
         VStack(spacing: 0) {
-            // Upper Ranked Folder/File Breakdown Table
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(topBranches.enumerated()), id: \.element.id) { idx, node in
-                        let pct = totalScannedBytes > 0 ? Double(node.size) / Double(totalScannedBytes) : 0
-                        let isSelected = pane.selectedPaths.contains(node.path)
-
-                        HStack(spacing: 10) {
-                            Image(nsImage: iconCache.icon(for: node.toFileItem(), preferThumbnail: false))
-                                .resizable()
-                                .frame(width: 18, height: 18)
-
-                            Text(node.name)
-                                .font(.system(size: 12, weight: node.isDirectory ? .semibold : .regular))
-                                .foregroundStyle(isSelected ? .white : .primary)
-                                .lineLimit(1)
-                                .frame(width: 210, alignment: .leading)
-
-                            // Visual Usage Bar (WizTree style)
-                            GeometryReader { geo in
-                                ZStack(alignment: .leading) {
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .fill(Color.primary.opacity(0.07))
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .fill(node.kindCategory.treemapColor.gradient)
-                                        .frame(width: max(3, geo.size.width * CGFloat(pct)))
-                                }
-                            }
-                            .frame(width: 150, height: 11)
-
-                            Text(String(format: "%5.1f%%", pct * 100.0))
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(isSelected ? .white.opacity(0.9) : .secondary)
-                                .frame(width: 56, alignment: .trailing)
-
-                            Text(FormatHelpers.formatBytes(node.size))
-                                .font(.system(size: 11.5, weight: .bold, design: .monospaced))
-                                .foregroundStyle(isSelected ? .white : .primary)
-                                .frame(width: 90, alignment: .trailing)
-
-                            Text("\(node.fileCount) plików")
-                                .font(.system(size: 10.5, design: .monospaced))
-                                .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
-                                .frame(width: 85, alignment: .trailing)
-
-                            Spacer()
+            // Optional detail columns collapse in narrow panes, like the file list.
+            GeometryReader { geometry in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(topBranches.enumerated()), id: \.element.id) { index, node in
+                            rankedBranchRow(node, index: index, availableWidth: geometry.size.width)
                         }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 4.5)
-                        .background(
-                            isSelected
-                            ? Color.accentColor
-                            : (idx.isMultiple(of: 2) ? Color.clear : Color.primary.opacity(0.025))
-                        )
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(
-                            TapGesture(count: 2).onEnded {
-                                if node.isDirectory {
-                                    pane.navigate(to: node.url)
-                                } else {
-                                    NSWorkspace.shared.open(node.url)
-                                }
-                            }
-                        )
-                        .simultaneousGesture(
-                            TapGesture(count: 1).onEnded {
-                                pane.setAnalysisSelection([node.toFileItem()], rootPath: pane.currentURL.path)
-                            }
-                        )
                     }
                 }
             }
@@ -682,6 +743,14 @@ public struct WizTreeAnalyzerView: View {
                     )
                     let generation = scanToken
                     ZStack(alignment: .topLeading) {
+                        if blocks.isEmpty {
+                            Text(topBranches.allSatisfy { $0.size == 0 } ? "Brak zajętego miejsca do przedstawienia na mapie." : "Powiększ panel, aby wyświetlić mapę miejsca.")
+                                .font(FinderUI.detailFont)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .padding(FinderUI.sectionSpacing)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
                         ForEach(blocks) { block in
                             treemapBlockView(block)
                         }
@@ -697,6 +766,77 @@ public struct WizTreeAnalyzerView: View {
         }
     }
 
+    private func rankedBranchRow(_ node: WizTreeNode, index: Int, availableWidth: CGFloat) -> some View {
+        let fraction = totalScannedBytes > 0 ? Double(node.size) / Double(totalScannedBytes) : 0
+        let isSelected = pane.selectedPaths.contains(node.path)
+
+        return HStack(spacing: FinderUI.rowSpacing) {
+            Image(nsImage: iconCache.icon(for: node.toFileItem(), preferThumbnail: false))
+                .resizable()
+                .frame(width: 18, height: 18)
+                .accessibilityHidden(true)
+            Text(node.name)
+                .font(FinderUI.detailFont.weight(node.isDirectory ? .semibold : .regular))
+                .foregroundStyle(isSelected ? selectionForegroundColor : Color.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if availableWidth >= 650 {
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.primary.opacity(0.07))
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(node.kindCategory.treemapColor.gradient)
+                            .frame(width: max(3, geometry.size.width * CGFloat(fraction)))
+                    }
+                }
+                .frame(width: 140, height: 11)
+                .accessibilityHidden(true)
+            }
+            if availableWidth >= 480 {
+                Text(String(format: "%5.1f%%", fraction * 100.0))
+                    .font(FinderUI.captionFont)
+                    .monospacedDigit()
+                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
+                    .frame(width: 56, alignment: .trailing)
+            }
+            Text(FormatHelpers.formatBytes(node.size))
+                .font(FinderUI.captionFont.weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(isSelected ? selectionForegroundColor : Color.primary)
+                .frame(width: 90, alignment: .trailing)
+            if availableWidth >= 760 {
+                Text("Pliki: \(node.fileCount)")
+                    .font(FinderUI.captionFont)
+                    .monospacedDigit()
+                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
+                    .frame(width: 85, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, FinderUI.sectionSpacing)
+        .padding(.vertical, 5)
+        .background(isSelected ? selectionBackgroundColor : (index.isMultiple(of: 2) ? Color.clear : Color.primary.opacity(0.025)))
+        .contentShape(Rectangle())
+        .help(node.path)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityAction {
+            selectAnalyzedItem(node.toFileItem())
+        }
+        .simultaneousGesture(
+            TapGesture(count: 2).onEnded {
+                openAnalyzedNode(node)
+            }
+        )
+        .simultaneousGesture(
+            TapGesture(count: 1).onEnded {
+                selectAnalyzedItem(node.toFileItem())
+            }
+        )
+    }
+
     private var treemapHudBar: some View {
         HStack(spacing: 8) {
             if let hov = hoveredBlock {
@@ -704,28 +844,30 @@ public struct WizTreeAnalyzerView: View {
                     .fill(hov.node.kindCategory.treemapColor)
                     .frame(width: 9, height: 9)
                 Text(hov.node.name)
-                    .font(.system(size: 11.5, weight: .bold))
+                    .font(FinderUI.detailFont.weight(.semibold))
                     .lineLimit(1)
                 if let parent = hov.parentFolderName {
                     Text("w \(parent)/")
-                        .font(.system(size: 11))
+                        .font(FinderUI.captionFont)
                         .foregroundStyle(.secondary)
                 }
                 Text("· \(FormatHelpers.formatBytes(hov.node.size))")
-                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                    .font(FinderUI.captionFont.weight(.semibold))
+                    .monospacedDigit()
                     .foregroundStyle(Color.accentColor)
                 if totalScannedBytes > 0 {
                     let pct = Double(hov.node.size) * 100.0 / Double(totalScannedBytes)
                     Text("(\(String(format: "%.1f%%", pct)))")
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(FinderUI.captionFont)
+                        .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
             } else {
                 Image(systemName: "hand.point.up.left.fill")
-                    .font(.system(size: 10.5))
+                    .font(FinderUI.captionFont)
                     .foregroundStyle(.secondary)
-                Text("Najedź na kafelek Treemap, kliknij aby zbadać w Inspektorze, kliknij dwukrotnie folder aby wejść głębiej")
-                    .font(.system(size: 11))
+                Text("Najedź na mapę, aby zobaczyć szczegóły. Kliknij element, aby otworzyć Inspektor, lub kliknij dwukrotnie folder, aby go otworzyć.")
+                    .font(FinderUI.captionFont)
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -769,8 +911,12 @@ public struct WizTreeAnalyzerView: View {
             .frame(width: block.rect.width, height: block.rect.height)
             .offset(x: block.rect.minX, y: block.rect.minY)
             .onTapGesture(count: 2) {
-                pane.navigate(to: block.node.url)
+                openAnalyzedNode(block.node)
             }
+            .help("\(block.node.path) · \(FormatHelpers.formatBytes(block.node.size))")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Folder \(block.node.name), \(FormatHelpers.formatBytes(block.node.size))")
+            .accessibilityAction(named: Text("Otwórz folder")) { openAnalyzedNode(block.node) }
         } else {
             // Individual File or Leaf Folder Tile
             ZStack(alignment: .topLeading) {
@@ -812,6 +958,13 @@ public struct WizTreeAnalyzerView: View {
             }
             .frame(width: block.rect.width, height: block.rect.height)
             .offset(x: block.rect.minX, y: block.rect.minY)
+            .help("\(block.node.path) · \(FormatHelpers.formatBytes(block.node.size))")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(block.node.name), \(FormatHelpers.formatBytes(block.node.size))")
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
+            .accessibilityAction {
+                selectAnalyzedItem(block.node.toFileItem())
+            }
             .onHover { hovering in
                 if hovering {
                     hoveredBlock = block
@@ -821,46 +974,44 @@ public struct WizTreeAnalyzerView: View {
             }
             .simultaneousGesture(
                 TapGesture(count: 2).onEnded {
-                    if block.node.isDirectory {
-                        pane.navigate(to: block.node.url)
-                    } else {
-                        NSWorkspace.shared.open(block.node.url)
-                    }
+                    openAnalyzedNode(block.node)
                 }
             )
             .simultaneousGesture(
                 TapGesture(count: 1).onEnded {
-                    pane.setAnalysisSelection([block.node.toFileItem()], rootPath: pane.currentURL.path)
+                    selectAnalyzedItem(block.node.toFileItem())
                 }
             )
             .contextMenu {
                 if block.node.isDirectory {
                     Button {
-                        pane.navigate(to: block.node.url)
+                        openAnalyzedNode(block.node)
                     } label: {
-                        Label("Wejdź do tego folderu w WizTree", systemImage: "arrow.down.right.and.arrow.up.left")
+                        Label("Otwórz folder w analizie", systemImage: "arrow.down.right.and.arrow.up.left")
                     }
                 }
                 Button {
-                    pane.viewMode = .list
-                    pane.navigate(to: block.node.isDirectory ? block.node.url : block.node.url.deletingLastPathComponent())
-                    pane.selectedPaths = [block.node.path]
+                    performPaneAction {
+                        pane.viewMode = .list
+                        pane.navigate(to: block.node.isDirectory ? block.node.url : block.node.url.deletingLastPathComponent())
+                        pane.selectedPaths = [block.node.path]
+                    }
                 } label: {
                     Label("Pokaż na liście plików", systemImage: "list.bullet")
                 }
                 Button {
-                    QuickLookCoordinator.shared.preview(urls: [block.node.url])
+                    performPaneAction { QuickLookCoordinator.shared.preview(urls: [block.node.url]) }
                 } label: {
                     Label("Quick Look (Spacja)", systemImage: "eye")
                 }
                 Button {
-                    FileOperationsManager.shared.openInTerminal(at: block.node.url)
+                    performPaneAction { FileOperationsManager.shared.openInTerminal(at: block.node.url) }
                 } label: {
                     Label("Otwórz w Terminalu", systemImage: "terminal")
                 }
                 Divider()
                 Button(role: .destructive) {
-                    trashAnalyzedItem(block.node.toFileItem())
+                    performPaneAction { trashAnalyzedItem(block.node.toFileItem()) }
                 } label: {
                     Label("Przenieś do Kosza", systemImage: "trash")
                 }
@@ -871,55 +1022,80 @@ public struct WizTreeAnalyzerView: View {
     // MARK: - Largest Files Table View
 
     private var largestFilesTableView: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(Array(largestFiles.enumerated()), id: \.element.id) { idx, item in
-                    let pct = totalScannedBytes > 0 ? Double(item.size) / Double(totalScannedBytes) : 0
-                    HStack(spacing: 10) {
-                        Text("#\(idx + 1)")
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 36, alignment: .trailing)
-
-                        Image(nsImage: FileIconCache.shared.icon(for: item))
-                            .resizable()
-                            .frame(width: 20, height: 20)
-
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(item.name)
-                                .font(.system(size: 12.5, weight: .semibold))
-                            Text(item.parentPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                        Text(String(format: "%.1f%%", pct * 100.0))
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(.secondary)
-
-                        Text(FormatHelpers.formatBytes(item.size))
-                            .font(.system(size: 12, weight: .bold, design: .monospaced))
-                            .frame(width: 95, alignment: .trailing)
-
-                        Button(role: .destructive) {
-                            trashAnalyzedItem(item)
-                        } label: {
-                            Image(systemName: "trash")
-                                .foregroundStyle(.red)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Przenieś do Kosza")
+        GeometryReader { geometry in
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(largestFiles.enumerated()), id: \.element.id) { index, item in
+                        largestFileRow(item, index: index, availableWidth: geometry.size.width)
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    .background(pane.selectedPaths.contains(item.path) ? Color.accentColor.opacity(0.18) : (idx.isMultiple(of: 2) ? Color.clear : Color.primary.opacity(0.025)))
-                    .contentShape(Rectangle())
-                    .onTapGesture { pane.setAnalysisSelection([item], rootPath: pane.currentURL.path) }
                 }
             }
         }
+    }
+
+    private func largestFileRow(_ item: FileItem, index: Int, availableWidth: CGFloat) -> some View {
+        let percent = totalScannedBytes > 0 ? Double(item.size) * 100.0 / Double(totalScannedBytes) : 0
+        let isSelected = pane.selectedPaths.contains(item.path)
+
+        return HStack(spacing: FinderUI.rowSpacing) {
+            if availableWidth >= 540 {
+                Text("#\(index + 1)")
+                    .font(FinderUI.captionFont.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
+                    .frame(width: 36, alignment: .trailing)
+            }
+            Image(nsImage: iconCache.icon(for: item))
+                .resizable()
+                .frame(width: 20, height: 20)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                Text(item.name)
+                    .font(FinderUI.bodyFont.weight(.medium))
+                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(item.parentPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                    .font(FinderUI.captionFont)
+                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if availableWidth >= 680 {
+                Text(String(format: "%.1f%%", percent))
+                    .font(FinderUI.captionFont)
+                    .monospacedDigit()
+                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
+            }
+            Text(FormatHelpers.formatBytes(item.size))
+                .font(FinderUI.detailFont.weight(.semibold))
+                .foregroundStyle(isSelected ? selectionForegroundColor : Color.primary)
+                .monospacedDigit()
+                .frame(width: 85, alignment: .trailing)
+            Button(role: .destructive) {
+                performPaneAction { trashAnalyzedItem(item) }
+            } label: {
+                Image(systemName: "trash")
+                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.red)
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.borderless)
+            .help("Przenieś do Kosza: \(item.name)")
+            .accessibilityLabel("Przenieś do Kosza: \(item.name)")
+        }
+        .padding(.horizontal, FinderUI.sectionSpacing)
+        .padding(.vertical, 6)
+        .background(isSelected ? selectionBackgroundColor : (index.isMultiple(of: 2) ? Color.clear : Color.primary.opacity(0.025)))
+        .contentShape(Rectangle())
+        .help(item.path)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(item.name)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityAction(named: Text("Zaznacz")) {
+            selectAnalyzedItem(item)
+        }
+        .onTapGesture { selectAnalyzedItem(item) }
     }
 
     // MARK: - Duplicate Files View (SHA-256)
@@ -927,82 +1103,112 @@ public struct WizTreeAnalyzerView: View {
     private var duplicatesScannerView: some View {
         VStack(spacing: 0) {
             if duplicateGroups.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: scanIsComplete ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                        .font(.system(size: 32))
-                        .foregroundStyle(scanIsComplete ? Color.green : Color.orange)
-                    Text(scanIsComplete ? "Nie znaleziono duplikatów w przeskanowanym zakresie" : "Nie znaleziono duplikatów w częściowo sprawdzonym zakresie")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text("SHA-256 pełnej treści, także plików pustych i dużych. Dowiązania symboliczne nie są śledzone. Ukryte pliki zależą od ustawienia widoku.")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                analysisEmptyState(
+                    title: scanIsComplete ? "Nie znaleziono duplikatów w przeskanowanym zakresie" : "Nie znaleziono duplikatów w częściowo sprawdzonym zakresie",
+                    message: "Porównano pełną treść plików metodą SHA-256, także pliki puste i duże. Dowiązania symboliczne nie są śledzone. Ukryte pliki zależą od ustawienia widoku.",
+                    systemImage: scanIsComplete ? "checkmark.seal" : "exclamationmark.triangle"
+                )
             } else {
-                let totalWasted = duplicateGroups.reduce(Int64(0)) { $0 + $1.wastedBytes }
-                HStack {
-                    Text("Znaleziono \(duplicateGroups.count) grup duplikatów · Logiczny rozmiar nadmiarowych kopii: \(FormatHelpers.formatBytes(totalWasted))")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.orange)
-                    Spacer()
-                    Button("Usuń nadmiarowe kopie do Kosza (zachowaj po 1 oryginale)") {
-                        trashDuplicates(duplicateGroups)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(isValidatingDuplicates)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(Color.orange.opacity(0.08))
-
-                Text("To suma rozmiarów logicznych, nie gwarantowane odzyskane miejsce. Dowiązania twarde, klony APFS i kompresja mogą współdzielić dane.")
-                    .font(.system(size: 10.5)).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 4)
+                duplicateSummary
                 Divider()
-
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
+                    LazyVStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
                         ForEach(duplicateGroups) { group in
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack {
-                                    Text("\(group.files.count)× kopie · \(FormatHelpers.formatBytes(group.fileSize)) każdy")
-                                        .font(.system(size: 12, weight: .bold))
-                                    Text("SHA-256: \(group.sha256.prefix(16))...")
-                                        .font(.system(size: 10.5, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                    Text("Nadmiarowe dane logiczne: \(FormatHelpers.formatBytes(group.wastedBytes))")
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .foregroundStyle(.orange)
-                                }
-                                ForEach(group.files) { file in
-                                    HStack {
-                                        Image(systemName: "doc.on.doc")
-                                            .font(.system(size: 11))
-                                            .foregroundStyle(.secondary)
-                                        Text(file.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                                            .font(.system(size: 11.5, design: .monospaced))
-                                        Spacer()
-                                        Button(file.path == group.files.first?.path ? "Zachowywany oryginał" : "Kosz", role: .destructive) {
-                                            trashDuplicates([group], onlyPath: file.path)
-                                        }
-                                        .disabled(file.path == group.files.first?.path || isValidatingDuplicates)
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.mini)
-                                    }
-                                    .background(pane.selectedPaths.contains(file.path) ? Color.accentColor.opacity(0.18) : Color.clear)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture { pane.setAnalysisSelection([file], rootPath: pane.currentURL.path) }
-                                }
-                            }
-                            .padding(10)
-                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+                            duplicateGroupCard(group)
                         }
                     }
-                    .padding(12)
+                    .padding(FinderUI.sectionSpacing)
                 }
             }
         }
+    }
+
+    private var duplicateSummary: some View {
+        let totalWasted = duplicateGroups.reduce(Int64(0)) { $0 + $1.wastedBytes }
+        return VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+            Text("Grupy duplikatów: \(duplicateGroups.count) · Nadmiarowe dane logiczne: \(FormatHelpers.formatBytes(totalWasted))")
+                .font(FinderUI.detailFont.weight(.semibold))
+            Button("Przenieś nadmiarowe kopie do Kosza", role: .destructive) {
+                performPaneAction { trashDuplicates(duplicateGroups) }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(isValidatingDuplicates)
+            .help("Zachowaj pierwszy plik z każdej grupy i zweryfikuj pozostałe przed przeniesieniem do Kosza")
+
+            if isValidatingDuplicates {
+                HStack(spacing: FinderUI.rowSpacing) {
+                    ProgressView().controlSize(.small)
+                    Text("Weryfikowanie plików przed przeniesieniem…")
+                        .font(FinderUI.captionFont)
+                }
+                .accessibilityElement(children: .combine)
+            }
+            Text("W każdej grupie zostanie zachowany wskazany oryginał. Rozmiar logiczny nie oznacza gwarantowanego odzyskanego miejsca: dowiązania twarde, klony APFS i kompresja mogą współdzielić dane.")
+                .font(FinderUI.captionFont)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, FinderUI.sectionSpacing)
+        .padding(.vertical, FinderUI.rowSpacing)
+        .background(Color.orange.opacity(0.06))
+    }
+
+    private func duplicateGroupCard(_ group: DuplicateFileGroup) -> some View {
+        VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+            Text("Kopie: \(group.files.count) · \(FormatHelpers.formatBytes(group.fileSize)) na plik")
+                .font(FinderUI.detailFont.weight(.semibold))
+            Text("Nadmiarowe dane logiczne: \(FormatHelpers.formatBytes(group.wastedBytes))")
+                .font(FinderUI.captionFont)
+                .foregroundStyle(.secondary)
+            Text("SHA-256: \(group.sha256.prefix(16))…")
+                .font(FinderUI.captionFont.monospaced())
+                .foregroundStyle(.secondary)
+                .help(group.sha256)
+            Divider()
+            ForEach(group.files) { file in
+                duplicateFileRow(file, in: group)
+            }
+        }
+        .padding(FinderUI.rowSpacing)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
+    }
+
+    private func duplicateFileRow(_ file: FileItem, in group: DuplicateFileGroup) -> some View {
+        let isKeeper = file.path == group.files.first?.path
+        let isSelected = pane.selectedPaths.contains(file.path)
+        return VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+            Text(file.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                .font(FinderUI.detailFont)
+                .foregroundStyle(isSelected ? selectionForegroundColor : Color.primary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if isKeeper {
+                Label("Zachowywany oryginał", systemImage: "checkmark.shield")
+                    .font(FinderUI.captionFont)
+                    .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
+            } else {
+                Button("Przenieś do Kosza", role: .destructive) {
+                    performPaneAction { trashDuplicates([group], onlyPath: file.path) }
+                }
+                .disabled(isValidatingDuplicates)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityLabel("Przenieś do Kosza: \(file.name)")
+            }
+        }
+        .padding(FinderUI.compactSpacing)
+        .background(isSelected ? selectionBackgroundColor : Color.clear, in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
+        .contentShape(Rectangle())
+        .help(file.path)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(file.name)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityAction(named: Text("Zaznacz")) {
+            selectAnalyzedItem(file)
+        }
+        .onTapGesture { selectAnalyzedItem(file) }
     }
 
     // MARK: - Generation-bound, bounded scans

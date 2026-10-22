@@ -15,6 +15,7 @@ public struct InspectorPreviewView: View {
     @ViewState private var sha256Hash: String? = nil
     @ViewState private var md5Hash: String? = nil
     @ViewState private var isComputingHash: Bool = false
+    @ViewState private var hashErrorMessage: String? = nil
     @ViewState private var hashRequestID = UUID()
 
     public init(appState: AppState, activeTab: PaneTabState) {
@@ -27,27 +28,20 @@ public struct InspectorPreviewView: View {
             // Header
             HStack {
                 Image(systemName: "info.circle.fill")
-                    .font(.system(size: 12))
+                    .font(FinderUI.bodyFont)
                     .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
                 Text("Inspektor")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(FinderUI.titleFont)
                 Spacer()
                 if activeTab.primarySelectedItem != nil {
                     Button {
                         appState.toggleQuickLook()
                     } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "eye")
-                                .font(.system(size: 10))
-                            Text("Quick Look")
-                                .font(.system(size: 10.5, weight: .medium))
-                        }
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 2.5)
-                        .background(Color.accentColor.opacity(0.15), in: Capsule())
-                        .foregroundStyle(Color.accentColor)
+                        Label("Quick Look", systemImage: "eye")
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                     .help("Otwórz natywny Quick Look (Spacja)")
                 }
             }
@@ -58,27 +52,32 @@ public struct InspectorPreviewView: View {
             Divider()
 
             if activeTab.selectedItems.count > 1 {
-                selectionSummary
+                ScrollView {
+                    selectionSummary
+                }
             } else if let item = activeTab.primarySelectedItem {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 13) {
+                    VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
                         // Top Identity Card
                         HStack(spacing: 12) {
                             Image(nsImage: FileIconCache.shared.icon(for: item))
                                 .resizable()
                                 .interpolation(.high)
                                 .frame(width: 48, height: 48)
+                                .accessibilityHidden(true)
 
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(item.name)
-                                    .font(.system(size: 13.5, weight: .bold))
+                                    .font(FinderUI.titleFont)
                                     .lineLimit(2)
+                                    .textSelection(.enabled)
+                                    .help(item.name)
                                 Text(item.kindDisplayString)
-                                    .font(.system(size: 11.5))
+                                    .font(FinderUI.detailFont)
                                     .foregroundStyle(.secondary)
                                 if let git = item.gitStatus {
                                     Text("Git: \(git.badgeDescription)")
-                                        .font(.system(size: 10.5, weight: .semibold))
+                                        .font(FinderUI.detailFont.weight(.semibold))
                                         .foregroundStyle(.orange)
                                 }
                             }
@@ -87,10 +86,23 @@ public struct InspectorPreviewView: View {
 
                         // Interactive macOS Color Tags Picker
                         VStack(alignment: .leading, spacing: 5) {
-                            Text("Tagi macOS")
-                                .font(.system(size: 10.5, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                            HStack(spacing: 8) {
+                            HStack(spacing: FinderUI.rowSpacing) {
+                                Text("Tagi macOS")
+                                    .font(FinderUI.detailFont.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityAddTraits(.isHeader)
+                                Spacer()
+                                if !item.tags.isEmpty {
+                                    Button("Wyczyść") {
+                                        fileOps.clearTags(for: [item])
+                                        activeTab.reloadDirectory()
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .controlSize(.small)
+                                    .help("Usuń wszystkie tagi z tego elementu")
+                                }
+                            }
+                            HStack(spacing: FinderUI.compactSpacing) {
                                 ForEach(FinderTagColor.allCases) { tagColor in
                                     let isTagged = item.tags.contains(tagColor)
                                     Button {
@@ -104,25 +116,28 @@ public struct InspectorPreviewView: View {
                                                 Circle()
                                                     .stroke(isTagged ? Color.primary : Color.clear, lineWidth: 2)
                                             )
-                                            .scaleEffect(isTagged ? 1.15 : 1.0)
+                                            .overlay {
+                                                if isTagged {
+                                                    Image(systemName: "checkmark")
+                                                        .font(.system(size: 9, weight: .bold))
+                                                        .foregroundStyle(.white)
+                                                        .shadow(color: .black.opacity(0.8), radius: 1)
+                                                }
+                                            }
+                                            .frame(width: 24, height: 24)
+                                            .contentShape(Rectangle())
                                     }
                                     .buttonStyle(.plain)
-                                    .help(tagColor.displayName)
+                                    .help("\(isTagged ? "Usuń" : "Dodaj") tag: \(tagColor.displayName)")
+                                    .accessibilityLabel("Tag: \(tagColor.displayName)")
+                                    .accessibilityValue(isTagged ? "Dodany" : "Niedodany")
+                                    .accessibilityAddTraits(isTagged ? .isSelected : [])
                                 }
                                 Spacer()
-                                if !item.tags.isEmpty {
-                                    Button("Wyczyść") {
-                                        fileOps.clearTags(for: [item])
-                                        activeTab.reloadDirectory()
-                                    }
-                                    .font(.system(size: 10))
-                                    .buttonStyle(.plain)
-                                    .foregroundStyle(.secondary)
-                                }
                             }
                         }
                         .padding(8)
-                        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 7))
+                        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
 
                         // Live Visual Preview (Image or Code/Text)
                         livePreviewBox(for: item)
@@ -132,34 +147,39 @@ public struct InspectorPreviewView: View {
                         // Metadata + Interactive chmod Permissions
                         VStack(alignment: .leading, spacing: 7) {
                             Text("Szczegóły i uprawnienia")
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(FinderUI.detailFont.weight(.semibold))
                                 .foregroundStyle(.secondary)
 
                             metadataRow(
                                 label: "Rozmiar",
                                 value: item.isDirectory
-                                    ? (folderSizes.displaySize(for: item.path) ?? "Obliczanie...")
+                                    ? (folderSizes.displaySize(for: item.path) ?? "Obliczanie…")
                                     : FormatHelpers.formatBytes(item.size)
                             )
                             metadataRow(label: "Zmodyfikowano", value: FormatHelpers.formatDate(item.modificationDate))
 
-                            // Interactive POSIX chmod row
-                            HStack {
-                                Text("Uprawnienia")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                                Text(posixPermissionsString)
-                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                Button {
-                                    showChmodEditor.toggle()
-                                } label: {
-                                    Image(systemName: "slider.horizontal.3")
-                                        .font(.system(size: 10.5))
-                                        .foregroundStyle(Color.accentColor)
+                            // The editable value has its own line so the narrow inspector stays readable.
+                            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                                HStack {
+                                    Text("Uprawnienia")
+                                        .font(FinderUI.detailFont)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Button {
+                                        showChmodEditor.toggle()
+                                    } label: {
+                                        Image(systemName: "slider.horizontal.3")
+                                            .font(FinderUI.detailFont)
+                                            .frame(width: 24, height: 24)
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .help("Edytuj uprawnienia POSIX (chmod)")
+                                    .accessibilityLabel("Edytuj uprawnienia POSIX")
+                                    .accessibilityValue(showChmodEditor ? "Rozwinięte" : "Zwinięte")
                                 }
-                                .buttonStyle(.plain)
-                                .help("Edytuj uprawnienia POSIX (chmod)")
+                                Text(posixPermissionsString)
+                                    .font(FinderUI.detailFont.monospaced())
+                                    .textSelection(.enabled)
                             }
 
                             if showChmodEditor {
@@ -168,15 +188,15 @@ public struct InspectorPreviewView: View {
 
                             VStack(alignment: .leading, spacing: 3) {
                                 Text("Pełna ścieżka:")
-                                    .font(.system(size: 10.5))
+                                    .font(FinderUI.detailFont)
                                     .foregroundStyle(.secondary)
                                 Text(item.path)
-                                    .font(.system(size: 10.5, design: .monospaced))
+                                    .font(FinderUI.detailFont.monospaced())
                                     .foregroundStyle(.primary)
                                     .textSelection(.enabled)
                                     .padding(6)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+                                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
                             }
                         }
 
@@ -191,7 +211,7 @@ public struct InspectorPreviewView: View {
                         // Quick Actions Grid
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Szybkie akcje")
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(FinderUI.detailFont.weight(.semibold))
                                 .foregroundStyle(.secondary)
 
                             if item.isExtractableArchive {
@@ -238,6 +258,7 @@ public struct InspectorPreviewView: View {
                     isComputingHash = false
                     sha256Hash = nil
                     md5Hash = nil
+                    hashErrorMessage = nil
                     loadPreviewAndMetadata(for: item)
                 }
                 .onChange(of: activeTab.directoryRevision) { _, _ in
@@ -245,6 +266,7 @@ public struct InspectorPreviewView: View {
                     isComputingHash = false
                     sha256Hash = nil
                     md5Hash = nil
+                    hashErrorMessage = nil
                     loadPreviewAndMetadata(for: item)
                 }
                 .onChange(of: folderSizes.result(for: item.path)) { _, result in
@@ -257,44 +279,52 @@ public struct InspectorPreviewView: View {
                     isComputingHash = false
                     sha256Hash = nil
                     md5Hash = nil
+                    hashErrorMessage = nil
                 }
             } else {
                 // Current Folder Summary when no file is selected
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 10) {
-                        Image(nsImage: NSWorkspace.shared.icon(for: .folder))
-                            .resizable()
-                            .frame(width: 42, height: 42)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(activeTab.currentURL.lastPathComponent.isEmpty ? "Macintosh HD" : activeTab.currentURL.lastPathComponent)
-                                .font(.system(size: 13.5, weight: .bold))
-                            Text("\(activeTab.displayedItems.count) elementów w widoku")
-                                .font(.system(size: 11.5))
-                                .foregroundStyle(.secondary)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 10) {
+                            Image(nsImage: NSWorkspace.shared.icon(for: .folder))
+                                .resizable()
+                                .frame(width: 42, height: 42)
+                                .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(activeTab.currentURL.lastPathComponent.isEmpty ? "Macintosh HD" : activeTab.currentURL.lastPathComponent)
+                                    .font(FinderUI.titleFont)
+                                Text("\(activeTab.displayedItems.count) elementów w widoku")
+                                    .font(FinderUI.detailFont)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        Text("Zaznacz plik lub folder, aby zobaczyć podgląd i szczegóły.")
+                            .font(FinderUI.detailFont)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Divider()
+
+                        Text("Skróty klawiaturowe")
+                            .font(FinderUI.detailFont.weight(.semibold))
+                            .foregroundStyle(.secondary)
+
+                        VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+                            shortcutHintRow(keys: "Cmd + F", desc: "Szukaj fsearch na pasku")
+                            shortcutHintRow(keys: "Cmd + P", desc: "Okno Spotlight fsearch")
+                            shortcutHintRow(keys: "Spacja", desc: "Natywny podgląd Quick Look")
+                            shortcutHintRow(keys: "Cmd + Z", desc: "Cofnij operację plikową")
+                            shortcutHintRow(keys: "Cmd + X / V", desc: "Wytnij i przenieś pliki")
+                            shortcutHintRow(keys: "Ctrl + `", desc: "Wbudowany dolny panel Terminala")
+                            shortcutHintRow(keys: "Cmd + ,", desc: "Ustawienia indeksu fsearch")
+                            shortcutHintRow(keys: "Cmd + Shift + D", desc: "Widok dwupanelowy (Dual Pane)")
+                            shortcutHintRow(keys: "Cmd + L", desc: "Edytuj pasek adresu ręcznie")
                         }
                     }
-
-                    Divider()
-
-                    Text("Wskazówki skrótów:")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-
-                    VStack(alignment: .leading, spacing: 5) {
-                        shortcutHintRow(keys: "Cmd + F", desc: "Szukaj fsearch na pasku")
-                        shortcutHintRow(keys: "Cmd + P", desc: "Okno Spotlight fsearch")
-                        shortcutHintRow(keys: "Spacja", desc: "Natywny podgląd Quick Look")
-                        shortcutHintRow(keys: "Cmd + Z", desc: "Cofnij operację plikową")
-                        shortcutHintRow(keys: "Cmd + X / V", desc: "Wytnij i przenieś pliki")
-                        shortcutHintRow(keys: "Ctrl + `", desc: "Wbudowany dolny panel Terminala")
-                        shortcutHintRow(keys: "Cmd + ,", desc: "Ustawienia indeksu fsearch")
-                        shortcutHintRow(keys: "Cmd + Shift + D", desc: "Widok dwupanelowy (Dual Pane)")
-                        shortcutHintRow(keys: "Cmd + L", desc: "Edytuj pasek adresu ręcznie")
-                    }
-
-                    Spacer()
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(14)
             }
         }
         .background(VisualEffectBackground(material: .sidebar, blendingMode: .withinWindow))
@@ -305,28 +335,29 @@ public struct InspectorPreviewView: View {
         let folders = items.filter(\.isDirectory)
         let knownBytes = items.reduce(Int64(0)) { $0 + ($1.isDirectory ? (folderSizes.result(for: $1.path)?.bytes ?? 0) : $1.size) }
         let hasUnknownSize = folders.contains { folderSizes.size(for: $0.path) == nil }
-        return VStack(alignment: .leading, spacing: 18) {
+        return VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
             Image(systemName: "doc.on.doc")
                 .font(.system(size: 40, weight: .light))
                 .foregroundStyle(Color.accentColor)
                 .padding(.top, 8)
+                .accessibilityHidden(true)
             Text("\(items.count) zaznaczonych elementów")
-                .font(.system(size: 17, weight: .semibold))
+                .font(FinderUI.titleFont)
             VStack(spacing: 10) {
                 metadataRow(label: "Pliki", value: "\(items.count - folders.count)")
                 metadataRow(label: "Foldery", value: "\(folders.count)")
                 metadataRow(label: "Rozmiar", value: "\(hasUnknownSize ? "≥ " : "")\(FormatHelpers.formatBytes(knownBytes))")
             }
-            .font(.system(size: 12))
+            .font(FinderUI.detailFont)
             Divider()
             Button("Podgląd zaznaczenia", systemImage: "eye") { appState.toggleQuickLook() }
             Button("Udostępnij…", systemImage: "square.and.arrow.up") { fileOps.showShareSheet(for: items) }
             Button("Kopiuj ścieżki", systemImage: "link") { fileOps.copyPaths(items) }
-            Spacer()
         }
         .buttonStyle(.bordered)
-        .padding(18)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .controlSize(.small)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .task(id: items.map(\.path)) {
             for folder in folders { folderSizes.requestSizeIfNeeded(for: folder.path) }
         }
@@ -340,59 +371,68 @@ public struct InspectorPreviewView: View {
     // MARK: - Interactive chmod Box
 
     private func chmodEditorBox(for item: FileItem) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Text("Szybki chmod:")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Button("644 (rw-r--r--)") { applyChmod(0o644, for: item) }
-                    .buttonStyle(.bordered).controlSize(.mini)
-                Button("755 (+x exec)") { applyChmod(0o755, for: item) }
-                    .buttonStyle(.bordered).controlSize(.mini)
-                Button("700 (rwx------)") { applyChmod(0o700, for: item) }
-                    .buttonStyle(.bordered).controlSize(.mini)
+        VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+            Text("Gotowe uprawnienia")
+                .font(FinderUI.detailFont.weight(.semibold))
+                .foregroundStyle(.secondary)
+            HStack(spacing: FinderUI.compactSpacing) {
+                Button("644") { applyChmod(0o644, for: item) }
+                    .help("rw-r--r--: zapis właściciela, odczyt dla wszystkich")
+                Button("755") { applyChmod(0o755, for: item) }
+                    .help("rwxr-xr-x: zapis właściciela, odczyt i wykonanie dla wszystkich")
+                Button("700") { applyChmod(0o700, for: item) }
+                    .help("rwx------: dostęp tylko dla właściciela")
             }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
 
-            HStack(spacing: 12) {
-                chmodBitGroup(label: "Owner", rBit: 0o400, wBit: 0o200, xBit: 0o100, item: item)
-                chmodBitGroup(label: "Group", rBit: 0o040, wBit: 0o020, xBit: 0o010, item: item)
-                chmodBitGroup(label: "Other", rBit: 0o004, wBit: 0o002, xBit: 0o001, item: item)
+            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                chmodBitGroup(label: "Właściciel", rBit: 0o400, wBit: 0o200, xBit: 0o100, item: item)
+                chmodBitGroup(label: "Grupa", rBit: 0o040, wBit: 0o020, xBit: 0o010, item: item)
+                chmodBitGroup(label: "Pozostali", rBit: 0o004, wBit: 0o002, xBit: 0o001, item: item)
             }
         }
-        .padding(8)
-        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+        .padding(FinderUI.rowSpacing)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
         .disabled(fileOps.isBusy)
     }
 
     private func chmodBitGroup(label: String, rBit: UInt16, wBit: UInt16, xBit: UInt16, item: FileItem) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        HStack(spacing: FinderUI.rowSpacing) {
             Text(label)
-                .font(.system(size: 9.5, weight: .bold))
+                .font(FinderUI.detailFont)
                 .foregroundStyle(.secondary)
-            HStack(spacing: 3) {
-                chmodBitButton("r", bit: rBit, item: item)
-                chmodBitButton("w", bit: wBit, item: item)
-                chmodBitButton("x", bit: xBit, item: item)
-            }
+            Spacer(minLength: FinderUI.compactSpacing)
+            chmodBitButton("r", permission: "Odczyt", group: label, bit: rBit, item: item)
+            chmodBitButton("w", permission: "Zapis", group: label, bit: wBit, item: item)
+            chmodBitButton("x", permission: "Wykonanie", group: label, bit: xBit, item: item)
         }
     }
 
-    private func chmodBitButton(_ title: String, bit: UInt16, item: FileItem) -> some View {
+    private func chmodBitButton(_ title: String, permission: String, group: String, bit: UInt16, item: FileItem) -> some View {
         let isSet = (currentModeBits & bit) != 0
         return Button {
             let newMode = isSet ? (currentModeBits & ~bit) : (currentModeBits | bit)
             applyChmod(newMode, for: item)
         } label: {
             Text(title)
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .frame(width: 18, height: 18)
-                .foregroundStyle(isSet ? Color.white : Color.secondary)
+                .font(FinderUI.detailFont.monospaced().weight(.semibold))
+                .frame(width: 26, height: 26)
+                .foregroundStyle(isSet ? Color.primary : Color.secondary)
                 .background(
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(isSet ? Color.accentColor : Color.primary.opacity(0.08))
+                    RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
+                        .fill(isSet ? Color.accentColor.opacity(0.2) : Color.primary.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
+                        .strokeBorder(isSet ? Color.accentColor : Color.clear, lineWidth: 1)
                 )
         }
         .buttonStyle(.plain)
+        .help("\(group): \(permission.lowercased())")
+        .accessibilityLabel("\(group): \(permission.lowercased())")
+        .accessibilityValue(isSet ? "Włączone" : "Wyłączone")
+        .accessibilityAddTraits(isSet ? .isSelected : [])
     }
 
     private func applyChmod(_ mode: UInt16, for item: FileItem) {
@@ -407,14 +447,15 @@ public struct InspectorPreviewView: View {
 
     private func checksumsSection(for item: FileItem) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Sumy kontrolne (SHA-256 / MD5)")
-                    .font(.system(size: 11, weight: .semibold))
+            VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+                Text("Sumy kontrolne")
+                    .font(FinderUI.detailFont.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Spacer()
+                    .accessibilityAddTraits(.isHeader)
                 if sha256Hash == nil {
                     Button {
                         isComputingHash = true
+                        hashErrorMessage = nil
                         let requestID = UUID()
                         hashRequestID = requestID
                         let url = item.url
@@ -425,6 +466,7 @@ public struct InspectorPreviewView: View {
                                       self.activeTab.primarySelectedItem?.path == url.path else { return }
                                 self.sha256Hash = hashes?.sha256
                                 self.md5Hash = hashes?.md5
+                                self.hashErrorMessage = hashes == nil ? "Nie udało się odczytać pliku. Spróbuj ponownie." : nil
                                 self.isComputingHash = false
                             }
                         }
@@ -435,14 +477,23 @@ public struct InspectorPreviewView: View {
                             } else {
                                 Image(systemName: "number.square")
                             }
-                            Text("Oblicz hash")
-                                .font(.system(size: 10.5, weight: .medium))
+                            Text(isComputingHash ? "Obliczanie…" : (hashErrorMessage == nil ? "Oblicz SHA-256 i MD5" : "Spróbuj ponownie"))
+                                .font(FinderUI.detailFont)
                         }
                     }
                     .buttonStyle(.bordered)
-                    .controlSize(.mini)
+                    .controlSize(.small)
                     .disabled(isComputingHash)
+                    .accessibilityLabel(isComputingHash ? "Obliczanie sum kontrolnych" : "Oblicz sumy kontrolne SHA-256 i MD5")
                 }
+            }
+
+            if let message = hashErrorMessage {
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .font(FinderUI.detailFont)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
 
             if let sha = sha256Hash {
@@ -458,7 +509,7 @@ public struct InspectorPreviewView: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(label)
-                    .font(.system(size: 9.5, weight: .bold))
+                    .font(FinderUI.detailFont.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Kopiuj") {
@@ -466,17 +517,19 @@ public struct InspectorPreviewView: View {
                     NSPasteboard.general.setString(value, forType: .string)
                     fileOps.lastStatusMessage = "Skopiowano \(label): \(value.prefix(16))..."
                 }
-                .font(.system(size: 9.5))
+                .font(FinderUI.detailFont)
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.accentColor)
+                .help("Kopiuj sumę kontrolną \(label)")
+                .accessibilityLabel("Kopiuj sumę kontrolną \(label)")
             }
             Text(value)
-                .font(.system(size: 9.5, design: .monospaced))
+                .font(FinderUI.detailFont.monospaced())
                 .textSelection(.enabled)
-                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(5)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 5))
+                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
         }
     }
 
@@ -488,24 +541,25 @@ public struct InspectorPreviewView: View {
                     .resizable()
                     .scaledToFit()
                     .frame(maxHeight: 190)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .clipShape(RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
+                    .accessibilityLabel("Podgląd: \(item.name)")
                 Text("\(Int(nsImg.size.width)) × \(Int(nsImg.size.height)) px")
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(FinderUI.detailFont.monospaced())
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity)
             .padding(8)
-            .background(Color.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
         } else if !textPreviewLines.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
-                HStack {
+                VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
                     Text("Podgląd treści")
-                        .font(.system(size: 10.5, weight: .semibold))
+                        .font(FinderUI.detailFont.weight(.semibold))
                         .foregroundStyle(.secondary)
-                    Spacer()
+                        .accessibilityAddTraits(.isHeader)
                     if let grep = item.grepMatch {
                         Text("Trafienie w linii \(grep.lineNumber)")
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .font(FinderUI.detailFont.monospaced().weight(.semibold))
                             .foregroundStyle(Color.accentColor)
                     }
                 }
@@ -516,13 +570,14 @@ public struct InspectorPreviewView: View {
                             let isMatchedLine = (item.grepMatch?.lineNumber == lineNo)
                             HStack(alignment: .top, spacing: 6) {
                                 Text("\(lineNo)")
-                                    .font(.system(size: 10, design: .monospaced))
+                                    .font(FinderUI.detailFont.monospaced())
                                     .foregroundStyle(isMatchedLine ? Color.accentColor : .secondary)
                                     .frame(width: 28, alignment: .trailing)
                                 Text(text.isEmpty ? " " : text)
-                                    .font(.system(size: 10.5, design: .monospaced))
+                                    .font(FinderUI.detailFont.monospaced())
                                     .foregroundStyle(isMatchedLine ? Color.primary : Color.primary.opacity(0.85))
                                     .lineLimit(1)
+                                    .textSelection(.enabled)
                             }
                             .padding(.horizontal, 4)
                             .padding(.vertical, 1)
@@ -536,36 +591,46 @@ public struct InspectorPreviewView: View {
                     .padding(6)
                 }
                 .frame(height: 185)
-                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
-                .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1), lineWidth: 1))
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
+                .overlay(RoundedRectangle(cornerRadius: FinderUI.cornerRadius).stroke(Color.primary.opacity(0.1), lineWidth: 1))
             }
+        } else if !item.isDirectory {
+            Label(item.size == 0 ? "Plik jest pusty." : "Podgląd treści jest niedostępny. Wypróbuj Quick Look.", systemImage: "doc.text.magnifyingglass")
+                .font(FinderUI.detailFont)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(FinderUI.rowSpacing)
+                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
         }
     }
 
     private func metadataRow(label: String, value: String) -> some View {
-        HStack {
+        HStack(alignment: .top, spacing: FinderUI.rowSpacing) {
             Text(label)
-                .font(.system(size: 11))
+                .font(FinderUI.detailFont)
                 .foregroundStyle(.secondary)
             Spacer()
             Text(value)
-                .font(.system(size: 11, weight: .medium))
+                .font(FinderUI.detailFont)
                 .foregroundStyle(.primary)
-                .lineLimit(1)
+                .multilineTextAlignment(.trailing)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
         }
     }
 
     private func shortcutHintRow(keys: String, desc: String) -> some View {
-        HStack {
+        VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
             Text(keys)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .font(FinderUI.detailFont.monospaced())
                 .padding(.horizontal, 5)
                 .padding(.vertical, 2)
                 .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 4))
             Text(desc)
-                .font(.system(size: 11))
+                .font(FinderUI.detailFont)
                 .foregroundStyle(.secondary)
-            Spacer()
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -575,20 +640,18 @@ public struct InspectorPreviewView: View {
         isDestructive: Bool = false,
         action: @escaping () -> Void
     ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 11))
-                Text(title)
-                    .font(.system(size: 11, weight: .medium))
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 5)
-            .foregroundStyle(isDestructive ? Color.red : Color.primary)
-            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+        Button(role: isDestructive ? .destructive : nil, action: action) {
+            Label(title, systemImage: icon)
+                .font(FinderUI.detailFont)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, minHeight: 24)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .help(title)
+        .accessibilityLabel(title)
     }
 
     private func loadPreviewAndMetadata(for item: FileItem) {

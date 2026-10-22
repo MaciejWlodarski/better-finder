@@ -36,8 +36,8 @@ public struct SidebarView: View {
     public var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
+                    VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
                         sidebarSectionHeader("Ulubione")
                         ForEach(appState.favorites) { item in
                             sidebarLocationRow(item)
@@ -47,17 +47,24 @@ public struct SidebarView: View {
                     bookmarksSection
                     smartFoldersSection
 
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
                         sidebarSectionHeader("Tagi")
                         ForEach(FinderTagColor.allCases) { tagColor in
                             tagRow(tagColor)
                         }
                     }
 
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
                         sidebarSectionHeader("Dyski i woluminy")
-                        ForEach(appState.mountedVolumes) { volume in
-                            volumeRow(volume)
+                        if appState.mountedVolumes.isEmpty {
+                            Text("Brak dostępnych woluminów")
+                                .font(FinderUI.detailFont)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, FinderUI.rowSpacing)
+                        } else {
+                            ForEach(appState.mountedVolumes) { volume in
+                                volumeRow(volume)
+                            }
                         }
                     }
                 }
@@ -68,14 +75,14 @@ public struct SidebarView: View {
             Divider()
             indexFooter
         }
-        .font(.system(size: 13))
+        .font(FinderUI.bodyFont)
         .background(VisualEffectBackground(material: .sidebar, blendingMode: .behindWindow))
         .accessibilityLabel("Pasek boczny")
     }
 
     private var bookmarksSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 4) {
+        VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+            HStack(spacing: FinderUI.compactSpacing) {
                 sidebarSectionHeader("Przypięte foldery")
                 Spacer(minLength: 0)
                 sidebarActionButton(icon: "plus", label: "Przypnij bieżący folder") {
@@ -84,16 +91,20 @@ public struct SidebarView: View {
                 .disabled(appState.customBookmarks.contains { $0.url.path == activeTab.currentURL.path })
             }
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
                 if appState.customBookmarks.isEmpty {
                     Button {
                         appState.addBookmark(for: activeTab.currentURL)
                     } label: {
                         Label("Przypnij bieżący folder", systemImage: "pin")
-                            .font(.system(size: 12))
+                            .font(FinderUI.detailFont)
                             .foregroundStyle(.secondary)
-                            .padding(.horizontal, 8)
-                            .frame(height: 28)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, FinderUI.rowSpacing)
+                            .padding(.vertical, FinderUI.compactSpacing)
+                            .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
                     }
                     .buttonStyle(.plain)
                     .help("Możesz też przeciągnąć tutaj folder")
@@ -112,8 +123,8 @@ public struct SidebarView: View {
     }
 
     private var smartFoldersSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 4) {
+        VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+            HStack(spacing: FinderUI.compactSpacing) {
                 sidebarSectionHeader("Inteligentne foldery")
                 Spacer(minLength: 0)
                 if !activeTab.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -147,7 +158,7 @@ public struct SidebarView: View {
         return Button {
             runSearch(query)
         } label: {
-            HStack(spacing: 8) {
+            HStack(spacing: FinderUI.rowSpacing) {
                 Image(systemName: icon)
                     .foregroundStyle(isSelected ? selectedTextColor : color)
                     .frame(width: 18)
@@ -176,7 +187,7 @@ public struct SidebarView: View {
         return Button {
             runSearch(query)
         } label: {
-            HStack(spacing: 8) {
+            HStack(spacing: FinderUI.rowSpacing) {
                 Circle()
                     .fill(tagColor.swiftUIColor)
                     .overlay(Circle().strokeBorder(Color.primary.opacity(0.2), lineWidth: 0.5))
@@ -206,7 +217,7 @@ public struct SidebarView: View {
         return Button {
             navigate(to: item.url)
         } label: {
-            HStack(spacing: 8) {
+            HStack(spacing: FinderUI.rowSpacing) {
                 Image(systemName: locationIcon(for: item))
                     .foregroundStyle(isSelected ? selectedTextColor : Color.accentColor)
                     .frame(width: 18)
@@ -224,7 +235,7 @@ public struct SidebarView: View {
         .buttonStyle(.plain)
         .help(item.url.path)
         .accessibilityLabel(item.title)
-        .accessibilityValue(isSelected ? "Bieżący folder" : item.url.path)
+        .accessibilityValue(isSelected ? "Bieżący folder: \(item.url.path)" : item.url.path)
         .accessibilityHint("Otwiera folder. Można tu przeciągnąć pliki; Option kopiuje zamiast przenosić.")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .contextMenu {
@@ -270,12 +281,12 @@ public struct SidebarView: View {
         let isSelected = isLocationSelected(volume.url)
         let usedFraction = min(max(volume.usedFraction, 0), 1)
 
-        return VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 4) {
+        return VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+            HStack(spacing: FinderUI.compactSpacing) {
                 Button {
                     navigate(to: volume.url)
                 } label: {
-                    HStack(spacing: 8) {
+                    HStack(spacing: FinderUI.rowSpacing) {
                         Image(systemName: volume.isRemovable ? "externaldrive" : "internaldrive")
                             .foregroundStyle(isSelected ? selectedTextColor : Color.secondary)
                             .frame(width: 18)
@@ -292,7 +303,7 @@ public struct SidebarView: View {
                 .buttonStyle(.plain)
                 .help(volume.url.path)
                 .accessibilityLabel(volume.name)
-                .accessibilityValue(isSelected ? "Bieżący folder" : volume.url.path)
+                .accessibilityValue(isSelected ? "Bieżący folder: \(volume.url.path)" : volume.url.path)
                 .accessibilityAddTraits(isSelected ? .isSelected : [])
 
                 if volume.isRemovable {
@@ -308,6 +319,7 @@ public struct SidebarView: View {
             if volume.totalBytes > 0 {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("\(FormatHelpers.formatBytes(volume.freeBytes)) wolne")
+                        .font(FinderUI.detailFont)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     ProgressView(value: usedFraction)
@@ -326,7 +338,7 @@ public struct SidebarView: View {
 
     private func sidebarSectionHeader(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 11, weight: .semibold))
+            .font(FinderUI.detailFont.weight(.semibold))
             .foregroundStyle(.secondary)
             .padding(.horizontal, 8)
             .accessibilityAddTraits(.isHeader)
@@ -348,12 +360,12 @@ public struct SidebarView: View {
     }
 
     private func rowBackground(isSelected: Bool, isDropTarget: Bool = false) -> some View {
-        RoundedRectangle(cornerRadius: 5)
+        RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
             .fill(isSelected
                 ? Color(nsColor: controlActiveState == .inactive ? .unemphasizedSelectedContentBackgroundColor : .selectedContentBackgroundColor)
                 : (isDropTarget ? Color.accentColor.opacity(0.15) : Color.clear))
             .overlay {
-                RoundedRectangle(cornerRadius: 5)
+                RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
                     .strokeBorder(isDropTarget ? Color.accentColor : Color.clear, lineWidth: 2)
             }
     }
@@ -416,9 +428,10 @@ public struct SidebarView: View {
     }
 
     private var indexFooter: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 4) {
-                Text(appState.isIndexing ? "Indeksowanie…" : "Indeks plików")
+        VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+            HStack(spacing: FinderUI.compactSpacing) {
+                Text("Indeks plików")
+                    .font(FinderUI.detailFont.weight(.semibold))
                     .lineLimit(1)
                 Spacer(minLength: 0)
                 sidebarActionButton(icon: "gearshape", label: "Ustawienia wyszukiwania i aplikacji") {
@@ -430,7 +443,20 @@ public struct SidebarView: View {
                 }
                 .disabled(appState.isIndexing)
             }
+            if appState.isIndexing {
+                HStack(spacing: FinderUI.rowSpacing) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Indeksowanie…")
+                        .font(FinderUI.detailFont)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Indeksowanie plików")
+            }
             Text("\(appState.indexedFileCount.formatted()) plików w indeksie")
+                .font(FinderUI.detailFont)
+                .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .help(appState.indexBuildDurationMs > 0

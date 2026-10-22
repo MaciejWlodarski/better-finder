@@ -1,0 +1,43 @@
+import Foundation
+
+struct RegressionFailure: Error, CustomStringConvertible {
+    let description: String
+}
+
+func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath, line: UInt = #line) throws {
+    if !condition() { throw RegressionFailure(description: "Assertion failed at \(file):\(line)") }
+}
+
+@main struct TestRunner {
+    @MainActor static func main() async {
+        do {
+            let tests = NavigationTests()
+            try await tests.testDirectoryShowsFilesBeforeTagMetadataCompletes()
+            print("PASS directory listing precedes asynchronous tag metadata")
+            try tests.testShiftSelectionKeepsAnchorAndCanShrink()
+            print("PASS stable Shift selection and shrink")
+            try tests.testArrowFromNoSelectionAndSelectAll()
+            print("PASS arrow boundaries and Select All")
+            try tests.testHiddenFilesRefreshAndDescendingOrder()
+            print("PASS hidden files and descending sort")
+            try await tests.testClearingSearchRejectsPendingResults()
+            print("PASS cancelled search cannot replace directory")
+            try await tests.testReloadRerunsActiveSearchAfterDeletion()
+            print("PASS active search refresh after deletion")
+            try await tests.testNavigationWithLocalQueryRefreshesBrowsingSnapshot()
+            print("PASS navigating with local search keeps the correct folder snapshot")
+            try tests.testScopeInvalidationUsesDirectoryBoundaries()
+            print("PASS scope invalidation respects path boundaries")
+            try tests.testNewTabIncludesInheritedHiddenFiles()
+            print("PASS new tabs inherit visible hidden files")
+            try await tests.testDropLoadsAllFileProvidersAsOneDeduplicatedBatch()
+            print("PASS drop collects every URL before starting a batch")
+            try await tests.testSearchCommitPublishesUpdatedMetadataAndRevision()
+            print("PASS same-path search updates publish fresh metadata to the inspector")
+            print("11 regression checks passed")
+        } catch {
+            fputs("FAIL: \(error)\n", stderr)
+            exit(1)
+        }
+    }
+}

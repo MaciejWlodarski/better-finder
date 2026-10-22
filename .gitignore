@@ -1,0 +1,17 @@
+# Swift build products and local package state
+.build/
+.swiftpm/
+*.app/
+*.dSYM/
+
+# macOS and editor state
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example

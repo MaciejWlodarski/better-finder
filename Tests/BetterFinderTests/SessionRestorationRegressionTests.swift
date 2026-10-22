@@ -125,7 +125,8 @@ struct SessionRestorationRegressionTests {
     private func testLimitsAndExternalChanges() throws {
         var oversized = sample()
         oversized.tabs = Array(repeating: oversized.tabs[0], count: 129)
-        try expect(!FinderSessionStore.decode(try JSONEncoder().encode(oversized)).canWrite)
+        let encodedOversized = try JSONEncoder().encode(oversized)
+        try expect(!FinderSessionStore.decode(encodedOversized).canWrite)
         try withStore { defaults, store in
             _ = store.load(defaultRightPath: "/home")
             try expect(!store.save(oversized))

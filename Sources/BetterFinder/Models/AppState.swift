@@ -210,6 +210,8 @@ public final class AppState: ObservableObject {
             self.iconGridSize = savedIconSize
         }
 
+        if isDualPane { rightPane.retainInitialLocation() }
+
         setupSidebarLocations()
         loadPersistedBookmarksAndSmartFolders()
         #if !BETTERFINDER_TESTING
@@ -509,7 +511,7 @@ public final class AppState: ObservableObject {
 
     public func toggleDualPane() {
         if !isDualPane {
-            if !rightPane.wasRestoredFromSession { rightPane.navigate(to: leftTab.currentURL, recordHistory: false) }
+            rightPane.initializeLocationIfNeeded(matching: leftTab.currentURL)
             isDualPane = true
         } else {
             isDualPane = false

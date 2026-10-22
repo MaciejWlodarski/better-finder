@@ -312,13 +312,12 @@ public struct QuickFSearchSpotlightModal: View {
         let chosen = results[selectedIndex]
         appState.showQuickFSearchModal = false
         if chosen.isDirectory && !revealInFolder {
-            activeTab.searchQuery = ""
-            activeTab.navigate(to: chosen.url)
+            activeTab.navigate(to: chosen.url, clearSearch: true)
         } else {
             let parentURL = URL(fileURLWithPath: chosen.parentPath, isDirectory: true)
-            activeTab.searchQuery = ""
-            activeTab.navigate(to: parentURL)
-            activeTab.selectedPaths = [chosen.path]
+            if activeTab.navigate(to: parentURL, clearSearch: true) {
+                activeTab.selectedPaths = [chosen.path]
+            }
         }
     }
 }

@@ -15,8 +15,13 @@ func section(_ text: String, from start: String, to end: String) -> String {
     }
     return String(text[a.lowerBound..<b.lowerBound])
 }
-let core = section(manager, from: "public enum FileHistoryAction", to: "/// Thread-safe cancellation flag")
+// Include the entry identity dependency introduced by guarded history actions.
+let core = section(manager, from: "struct FileEntryIdentity", to: "/// Thread-safe cancellation flag")
 let tags = section(model, from: "public enum FinderTagColor", to: "public enum FileKindCategory")
+// Restore actions call this production naming helper; extract it rather than
+// substituting a test-only implementation of collision handling.
+let naming = section(manager, from: "    nonisolated public static func uniqueURL", to: "    /// The creator must fail")
+let managerNamespace = "enum FileOperationsManager {\n" + naming + "\n}\n"
 let harness = #"""
 import Foundation
 import Darwin
@@ -234,7 +239,7 @@ try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories
 defer { try? FileManager.default.removeItem(at: scratch) }
 let source = scratch.appendingPathComponent("main.swift")
 let executable = scratch.appendingPathComponent("file-operation-checks")
-try ("import Foundation\nimport Darwin\nimport SwiftUI\n" + core + tags + harness).write(to: source, atomically: true, encoding: .utf8)
+try ("import Foundation\nimport Darwin\nimport SwiftUI\n" + core + managerNamespace + tags + harness).write(to: source, atomically: true, encoding: .utf8)
 func run(_ command: String, _ arguments: [String]) throws {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: command)

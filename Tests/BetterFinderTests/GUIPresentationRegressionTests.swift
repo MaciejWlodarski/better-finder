@@ -57,6 +57,8 @@ struct GUIPresentationRegressionTests {
         }
         let left = PaneTabState(initialURL: root)
         let right = PaneTabState(initialURL: root)
+        let rightURLBeforeNavigation = right.currentURL
+        try expect(rightURLBeforeNavigation == root.standardizedFileURL)
         app.tabs = [left]
         app.activeTabId = left.id
         app.rightPane = right
@@ -86,7 +88,7 @@ struct GUIPresentationRegressionTests {
         try expect(activatedBeforeNavigation)
         try expect(app.activeTab === left)
         try expect(app.activeTab.currentURL == destination)
-        try expect(right.currentURL == root)
+        try expect(right.currentURL == rightURLBeforeNavigation)
         print("PASS production pane-action routing activates before analysis selection and navigation")
     }
 

@@ -259,7 +259,13 @@ struct SearchIndexRegressionTests {
         try git(["-c", "user.name=Regression", "-c", "user.email=regression@example.invalid", "commit", "-qm", "fixture"])
         let index = engine(root)
         try write("modified content", to: file)
-        try expect(query(index, "git:modified", root, scope: .currentFolder).items.map(\.name) == ["tracked.txt"])
+        let modified = query(index, "git:modified", root, scope: .currentFolder)
+        if modified.items.map(\.name) != ["tracked.txt"] {
+            let snapshot = FileOperationsManager.fetchGitStatusSnapshot(for: root.path)
+            let entries = BulkCrawler.readDirectoryResult(at: root.path).entries
+            print("Git fixture diagnostic: root=\(root.path); candidates=\(entries.map(\.fullPath)); results=\(modified.items.map(\.path)); partial=\(modified.isPartial); diagnostic=\(modified.diagnostic ?? "none"); snapshotRoot=\(snapshot?.repositoryRoot ?? "unavailable"); statuses=\(snapshot?.statuses.description ?? "unavailable")")
+        }
+        try expect(modified.items.map(\.name) == ["tracked.txt"])
         try write("original", to: file)
         try expect(query(index, "git:modified", root, scope: .currentFolder).items.isEmpty)
         let snapshot = FileOperationsManager.fetchGitStatusSnapshot(for: root.path)

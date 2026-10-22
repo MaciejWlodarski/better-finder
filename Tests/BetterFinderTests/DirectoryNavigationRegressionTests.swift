@@ -272,6 +272,12 @@ struct DirectoryNavigationRegressionTests {
         try expect(!pane.navigate(to: target))
         let failureID = pane.navigationFailureID!
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        // The attempted URL was standardized while absent. Recompute only the
+        // expected destination now that it is a directory, exactly as navigation
+        // does at retry time (Foundation may add directory URL representation).
+        let expectedDestination = target.standardizedFileURL
+        print("INFO retry fixture URL: before creation=\(target.absoluteString), after creation=\(expectedDestination.absoluteString), equal=\(target == expectedDestination)")
+        let originalLocation = pane.currentURL
         var actions = 0
         let action = { actions += 1; pane.retryNavigation(expectedFailureID: failureID) }
         app.tabs = [pane, replacement]; app.activeTabId = replacement.id
@@ -285,6 +291,14 @@ struct DirectoryNavigationRegressionTests {
         try expect(actions == 0 && app.activePaneSide == .left && pane.currentURL != target)
         app.isDualPane = true
         try expect(FinderPaneActionRouting.performIfCurrent(appState: app, pane: pane, paneSide: .right, action: action))
-        try expect(actions == 1 && app.activePaneSide == .right && pane.currentURL == target)
+        guard actions == 1 else {
+            throw RegressionFailure(description: "Visible retry invoked \(actions) actions; expected exactly one")
+        }
+        try expect(app.activePaneSide == .right)
+        guard pane.currentURL == expectedDestination else {
+            throw RegressionFailure(description: "Retry destination mismatch: actual=\(pane.currentURL.absoluteString), expected=\(expectedDestination.absoluteString), attempted=\(target.absoluteString), diagnostic=\(pane.navigationDiagnostic ?? "nil"), failureID=\(String(describing: pane.navigationFailureID))")
+        }
+        try expect(pane.historyBack == [originalLocation] && pane.historyForward.isEmpty)
+        try expect(pane.navigationDiagnostic == nil && pane.navigationFailureID == nil)
     }
 }

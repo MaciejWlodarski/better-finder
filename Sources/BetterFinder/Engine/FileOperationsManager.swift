@@ -626,7 +626,7 @@ public final class FileOperationsManager: ObservableObject {
             isCancellable: total > 1
         )
 
-        Task.detached(priority: .userInitiated) { [self] in
+        Task.detached(priority: .userInitiated) { [self, validSources, rejectedNested] in
             var resultURLs: [URL] = []
             var copiedURLs: [URL] = []
             var movedPairs: [(from: URL, to: URL)] = []

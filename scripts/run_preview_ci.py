@@ -108,7 +108,7 @@ CENSUS = None
 END = 0.0
 SOURCE_PINS = {
     'scripts/preview_app.sh': 'e2508373f2385a04cd29026a38926197d1b245efa19c18e9bfc5bd2eee3761df',
-    'scripts/preview_app.swift': '0d2503e26fcea08ed574843c4ce1ebd0db11d304cd7ca862702eb22f3403c1b8',
+    'scripts/preview_app.swift': 'cf811394f0d838488bc83e1a6e9a23b36d7af5d9ac6c7db12872da28e04bd67c',
 }
 
 

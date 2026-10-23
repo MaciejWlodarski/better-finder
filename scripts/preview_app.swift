@@ -38,7 +38,15 @@ struct NativePreview {
         markStage("write-fixture-files")
         do {
             for name in ["Notatki ze spotkania.md", "Plan projektu.txt", "README.md", "Szkice.svg", "Zestawienie.csv"] {
-                try Data("BetterFinder preview\n".utf8).write(to: fixture.appendingPathComponent(name))
+                var content = "BetterFinder preview\n"
+                #if BETTERFINDER_TESTING
+                // A valid static SVG exercises native thumbnails, not a parser-error fixture.
+                // Keep non-CI preview fixture contents unchanged.
+                if name == "Szkice.svg" {
+                    content = ##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="120" viewBox="0 0 160 120"><rect width="160" height="120" fill="#eef2f7"/><rect x="20" y="20" width="70" height="80" rx="8" fill="#3975d5"/><circle cx="112" cy="60" r="24" fill="#edb94b"/></svg>"## + "\n"
+                }
+                #endif
+                try Data(content.utf8).write(to: fixture.appendingPathComponent(name))
             }
         } catch { require(false, "bootstrap fixture file write failed"); return }
         markStage("configure-defaults")

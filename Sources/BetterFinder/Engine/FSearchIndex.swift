@@ -56,6 +56,7 @@ public final class FSearchIndex: @unchecked Sendable {
     private var refreshWorkerScheduled = false
     private let pendingRefreshLimit = 128
     #if BETTERFINDER_TESTING
+    var searchDateForTesting: Date?
     var refreshReadHookForTesting: (@Sendable (String) -> Void)?
     var crawlProgressHookForTesting: (@Sendable (Int) -> Void)?
     var beforeCrawlLockHookForTesting: (@Sendable () -> Void)?
@@ -434,7 +435,7 @@ public final class FSearchIndex: @unchecked Sendable {
                 guard let ext = String(bytes: extSlice, encoding: .utf8) else { return nil }
                 offset += extLen
 
-                let lowerBytes = Array(name.lowercased().utf8)
+                let lowerBytes = Array(ParsedFSearchQuery.normalizedNameSearchText(name).utf8)
                 result.append(IndexedFileEntry(
                     name: name,
                     lowerNameUTF8: lowerBytes,
@@ -696,7 +697,11 @@ public final class FSearchIndex: @unchecked Sendable {
             }
         }
 
+        #if BETTERFINDER_TESTING
+        let now = searchDateForTesting ?? Date()
+        #else
         let now = Date()
+        #endif
         let chunkSize = max(2048, (totalCount + 7) / 8)
         let numChunks = (totalCount + chunkSize - 1) / chunkSize
 
@@ -863,7 +868,7 @@ public final class FSearchIndex: @unchecked Sendable {
         }
 
         if !query.mtimeFilters.isEmpty {
-            let modDate = Date(timeIntervalSince1970: TimeInterval(entry.mtimeEpoch))
+            let modDate = entry.modificationDate
             for mf in query.mtimeFilters {
                 if !mf.matches(modDate, now: now) { return nil }
             }
@@ -1075,44 +1080,59 @@ public final class FSearchIndex: @unchecked Sendable {
         return max(60, 220 + (consecutiveCount * 25) - (span - nCount) * 12 - firstMatchIdx * 3)
     }
 
+    #if BETTERFINDER_TESTING
+    static func ageFilteredEntryMatchesForTesting(_ entry: IndexedFileEntry, rawQuery: String, now: Date) -> Bool {
+        entrySearchScoreForTesting(entry, rawQuery: rawQuery, fuzzyEnabled: false, now: now) != nil
+    }
+
+    static func entrySearchScoreForTesting(_ entry: IndexedFileEntry, rawQuery: String,
+                                          fuzzyEnabled: Bool, now: Date) -> Int? {
+        let query = ParsedFSearchQuery.parse(rawQuery, fuzzyEnabled: fuzzyEnabled)
+        guard query.validationError == nil else { return nil }
+        return evaluateEntry(entry, query: query, compiledRegex: nil, gitStatusMap: [:], now: now)
+    }
+
+    // Expose the production matcher separately from intentional subsequence fallback.
+    static func oneTypoSubstringMatchesForTesting(_ name: String, _ term: String) -> Bool {
+        hasOneTypoSubstringMatch(haystack: Array(name.utf8), needle: Array(term.utf8))
+    }
+    #endif
+
     @inline(__always)
     private static func hasOneTypoSubstringMatch(haystack: [UInt8], needle: [UInt8]) -> Bool {
         let hLen = haystack.count
         let nLen = needle.count
         guard nLen >= 5, hLen >= nLen - 1 else { return false }
 
-        let maxStart = max(0, hLen - (nLen - 1))
-        for start in 0...maxStart {
+        // After spending the single edit, the rest must match exactly. Trying all
+        // admissible tails avoids greedy insertion/deletion choices when bytes repeat.
+        // This remains byte-based, allocation-free and O(hLen * nLen).
+        func tailMatches(_ haystackStart: Int, _ needleStart: Int) -> Bool {
+            let remaining = nLen - needleStart
+            guard hLen - haystackStart >= remaining else { return false }
+            for offset in 0..<remaining {
+                if haystack[haystackStart + offset] != needle[needleStart + offset] { return false }
+            }
+            return true
+        }
+
+        for start in 0...(hLen - (nLen - 1)) {
             var i = start
             var j = 0
-            var edits = 0
-
-            while i < hLen && j < nLen {
-                if haystack[i] == needle[j] {
-                    i += 1
-                    j += 1
-                } else {
-                    edits += 1
-                    if edits > 1 { break }
-
-                    if i + 1 < hLen && j + 1 < nLen &&
-                       haystack[i] == needle[j + 1] && haystack[i + 1] == needle[j] {
-                        i += 2
-                        j += 2
-                    } else if i + 1 < hLen && haystack[i + 1] == needle[j] {
-                        i += 1
-                    } else if j + 1 < nLen && haystack[i] == needle[j + 1] {
-                        j += 1
-                    } else {
-                        i += 1
-                        j += 1
-                    }
-                }
+            while i < hLen && j < nLen && haystack[i] == needle[j] {
+                i += 1
+                j += 1
             }
-            let remainingNeedle = nLen - j
-            if edits + remainingNeedle <= 1 {
-                return true
-            }
+            if j == nLen { return true }
+            // Delete one needle byte, including a missing final filename byte.
+            if tailMatches(i, j + 1) { return true }
+            guard i < hLen else { continue }
+            // Substitute, or skip one extra haystack byte.
+            if tailMatches(i + 1, j + 1) || tailMatches(i + 1, j) { return true }
+            // Preserve the existing adjacent-transposition allowance.
+            if i + 1 < hLen && j + 1 < nLen &&
+                haystack[i] == needle[j + 1] && haystack[i + 1] == needle[j] &&
+                tailMatches(i + 2, j + 2) { return true }
         }
         return false
     }

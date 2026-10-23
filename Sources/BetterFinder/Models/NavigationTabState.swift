@@ -142,7 +142,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }()
 
     public var title: String {
-        if !searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+        if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return searchQuery
         }
         let name = currentURL.lastPathComponent
@@ -649,7 +649,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     private func rebuildDisplayedItemsWithExpandedTree() {
-        guard searchQuery.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        guard searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         if viewMode != .list || expandedFolderPaths.isEmpty {
             displayedItems = directoryItems
             reconcileSelection()
@@ -700,8 +700,8 @@ public final class PaneTabState: ObservableObject, Identifiable {
         searchTask?.cancel()
         searchGeneration &+= 1
         let generation = searchGeneration
-        let q = searchQuery.trimmingCharacters(in: .whitespaces)
-        let parsed = ParsedFSearchQuery.parse(q, fuzzyEnabled: fuzzyEnabled)
+        let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsed = ParsedFSearchQuery.parse(searchQuery, fuzzyEnabled: fuzzyEnabled)
         activeFilterPills = parsed.pills
         searchDiagnostic = parsed.validationError
         searchIsPartial = false
@@ -874,26 +874,17 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
 
     public func removeFilterPill(_ pill: ActiveFilterPill) {
-        let updated = searchQuery
-            .replacingOccurrences(of: pill.rawToken, with: "")
-            .replacingOccurrences(of: "  ", with: " ")
-            .trimmingCharacters(in: .whitespaces)
-        searchQuery = updated
+        searchQuery = ParsedFSearchQuery.removing(pill, from: searchQuery)
         triggerSearch()
     }
 
     public func appendSearchOperator(_ token: String) {
-        let trimmed = searchQuery.trimmingCharacters(in: .whitespaces)
-        if trimmed.contains(token) {
-            searchQuery = trimmed.replacingOccurrences(of: token, with: "").trimmingCharacters(in: .whitespaces)
-        } else {
-            searchQuery = trimmed.isEmpty ? token : "\(trimmed) \(token)"
-        }
+        searchQuery = ParsedFSearchQuery.togglingOperator(token, in: searchQuery)
         triggerSearch()
     }
 
     public func applySortChange() {
-        if searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+        if searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             directoryItems = sortItems(directoryItems)
             rebuildDisplayedItemsWithExpandedTree()
         } else {

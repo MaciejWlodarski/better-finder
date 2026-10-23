@@ -77,6 +77,8 @@ public struct ActiveFilterPill: Identifiable, Equatable, Sendable {
     public let prefix: String
     public let value: String
     public let rawToken: String
+    public let tokenIndex: Int
+    public let sourceQuery: String
     public let icon: String
 }
 
@@ -128,7 +130,8 @@ public struct ParsedFSearchQuery: Sendable {
             return result
         }
 
-        for (idx, token) in tokens.values.enumerated() {
+        for (idx, span) in tokens.values.enumerated() {
+            let token = span.raw
             if token.isEmpty { continue }
 
             if let colonIndex = token.firstIndex(of: ":"), colonIndex != token.startIndex {
@@ -138,10 +141,19 @@ public struct ParsedFSearchQuery: Sendable {
                     let isNegated = rawKey.hasPrefix("!") || rawKey.hasPrefix("-")
                     let key = isNegated ? String(rawKey.dropFirst()) : rawKey
 
+                    let recognized = ["ext", "e", "type", "kind", "t", "tag", "tags", "color", "kolor", "size", "s", "mtime", "modified", "age", "dm", "in", "path", "dir", "folder", "grep", "content", "g", "regex", "re", "sym", "symlink", "git", "limit", "max"]
+                    if isNegated && recognized.contains(key) && key != "ext" && key != "e" {
+                        result.validationError = "Negation is not supported for \(key):. Only extension predicates and ordinary terms can be excluded."
+                        return result
+                    }
                     switch key {
                     case "ext", "e":
-                        let exts = val.lowercased().split(separator: ",").map {
+                        let exts = val.lowercased().split(separator: ",", omittingEmptySubsequences: false).map {
                             $0.hasPrefix(".") ? String($0.dropFirst()) : String($0)
+                        }
+                        guard !exts.isEmpty, exts.allSatisfy({ !$0.isEmpty }) else {
+                            result.validationError = "Invalid extension list: \(val)"
+                            return result
                         }
                         if isNegated {
                             result.excludedExtensions.formUnion(exts)
@@ -153,36 +165,46 @@ public struct ParsedFSearchQuery: Sendable {
                             prefix: isNegated ? "!ext" : "ext",
                             value: exts.joined(separator: ", "),
                             rawToken: token,
+                            tokenIndex: idx, sourceQuery: input,
                             icon: "doc.badge.gearshape"
                         ))
                         continue
 
                     case "type", "kind", "t":
-                        let types = val.lowercased().split(separator: ",").map(String.init)
+                        let types = val.lowercased().split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+                        guard types.allSatisfy({ !$0.isEmpty }) else {
+                            result.validationError = "Invalid type list: \(val)"
+                            return result
+                        }
                         result.typeFilters.formUnion(types)
                         result.pills.append(ActiveFilterPill(
                             id: "\(idx)-\(token)",
                             prefix: "type",
                             value: types.joined(separator: ", "),
                             rawToken: token,
+                            tokenIndex: idx, sourceQuery: input,
                             icon: "square.grid.2x2"
                         ))
                         continue
 
                     case "tag", "tags", "color", "kolor":
-                        let rawColors = val.lowercased().split(separator: ",").map(String.init)
+                        let rawColors = val.lowercased().split(separator: ",", omittingEmptySubsequences: false).map(String.init)
                         let matchedColors = rawColors.compactMap { FinderTagColor.from(rawTagName: $0) }
-                        if !matchedColors.isEmpty {
+                        if !matchedColors.isEmpty && matchedColors.count == rawColors.count {
                             result.tagFilters.formUnion(matchedColors)
                             result.pills.append(ActiveFilterPill(
                                 id: "\(idx)-\(token)",
                                 prefix: "tag",
                                 value: matchedColors.map(\.displayName).joined(separator: ", "),
                                 rawToken: token,
+                                tokenIndex: idx, sourceQuery: input,
                                 icon: "tag.fill"
                             ))
                             continue
                         }
+
+                        result.validationError = "Invalid tag list: \(val)"
+                        return result
 
                     case "size", "s":
                         if let sf = parseSizeFilter(val) {
@@ -192,6 +214,7 @@ public struct ParsedFSearchQuery: Sendable {
                                 prefix: "size",
                                 value: val,
                                 rawToken: token,
+                                tokenIndex: idx, sourceQuery: input,
                                 icon: "internaldrive"
                             ))
                             continue
@@ -207,6 +230,7 @@ public struct ParsedFSearchQuery: Sendable {
                                 prefix: "mtime",
                                 value: val,
                                 rawToken: token,
+                                tokenIndex: idx, sourceQuery: input,
                                 icon: "clock.arrow.circlepath"
                             ))
                             continue
@@ -221,6 +245,7 @@ public struct ParsedFSearchQuery: Sendable {
                             prefix: "in",
                             value: val,
                             rawToken: token,
+                            tokenIndex: idx, sourceQuery: input,
                             icon: "folder"
                         ))
                         continue
@@ -233,6 +258,7 @@ public struct ParsedFSearchQuery: Sendable {
                             prefix: "grep",
                             value: val,
                             rawToken: token,
+                            tokenIndex: idx, sourceQuery: input,
                             icon: "text.magnifyingglass"
                         ))
                         continue
@@ -249,29 +275,41 @@ public struct ParsedFSearchQuery: Sendable {
                             prefix: "regex",
                             value: val,
                             rawToken: token,
+                            tokenIndex: idx, sourceQuery: input,
                             icon: "asterisk.circle"
                         ))
                         continue
 
                     case "sym", "symlink":
-                        let b = (val == "true" || val == "1" || val == "yes")
+                        let normalized = val.lowercased()
+                        guard ["true", "1", "yes", "false", "0", "no"].contains(normalized) else {
+                            result.validationError = "Invalid symlink value: \(val). Use true/false, yes/no or 1/0."
+                            return result
+                        }
+                        let b = ["true", "1", "yes"].contains(normalized)
                         result.symlinkOnly = b
                         result.pills.append(ActiveFilterPill(
                             id: "\(idx)-\(token)",
                             prefix: "sym",
                             value: b ? "yes" : "no",
                             rawToken: token,
+                            tokenIndex: idx, sourceQuery: input,
                             icon: "arrow.turn.up.right"
                         ))
                         continue
 
                     case "git":
+                        guard ["m", "mod", "modified", "a", "staged", "added", "?", "u", "untracked", "any", "*"].contains(val.lowercased()) else {
+                            result.validationError = "Invalid Git status: \(val)"
+                            return result
+                        }
                         result.gitFilter = val.lowercased()
                         result.pills.append(ActiveFilterPill(
                             id: "\(idx)-\(token)",
                             prefix: "git",
                             value: val.lowercased(),
                             rawToken: token,
+                            tokenIndex: idx, sourceQuery: input,
                             icon: "point.3.connected.trianglepath.dotted"
                         ))
                         continue
@@ -282,6 +320,9 @@ public struct ParsedFSearchQuery: Sendable {
                             continue
                         }
 
+                        result.validationError = "Invalid result limit: \(val)"
+                        return result
+
                     default:
                         break
                     }
@@ -289,27 +330,28 @@ public struct ParsedFSearchQuery: Sendable {
             }
 
             if (token.hasPrefix("!") || token.hasPrefix("-")) && token.count > 1 {
-                let term = String(token.dropFirst()).lowercased()
+                let term = Self.normalizedNameSearchText(String(token.dropFirst()))
                 result.terms.append(.excluded(term))
                 result.pills.append(ActiveFilterPill(
                     id: "\(idx)-\(token)",
                     prefix: "not",
                     value: term,
                     rawToken: token,
+                    tokenIndex: idx, sourceQuery: input,
                     icon: "minus.circle"
                 ))
             } else if token.hasPrefix("^") && token.count > 1 {
-                let term = String(token.dropFirst()).lowercased()
+                let term = Self.normalizedNameSearchText(String(token.dropFirst()))
                 result.terms.append(.prefix(term))
             } else if token.hasSuffix("$") && token.count > 1 {
-                let term = String(token.dropLast()).lowercased()
+                let term = Self.normalizedNameSearchText(String(token.dropLast()))
                 result.terms.append(.suffix(term))
             } else if (token.hasPrefix("\"") && token.hasSuffix("\"") && token.count > 2) ||
                       (token.hasPrefix("'") && token.hasSuffix("'") && token.count > 2) {
-                let inner = decodeQuotedValue(token).lowercased()
+                let inner = Self.normalizedNameSearchText(decodeQuotedValue(token))
                 result.terms.append(.exact(inner))
             } else {
-                let lower = token.lowercased()
+                let lower = Self.normalizedNameSearchText(token)
                 let bytes = Array(lower.utf8)
                 let mask = Self.computeAsciiBitmask(bytes)
                 result.terms.append(.fuzzyOrSubstring(lower, lowerBytes: bytes, charMask: mask))
@@ -317,6 +359,12 @@ public struct ParsedFSearchQuery: Sendable {
         }
 
         return result
+    }
+
+    /// Canonical equivalence for derived name-search data only. Keep raw names,
+    /// operation paths and token spans untouched; edits still count UTF-8 bytes.
+    static func normalizedNameSearchText(_ text: String) -> String {
+        text.lowercased().precomposedStringWithCanonicalMapping
     }
 
     /// Computes a 64-bit ASCII presence bitmask for O(1) Bloom-style rejection
@@ -364,32 +412,75 @@ public struct ParsedFSearchQuery: Sendable {
 
     // Keep the original spelling for removable filter pills. Decode only syntax
     // quotes and escaped quotes/backslashes, preserving regex escapes such as \d.
-    private static func tokenize(_ input: String) -> (values: [String], unterminatedQuote: Bool) {
-        var tokens: [String] = []
-        var current = ""
+    private struct TokenSpan {
+        let raw: String
+        let range: Range<String.Index>
+    }
+
+    private static func tokenize(_ input: String) -> (values: [TokenSpan], unterminatedQuote: Bool) {
+        var tokens: [TokenSpan] = []
+        var start: String.Index?
         var inQuote: Character?
         var escaped = false
-        for ch in input {
+        for index in input.indices {
+            let ch = input[index]
+            if start == nil && !ch.isWhitespace { start = index }
             if escaped {
-                current.append(ch)
                 escaped = false
             } else if ch == "\\" {
-                current.append(ch)
                 escaped = true
             } else if let quote = inQuote {
-                current.append(ch)
                 if ch == quote { inQuote = nil }
-            } else if (ch == "\"" || ch == "'"), current.isEmpty || current.hasSuffix(":") {
+            } else if (ch == "\"" || ch == "'"),
+                      start == index || (index > input.startIndex && input[input.index(before: index)] == ":") {
                 inQuote = ch
-                current.append(ch)
-            } else if ch.isWhitespace {
-                if !current.isEmpty { tokens.append(current); current = "" }
-            } else {
-                current.append(ch)
+            } else if ch.isWhitespace, let lower = start {
+                tokens.append(TokenSpan(raw: String(input[lower..<index]), range: lower..<index))
+                start = nil
             }
         }
-        if !current.isEmpty { tokens.append(current) }
+        if let lower = start {
+            tokens.append(TokenSpan(raw: String(input[lower...]), range: lower..<input.endIndex))
+        }
         return (tokens, inQuote != nil)
+    }
+
+    /// Snapshot identity makes an obsolete pill harmless. Delete only its token;
+    /// surrounding whitespace and all other raw spelling/escaping remain intact.
+    public static func removing(_ pill: ActiveFilterPill, from input: String) -> String {
+        guard pill.sourceQuery == input else { return input }
+        let spans = tokenize(input).values
+        guard spans.indices.contains(pill.tokenIndex),
+              spans[pill.tokenIndex].raw == pill.rawToken,
+              parse(input).pills.contains(pill) else { return input }
+        let range = spans[pill.tokenIndex].range
+        return String(input[..<range.lowerBound]) + String(input[range.upperBound...])
+    }
+
+    /// Menu toggles match complete, parsed pill tokens, case-insensitively.
+    /// Aliases and alternate quoting are not canonicalized. Toggle-off removes
+    /// all same-spelling duplicates so the corresponding checkmark becomes off.
+    public static func containsOperator(_ token: String, in input: String, pills: [ActiveFilterPill]) -> Bool {
+        pills.contains { $0.sourceQuery == input && $0.rawToken.caseInsensitiveCompare(token) == .orderedSame }
+    }
+
+    public static func togglingOperator(_ token: String, in input: String) -> String {
+        let matches = parse(input).pills.filter { $0.rawToken.caseInsensitiveCompare(token) == .orderedSame }
+        if !matches.isEmpty {
+            let spans = tokenize(input).values
+            let removedIndices = Set(matches.map(\.tokenIndex))
+            var output = ""
+            var cursor = input.startIndex
+            // Every index is used only with the immutable source that created it.
+            // Append retained gaps verbatim, including whitespace and escaping.
+            for (index, span) in spans.enumerated() where removedIndices.contains(index) {
+                output.append(contentsOf: input[cursor..<span.range.lowerBound])
+                cursor = span.range.upperBound
+            }
+            output.append(contentsOf: input[cursor...])
+            return output
+        }
+        return input + (input.isEmpty || input.last?.isWhitespace == true ? "" : " ") + token
     }
 
     private static func decodeQuotedValue(_ raw: String) -> String {
@@ -460,8 +551,7 @@ public struct ParsedFSearchQuery: Sendable {
                 unitStr.append(ch)
             }
         }
-        guard let val = Double(numStr) else { return nil }
-        let mult: Double
+        let mult: Int64
         switch unitStr.lowercased() {
         case "g", "gb", "gib": mult = 1024 * 1024 * 1024
         case "m", "mb", "mib": mult = 1024 * 1024
@@ -469,14 +559,29 @@ public struct ParsedFSearchQuery: Sendable {
         case "b", "": mult = 1
         default: return nil
         }
-        if let integer = Int64(numStr) {
-            let (bytes, overflow) = integer.multipliedReportingOverflow(by: Int64(mult))
-            return !overflow && bytes >= 0 ? bytes : nil
+        // Exact decimal digit multiplication avoids Double rounding above 2^53.
+        // Drop fractional bytes only after scaling, retaining the original policy.
+        let parts = numStr.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count <= 2, !numStr.isEmpty,
+              parts.contains(where: { !$0.isEmpty }) else { return nil }
+        let fractionCount = parts.count == 2 ? parts[1].count : 0
+        let digits = parts.joined().utf8.map { Int64($0 - 48) }
+        var product: [Int64] = []
+        var carry: Int64 = 0
+        for digit in digits.reversed() {
+            let value = digit * mult + carry // <= 10 * 2^30, safely within Int64
+            product.append(value % 10)
+            carry = value / 10
         }
-        let scaled = val * mult
-        guard scaled.isFinite, scaled >= 0 else { return nil }
-        // Int64.max rounds up to 2^63 as Double; a <= max check is unsafe.
-        return Int64(exactly: scaled.rounded(.towardZero))
+        while carry > 0 { product.append(carry % 10); carry /= 10 }
+        var bytes: Int64 = 0
+        for digit in product.dropFirst(fractionCount).reversed() {
+            let (scaled, overflow) = bytes.multipliedReportingOverflow(by: 10)
+            let (next, additionOverflow) = scaled.addingReportingOverflow(digit)
+            guard !overflow && !additionOverflow else { return nil }
+            bytes = next
+        }
+        return bytes
     }
 
     private static func parseMTimeFilter(_ raw: String) -> MTimeFilter? {

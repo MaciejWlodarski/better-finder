@@ -38,6 +38,7 @@ struct GUIPresentationRegressionTests {
         print("PASS status summary follows production analysis/list selection and pending search")
         try testPaneActionRouting(root: root, files: files)
         try testQuickSearchSelection()
+        try testBreadcrumbRevealRequest()
     }
     @MainActor private func testPaneActionRouting(root: URL, files: [FileItem]) throws {
         // The same synchronous routing helper is invoked by mouse and AX view
@@ -103,6 +104,24 @@ struct GUIPresentationRegressionTests {
         try expect(QuickSearchSelection.movedIndex(from: 99, count: 100, direction: .down) == 99)
         try expect(QuickSearchSelection.movedIndex(from: 98, count: 100, direction: .down) == 99)
         print("PASS production quick-search selection boundaries for the visible result list")
+    }
+
+    private func testBreadcrumbRevealRequest() throws {
+        let initial = BreadcrumbRevealRequest(path: "/tmp/Pracownia", viewportWidth: 800)
+        try expect(initial.maximumSegmentWidth == 280)
+        try expect(initial == BreadcrumbRevealRequest(path: initial.path, viewportWidth: 800))
+        // Narrowing, widening, and navigation all invalidate the reveal task.
+        try expect(initial != BreadcrumbRevealRequest(path: initial.path, viewportWidth: 500))
+        try expect(initial != BreadcrumbRevealRequest(path: initial.path, viewportWidth: 1000))
+        try expect(initial != BreadcrumbRevealRequest(path: "/tmp/Projekty", viewportWidth: 800))
+        for width in [CGFloat(0), 1, 40, 120, 279, 280, 281, 1000] {
+            let request = BreadcrumbRevealRequest(path: "/", viewportWidth: width)
+            try expect(request.maximumSegmentWidth >= 0)
+            try expect(request.maximumSegmentWidth <= width)
+            try expect(request.maximumSegmentWidth <= 280)
+        }
+        try expect(BreadcrumbRevealRequest(path: "/", viewportWidth: -1).maximumSegmentWidth == 0)
+        print("PASS breadcrumb reveal identity and viewport-bounded segment widths")
     }
 
 }

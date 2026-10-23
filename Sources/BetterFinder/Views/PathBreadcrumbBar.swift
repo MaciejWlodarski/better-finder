@@ -8,6 +8,18 @@ public struct PathBreadcrumbSegment: Identifiable {
     public let isRoot: Bool
 }
 
+/// Only a location or viewport change requests a reveal. Content offsets and
+/// unrelated pane updates deliberately do not participate, so manual scrolling
+/// through ancestors is left alone until the next navigation or resize.
+struct BreadcrumbRevealRequest: Equatable {
+    let path: String
+    let viewportWidth: CGFloat
+
+    var maximumSegmentWidth: CGFloat {
+        min(280, max(0, viewportWidth))
+    }
+}
+
 public struct PathBreadcrumbBar: View {
     @ObservedObject var appState: AppState
     @ObservedObject var pane: PaneTabState
@@ -83,38 +95,47 @@ public struct PathBreadcrumbBar: View {
     }
 
     private var breadcrumbTrail: some View {
-        ScrollViewReader { scrollProxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 2) {
-                    ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
-                        if index > 0 {
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(.tertiary)
-                                .accessibilityHidden(true)
+        GeometryReader { geometry in
+            let request = BreadcrumbRevealRequest(
+                path: pane.currentURL.path,
+                viewportWidth: geometry.size.width
+            )
+            ScrollViewReader { scrollProxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 2) {
+                        ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
+                            if index > 0 {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(.tertiary)
+                                    .accessibilityHidden(true)
+                            }
+                            breadcrumbButton(segment, maximumWidth: request.maximumSegmentWidth)
+                                .id(segment.id)
                         }
-                        breadcrumbButton(segment)
-                            .id(segment.id)
                     }
                 }
-            }
-            .defaultScrollAnchor(.trailing)
-            .onAppear {
-                scrollProxy.scrollTo(pane.currentURL.path, anchor: .trailing)
-            }
-            .onChange(of: pane.currentURL) { _, url in
-                scrollProxy.scrollTo(url.path, anchor: .trailing)
-            }
-            .help(pane.currentURL.path)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                beginEditing()
+                .defaultScrollAnchor(.trailing)
+                .task(id: request) { @MainActor in
+                    // Defer out of this view update before revealing the destination.
+                    // Yield is not a layout barrier; native resize checks cover
+                    // timing. A newer resize/navigation cancels stale work.
+                    await Task.yield()
+                    guard !Task.isCancelled, request.viewportWidth > 0,
+                          request.path == pane.currentURL.path else { return }
+                    scrollProxy.scrollTo(request.path, anchor: .trailing)
+                }
+                .help(pane.currentURL.path)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) {
+                    beginEditing()
+                }
             }
         }
         .frame(height: 28)
     }
 
-    private func breadcrumbButton(_ segment: PathBreadcrumbSegment) -> some View {
+    private func breadcrumbButton(_ segment: PathBreadcrumbSegment, maximumWidth: CGFloat) -> some View {
         let isCurrent = segment.url.path == pane.currentURL.path
 
         return Button {
@@ -128,9 +149,10 @@ public struct PathBreadcrumbBar: View {
                     .font(.system(size: 13, weight: isCurrent ? .semibold : .regular))
                     .foregroundStyle(isCurrent ? Color.primary : Color.secondary)
                     .lineLimit(1)
-                    .fixedSize()
+                    .truncationMode(.middle)
             }
             .padding(.horizontal, 6)
+            .frame(maxWidth: maximumWidth, alignment: .leading)
             .frame(minHeight: 28)
             .background {
                 if isCurrent {
@@ -143,7 +165,7 @@ public struct PathBreadcrumbBar: View {
         .buttonStyle(.plain)
         .help(segment.url.path)
         .accessibilityLabel(segment.name)
-        .accessibilityValue(isCurrent ? "Bieżący folder" : segment.url.path)
+        .accessibilityValue(isCurrent ? "Bieżący folder: \(segment.url.path)" : segment.url.path)
         .accessibilityHint("Otwiera folder. Menu kontekstowe zawiera działania dla tego folderu.")
         .accessibilityAddTraits(isCurrent ? .isSelected : [])
         .contextMenu {

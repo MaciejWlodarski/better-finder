@@ -242,7 +242,7 @@ public struct FSearchToolbarSection: View {
         Button {
             activeTab.appendSearchOperator(token)
         } label: {
-            Label(title, systemImage: activeTab.activeFilterPills.contains(where: { $0.rawToken == token }) ? "checkmark" : icon)
+            Label(title, systemImage: ParsedFSearchQuery.containsOperator(token, in: activeTab.searchQuery, pills: activeTab.activeFilterPills) ? "checkmark" : icon)
         }
     }
 

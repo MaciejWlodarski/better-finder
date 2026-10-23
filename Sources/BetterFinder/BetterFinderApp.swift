@@ -274,6 +274,10 @@ struct BetterFinderApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var keyMonitor: Any?
     private var quitFailureAlert: NSAlert?
+    #if BETTERFINDER_TESTING
+    /// Direct-delegate integration harness: captures reply without terminating its process.
+    var terminationReplyForTesting: ((Bool) -> Void)?
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -342,7 +346,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         dismissQuitFailure(nil)
+        #if BETTERFINDER_TESTING
+        let capturedReplyForTesting = terminationReplyForTesting
+        #endif
         let decision = TerminalApplicationLifecycle.shared.beginTermination { [weak self, weak sender] completed in
+            #if BETTERFINDER_TESTING
+            if let capture = capturedReplyForTesting {
+                capture(completed)
+                return
+            }
+            #endif
             // AppKit remains responsive while the owned workers cancel and reap.
             sender?.reply(toApplicationShouldTerminate: completed)
             if !completed { self?.showQuitFailure() }

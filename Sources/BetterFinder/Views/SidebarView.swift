@@ -225,33 +225,27 @@ public struct SidebarView: View {
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
+    // Keep the row's result builders and drag closures separately type-checked.
+    // This preserves the native view/modifier structure without type erasure.
     private func sidebarLocationRow(_ item: SidebarLocationItem) -> some View {
         let isTrash = SystemTrashNavigation.isSystemTrash(item.url, systemTrashURL: appState.systemTrashURL)
         let isSelected = !isTrash && isLocationSelected(item.url)
         let isDropTarget = dropTargetedPath == item.url.path
 
-        return Button {
+        return favoriteAccessibleButton(item, isTrash: isTrash, isSelected: isSelected, isDropTarget: isDropTarget)
+            .contextMenu { favoriteContextMenu(item, isTrash: isTrash) }
+            .onDrag { favoriteDragProvider(for: item) }
+            .onDrop(of: [.fileURL, favoriteDragType], isTargeted: favoriteDropTarget(for: item)) { providers in
+                receiveFavoriteDrop(providers, item: item, isTrash: isTrash)
+            }
+    }
+
+    private func favoriteAccessibleButton(_ item: SidebarLocationItem, isTrash: Bool,
+                                          isSelected: Bool, isDropTarget: Bool) -> some View {
+        Button {
             openFavorite(item.url)
         } label: {
-            HStack(spacing: FinderUI.rowSpacing) {
-                Image(systemName: locationIcon(for: item))
-                    .foregroundStyle(isSelected ? selectedTextColor : Color.accentColor)
-                    .frame(width: FinderUI.sidebarIconWidth)
-                    .accessibilityHidden(true)
-                Text(item.title)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            .foregroundStyle(isSelected ? selectedTextColor : Color.primary)
-            .padding(.horizontal, FinderUI.sidebarRowInset)
-            .frame(minHeight: FinderUI.sidebarRowHeight)
-            .background(rowBackground(isSelected: isSelected, isDropTarget: isDropTarget && favoriteDragNonce == nil))
-            .overlay(alignment: .top) {
-                if isDropTarget && favoriteDragNonce != nil {
-                    Rectangle().fill(Color.accentColor).frame(height: 2).allowsHitTesting(false)
-                }
-            }
-            .contentShape(Rectangle())
+            favoriteRowLabel(item, isSelected: isSelected, isDropTarget: isDropTarget)
         }
         .buttonStyle(.plain)
         .help(isTrash ? "Otwórz Kosz w Finderze" : item.url.path)
@@ -262,57 +256,95 @@ public struct SidebarView: View {
         .accessibilityAction(named: Text("Przesuń wyżej")) { appState.moveFavorite(item, by: -1) }
         .accessibilityAction(named: Text("Przesuń niżej")) { appState.moveFavorite(item, by: 1) }
         .accessibilityAction(named: Text("Usuń z ulubionych")) { appState.removeBookmark(item) }
-        .contextMenu {
-            if !isTrash {
-                Button {
-                    appState.addNewTab(at: item.url)
-                } label: {
-                    Label("Otwórz w nowej karcie", systemImage: "plus.square.on.square")
-                }
-            }
-            Button {
-                if isTrash { openFavorite(item.url) }
-                else { NSWorkspace.shared.open(item.url) }
-            } label: {
-                Label(isTrash ? "Otwórz Kosz w Finderze" : "Otwórz w Finderze", systemImage: isTrash ? "trash" : "folder")
-            }
-            Button {
-                FileOperationsManager.shared.copyPathString(item.url.path)
-            } label: {
-                Label("Kopiuj ścieżkę", systemImage: "doc.on.doc")
-            }
-            Divider()
-            Button("Zmień nazwę w ulubionych…", systemImage: "pencil") {
-                favoriteTitle = item.title
-                renamingFavorite = item
-            }
-            .disabled(appState.pinnedFolderNotice != nil)
-            Button("Przesuń wyżej", systemImage: "arrow.up") {
-                appState.moveFavorite(item, by: -1)
-            }
-            .disabled(appState.pinnedFolderNotice != nil || appState.favorites.first?.id == item.id)
-            Button("Przesuń niżej", systemImage: "arrow.down") {
-                appState.moveFavorite(item, by: 1)
-            }
-            .disabled(appState.pinnedFolderNotice != nil || appState.favorites.last?.id == item.id)
-            Button("Usuń z ulubionych", systemImage: "minus.circle") {
-                appState.removeBookmark(item)
-            }
-            .disabled(appState.pinnedFolderNotice != nil)
+    }
+
+    private func favoriteRowLabel(_ item: SidebarLocationItem, isSelected: Bool, isDropTarget: Bool) -> some View {
+        HStack(spacing: FinderUI.rowSpacing) {
+            Image(systemName: locationIcon(for: item))
+                .foregroundStyle(isSelected ? selectedTextColor : Color.accentColor)
+                .frame(width: FinderUI.sidebarIconWidth)
+                .accessibilityHidden(true)
+            Text(item.title)
+                .lineLimit(1)
+            Spacer(minLength: 0)
         }
-        .onDrag {
-            let nonce = UUID()
-            draggedFavoriteID = appState.pinnedFolderNotice == nil ? item.id : nil
-            favoriteDragNonce = appState.pinnedFolderNotice == nil ? nonce : nil
-            let data = Data("\(nonce.uuidString)\n\(item.id)".utf8)
-            let provider = NSItemProvider()
-            provider.registerDataRepresentation(forTypeIdentifier: favoriteDragType.identifier, visibility: .ownProcess) { completion in
-                completion(data, nil)
-                return nil
+        .foregroundStyle(isSelected ? selectedTextColor : Color.primary)
+        .padding(.horizontal, FinderUI.sidebarRowInset)
+        .frame(minHeight: FinderUI.sidebarRowHeight)
+        .background(rowBackground(isSelected: isSelected, isDropTarget: isDropTarget && favoriteDragNonce == nil))
+        .overlay(alignment: .top) {
+            if isDropTarget && favoriteDragNonce != nil {
+                Rectangle().fill(Color.accentColor).frame(height: 2).allowsHitTesting(false)
             }
-            return provider
         }
-        .onDrop(of: [.fileURL, favoriteDragType], isTargeted: Binding(
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private func favoriteContextMenu(_ item: SidebarLocationItem, isTrash: Bool) -> some View {
+        favoriteNavigationMenu(item, isTrash: isTrash)
+        Divider()
+        favoriteEditingMenu(item)
+    }
+
+    @ViewBuilder
+    private func favoriteNavigationMenu(_ item: SidebarLocationItem, isTrash: Bool) -> some View {
+        if !isTrash {
+            Button {
+                appState.addNewTab(at: item.url)
+            } label: {
+                Label("Otwórz w nowej karcie", systemImage: "plus.square.on.square")
+            }
+        }
+        Button {
+            if isTrash { openFavorite(item.url) }
+            else { NSWorkspace.shared.open(item.url) }
+        } label: {
+            Label(isTrash ? "Otwórz Kosz w Finderze" : "Otwórz w Finderze", systemImage: isTrash ? "trash" : "folder")
+        }
+        Button {
+            FileOperationsManager.shared.copyPathString(item.url.path)
+        } label: {
+            Label("Kopiuj ścieżkę", systemImage: "doc.on.doc")
+        }
+    }
+
+    @ViewBuilder
+    private func favoriteEditingMenu(_ item: SidebarLocationItem) -> some View {
+        Button("Zmień nazwę w ulubionych…", systemImage: "pencil") {
+            favoriteTitle = item.title
+            renamingFavorite = item
+        }
+        .disabled(appState.pinnedFolderNotice != nil)
+        Button("Przesuń wyżej", systemImage: "arrow.up") {
+            appState.moveFavorite(item, by: -1)
+        }
+        .disabled(appState.pinnedFolderNotice != nil || appState.favorites.first?.id == item.id)
+        Button("Przesuń niżej", systemImage: "arrow.down") {
+            appState.moveFavorite(item, by: 1)
+        }
+        .disabled(appState.pinnedFolderNotice != nil || appState.favorites.last?.id == item.id)
+        Button("Usuń z ulubionych", systemImage: "minus.circle") {
+            appState.removeBookmark(item)
+        }
+        .disabled(appState.pinnedFolderNotice != nil)
+    }
+
+    private func favoriteDragProvider(for item: SidebarLocationItem) -> NSItemProvider {
+        let nonce = UUID()
+        draggedFavoriteID = appState.pinnedFolderNotice == nil ? item.id : nil
+        favoriteDragNonce = appState.pinnedFolderNotice == nil ? nonce : nil
+        let data = Data("\(nonce.uuidString)\n\(item.id)".utf8)
+        let provider = NSItemProvider()
+        provider.registerDataRepresentation(forTypeIdentifier: favoriteDragType.identifier, visibility: .ownProcess) { completion in
+            completion(data, nil)
+            return nil
+        }
+        return provider
+    }
+
+    private func favoriteDropTarget(for item: SidebarLocationItem) -> Binding<Bool> {
+        Binding(
             get: { dropTargetedPath == item.url.path },
             set: { targeted in
                 if targeted {
@@ -321,13 +353,15 @@ public struct SidebarView: View {
                     dropTargetedPath = nil
                 }
             }
-        )) { providers in
-            if providers.contains(where: { $0.hasItemConformingToTypeIdentifier(favoriteDragType.identifier) }) {
-                return reorderFavorite(providers: providers, beforeID: item.id)
-            }
-            guard !isTrash else { return false }
-            return handleDropFiles(providers: providers, into: item.url)
+        )
+    }
+
+    private func receiveFavoriteDrop(_ providers: [NSItemProvider], item: SidebarLocationItem, isTrash: Bool) -> Bool {
+        if providers.contains(where: { $0.hasItemConformingToTypeIdentifier(favoriteDragType.identifier) }) {
+            return reorderFavorite(providers: providers, beforeID: item.id)
         }
+        guard !isTrash else { return false }
+        return handleDropFiles(providers: providers, into: item.url)
     }
 
     private func networkServerRow(_ server: NetworkVolumeGroup) -> some View {

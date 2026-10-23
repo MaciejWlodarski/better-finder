@@ -20,3 +20,5 @@ jobs:
         run: zsh ./build_app.sh
       - name: Run isolated production-path regressions
         run: zsh ./scripts/run_tests.sh
+      - name: Run direct-delegate live terminal integration
+        run: zsh ./scripts/run_terminal_live_integration.sh

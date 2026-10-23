@@ -154,6 +154,7 @@ public struct EmbeddedTerminalDrawerView: View {
     @ViewState private var commandHistory: [String] = []
     @ViewState private var isRunning: Bool = false
     @ViewState private var session: TerminalCommandSession?
+    @ViewState private var commandToken: UUID?
     @FocusState private var isInputFocused: Bool
 
     private let quickCommands = ["git status -sb", "ls -la", "du -sh * | sort -h", "git log -n 5 --oneline"]
@@ -297,6 +298,7 @@ public struct EmbeddedTerminalDrawerView: View {
         .onDisappear {
             session?.cancel()
             session = nil
+            commandToken = nil
             isRunning = false
         }
     }
@@ -313,6 +315,7 @@ public struct EmbeddedTerminalDrawerView: View {
         .accessibilityLabel(label)
     }
 
+    @MainActor
     private func executeCommand(_ rawCmd: String) {
         guard !isRunning else { return }
         let dirURL = activeTab.currentURL
@@ -344,35 +347,34 @@ public struct EmbeddedTerminalDrawerView: View {
             return
         }
 
-        isRunning = true
-        let current = TerminalCommandSession()
-        session = current
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let result = try current.run(command: rawCmd, directory: dirURL)
-                Task { @MainActor in
-                    guard self.session === current else { return }
-                    // stdout/stderr are intentionally merged in their observed arrival order.
-                    self.transcript.appendOutput(result.output)
-                    if result.wasTruncated {
-                        self.transcript.append(text: "[Wyjście ograniczone do 1 MiB; dalsze dane odczytano i pominięto.]", isCommand: false, isError: false)
-                    }
-                    if result.wasCancelled || result.status != 0 {
-                        self.transcript.append(text: result.wasCancelled ? "[Polecenie przerwane]" : "[Polecenie zakończone błędem: \(result.status)]", isCommand: false, isError: true)
-                    }
-                    self.isRunning = false
-                    self.session = nil
-                    FSearchIndex.shared.enqueueDirectoryRefresh(dirURL.path)
-                    if self.activeTab.currentURL.path == dirURL.path { self.activeTab.reloadDirectory() }
+        let token = UUID()
+        commandToken = token
+        guard let current = TerminalApplicationLifecycle.shared.start(command: rawCmd, directory: dirURL, completion: { result in
+            // Worker ownership was released independently of this stale-view check.
+            guard self.commandToken == token else { return }
+            switch result {
+            case .success(let result):
+                self.transcript.appendOutput(result.output)
+                if result.wasTruncated {
+                    self.transcript.append(text: "[Wyjście ograniczone do 1 MiB; dalsze dane odczytano i pominięto.]", isCommand: false, isError: false)
                 }
-            } catch {
-                Task { @MainActor in
-                    guard self.session === current else { return }
-                    self.transcript.append(text: "Błąd wykonania: \(error.localizedDescription)", isCommand: false, isError: true)
-                    self.isRunning = false
-                    self.session = nil
+                if result.wasCancelled || result.status != 0 {
+                    self.transcript.append(text: result.wasCancelled ? "[Polecenie przerwane]" : "[Polecenie zakończone błędem: \(result.status)]", isCommand: false, isError: true)
                 }
+                FSearchIndex.shared.enqueueDirectoryRefresh(dirURL.path)
+                if self.activeTab.currentURL.path == dirURL.path { self.activeTab.reloadDirectory() }
+            case .failure(let error):
+                self.transcript.append(text: "Błąd wykonania: \(error.localizedDescription)", isCommand: false, isError: true)
             }
+            self.isRunning = false
+            self.session = nil
+            self.commandToken = nil
+        }) else {
+            commandToken = nil
+            transcript.append(text: "[Trwa zamykanie aplikacji; polecenie nie zostało uruchomione.]", isCommand: false, isError: true)
+            return
         }
+        isRunning = true
+        session = current
     }
 }

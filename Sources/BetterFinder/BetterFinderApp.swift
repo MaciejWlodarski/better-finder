@@ -273,6 +273,7 @@ struct BetterFinderApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var keyMonitor: Any?
+    private var quitFailureAlert: NSAlert?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -337,6 +338,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return event
         }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        dismissQuitFailure(nil)
+        let decision = TerminalApplicationLifecycle.shared.beginTermination { [weak self, weak sender] completed in
+            // AppKit remains responsive while the owned workers cancel and reap.
+            sender?.reply(toApplicationShouldTerminate: completed)
+            if !completed { self?.showQuitFailure() }
+        }
+        switch decision {
+        case .now: return .terminateNow
+        case .later: return .terminateLater
+        }
+    }
+
+    private func showQuitFailure() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Nie można jeszcze zamknąć aplikacji"
+        alert.informativeText = "Nie potwierdzono zakończenia wszystkich poleceń terminala w ciągu 5 sekund. Anulowano zamykanie aplikacji. Przerywanie poleceń trwa nadal; możesz ponownie wybrać Zakończ. Wymuszenie zamknięcia nie gwarantuje zakończenia procesów."
+        let button = alert.addButton(withTitle: "OK")
+        button.target = self
+        button.action = #selector(dismissQuitFailure(_:))
+        quitFailureAlert = alert
+        // A modeless alert also works when no document window remains. Never block
+        // the main actor: worker completions must still release their leases.
+        alert.window.center()
+        alert.window.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func dismissQuitFailure(_ sender: Any?) {
+        quitFailureAlert?.window.close()
+        quitFailureAlert = nil
     }
 
     func applicationWillTerminate(_ notification: Notification) {

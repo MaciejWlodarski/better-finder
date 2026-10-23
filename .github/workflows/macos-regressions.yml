@@ -16,3 +16,190 @@ jobs:
         run: zsh ./build_app.sh
       - name: Run isolated production-path regressions
         run: zsh ./scripts/run_tests.sh
+      - name: Render isolated native preview
+        id: native_preview
+        timeout-minutes: 5
+        run: python3 scripts/run_preview_ci.py
+      - name: Upload bounded synthetic native renders
+        if: success() && steps.native_preview.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-view-renders-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .build/previews-ci-artifact/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+  terminal_shutdown_probe:
+    if: >-
+      ${{ github.event_name == 'pull_request' &&
+          github.event.action == 'opened' &&
+          github.run_attempt == '1' &&
+          github.repository == 'MaciejWlodarski/better-finder' &&
+          github.event.pull_request.base.repo.full_name == 'MaciejWlodarski/better-finder' &&
+          github.event.pull_request.base.ref == 'docs/integrated-features-native-view' &&
+          github.event.pull_request.base.sha == '2bb1f6261e004e25b4bd6bdd7197d46a343251e4' &&
+          github.event.pull_request.head.repo.full_name == 'MaciejWlodarski/better-finder' &&
+          github.event.pull_request.head.ref == 'experimental/terminal-shutdown-once-20261023-v4' &&
+          github.event.pull_request.draft == true }}
+    needs: macos
+    runs-on: macos-14
+    timeout-minutes: 12
+    env:
+      BF_PROBE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MaciejWlodarski/better-finder
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Run bounded synthetic shutdown diagnostic
+        id: shutdown_probe
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, sys
+          try:
+              root = pathlib.Path.cwd().resolve()
+              head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], timeout=5, stderr=subprocess.DEVNULL).decode().strip()
+              expected = os.environ['BF_PROBE_HEAD_SHA']
+              assert re.fullmatch('[0-9a-f]{40}', expected) and head == expected
+              assert os.environ['GITHUB_EVENT_NAME'] == 'pull_request'
+              assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+              assert os.environ['GITHUB_REPOSITORY'] == 'MaciejWlodarski/better-finder'
+              event = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_bytes())
+              pr = event['pull_request']
+              assert event['action'] == 'opened' and pr['draft'] is True
+              assert event['repository']['full_name'] == 'MaciejWlodarski/better-finder'
+              assert pr['base']['repo']['full_name'] == 'MaciejWlodarski/better-finder'
+              assert pr['base']['ref'] == 'docs/integrated-features-native-view'
+              assert pr['base']['sha'] == '2bb1f6261e004e25b4bd6bdd7197d46a343251e4'
+              assert pr['head']['repo']['full_name'] == 'MaciejWlodarski/better-finder'
+              assert pr['head']['ref'] == 'experimental/terminal-shutdown-once-20261023-v4'
+              assert pr['head']['sha'] == expected
+              names = subprocess.check_output(['git', 'ls-files', '-z'], timeout=5, stderr=subprocess.DEVNULL).decode().split('\0')
+              files = []
+              for name in sorted(filter(None, names)):
+                  path = root / name
+                  assert path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(root)
+                  files.append({'path': name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+              target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'bf-shutdown-manifest.json'
+              target.write_text(json.dumps({'schema': 2, 'file_count': len(files), 'files': files}, sort_keys=True) + '\n')
+          except Exception:
+              sys.exit('Shutdown probe: INCONCLUSIVE; stage=manifest')
+          PY
+          status=0
+          python3 scripts/run_terminal_shutdown_probe.py --approved-ephemeral-runner --manifest "$RUNNER_TEMP/bf-shutdown-manifest.json" > "$RUNNER_TEMP/bf-shutdown-result.json" 2>/dev/null || status=$?
+          python3 - "$status" <<'PY'
+          import hashlib, json, math, os, pathlib, re, sys
+          MAX_BYTES = 16384
+          STAGES = {'preflight','build-c','build-swift','sign','helper-controls','cancel-controls',
+                    'quit-cases','identity','startup','shutdown','protocol','cleanup','complete'}
+
+          REASONS = {'approved-runner-required','kqueue-unavailable','platform-identity-invalid',
+                     'child-retention-contract','manifest-invalid','input-path-invalid',
+                     'source-manifest-mismatch','native-constants-invalid','nosigpipe-setup-failed',
+                     'safety-failure','unavailable'}
+
+          OPERATIONS = {'quit-cases', 'sdk', 'helper-controls', 'cancel-controls', 'sign', 'preflight', 'version-swift', 'transform', 'none', 'compile-c', 'version-clang', 'constants', 'compile-swift', 'bundle'}
+          PHASES = {'cleanup-drain', 'tool-work', 'kqueue-decode', 'none', 'cleanup-root-remove', 'kqueue-register', 'launch', 'operation', 'pipe-nonblocking', 'cleanup-reap', 'cleanup-owner-finalizer', 'kqueue-create', 'tool-observe', 'cleanup-root-finalizer', 'cleanup-group-proof', 'cleanup-term', 'unavailable', 'kevent-create', 'cleanup-pipe-close', 'cleanup-case-finalizer', 'cleanup-signal-result', 'cleanup-launch-outcome', 'cleanup-kill', 'cleanup-kqueue-close'}
+          SAFETY_SUBTYPES = {'launch-outcome-unverified', 'sigchld-preflight-timeout', 'app-case-cleanup-failed', 'owned-child-cleanup-timeout', 'final-cleanup-unverified', 'sigchld-auto-reap-detected', 'fixture-cleanup-unverified', 'helper-case-cleanup-failed', 'fixture-cleanup-query-unavailable', 'owned-child-signal-failed', 'owned-group-cleanup-unverified'}
+          CATEGORIES = REASONS | {'os-other', 'owned-child-cleanup-timeout', 'os-no-process', 'outer-cancel-or-deadline', 'sigchld-auto-reap-detected', 'tool-timeout', 'none', 'os-no-child', 'wait-timeout', 'fixture-cleanup-unverified', 'app-case-cleanup-failed', 'child-retention-contract-missing', 'final-cleanup-unverified', 'tool-failed', 'helper-case-cleanup-failed', 'os-not-found', 'fixture-cleanup-query-unavailable', 'unexpected-process-event', 'launch-outcome-unverified', 'os-unsupported', 'process-event-error', 'os-permission', 'owned-child-signal-failed', 'owned-group-cleanup-unverified', 'sigchld-preflight-timeout', 'missing-exit-event'}
+
+          def validate_failure(data):
+              assert set(data) == {'schema','result','clean_success','stage','reason','diagnostic'} and data['schema'] == 2
+              result, stage, reason = data['result'], data['stage'], data['reason']
+              assert result in {'INCONCLUSIVE','SAFETY_FAILURE'} and data['clean_success'] is False
+              assert stage in STAGES and reason in REASONS
+              assert (result == 'SAFETY_FAILURE') == (reason == 'safety-failure')
+              diag = data['diagnostic']
+              assert type(diag) is dict and set(diag) == {'first_operation','first_phase','first_category',
+                     'cleanup_operation','cleanup_phase','cleanup_category','safety_subtype'}
+              assert all(type(value) is str for value in diag.values())
+              assert diag['first_operation'] in OPERATIONS and diag['cleanup_operation'] in OPERATIONS
+              assert diag['first_phase'] in PHASES and diag['cleanup_phase'] in PHASES
+              assert diag['first_category'] in CATEGORIES and diag['cleanup_category'] in CATEGORIES
+              assert diag['safety_subtype'] in SAFETY_SUBTYPES | {'none','unavailable'}
+              assert (result == 'SAFETY_FAILURE') == (diag['safety_subtype'] != 'none')
+              for prefix in ('first','cleanup'):
+                  fields = [diag[prefix + '_' + key] for key in ('operation','phase','category')]
+                  assert all(value == 'none' for value in fields) or all(value != 'none' for value in fields)
+              assert diag['cleanup_phase'] == 'none' or diag['cleanup_phase'].startswith('cleanup-')
+              assert not diag['first_phase'].startswith('cleanup-')
+              return ('Shutdown probe: ' + result + '; stage=' + stage + '; reason=' + reason +
+                      '; diagnostic=' + json.dumps(diag, sort_keys=True))
+
+          def validate(data, manifest_bytes, commit):
+              assert set(data) == {'schema','result','configuration','transform_sha256','source_manifest_sha256',
+                                   'darwin_release','architecture','swift_version','clang_version','cases'}
+              assert data['schema'] == 2 and data['result'] == 'COMPLETE'
+              assert data['configuration'] == 'restoration-disabled-single-process'
+              assert re.fullmatch('[0-9a-f]{64}', data['transform_sha256'])
+              assert data['source_manifest_sha256'] == hashlib.sha256(manifest_bytes).hexdigest()
+              assert data['architecture'] in {'arm64','x86_64'}
+              for key in ('darwin_release','swift_version','clang_version'):
+                  assert re.fullmatch(r'[0-9]+(?:\.[0-9]+){0,3}', data[key]) and len(data[key]) <= 32
+              expected = ['helper-' + mode + '-' + action for mode in ('default','resistant')
+                          for action in ('cleanup','eof','deadline')]
+              expected += ['cancel-default','cancel-resistant','quit-default','quit-resistant']
+              assert len(data['cases']) == 10
+              for case, name in zip(data['cases'], expected):
+                  assert case['case'] == name and case['cleanup'] == 'verified'
+                  if name.startswith('helper-'):
+                      assert set(case) == {'case','result','cleanup'} and case['result'] == 'CONTROL_PASS'
+                      continue
+                  assert set(case) == {'case','result','cleanup','normal_exit','restoration_enabled',
+                                       'persistence_tested','post_exit_response','quit_to_exit_observation_ms',
+                                       'challenge_roundtrip_ms'}
+                  assert case['normal_exit'] is True and case['restoration_enabled'] is False
+                  assert case['persistence_tested'] is False and type(case['post_exit_response']) is bool
+                  elapsed = case['quit_to_exit_observation_ms']
+                  assert type(elapsed) in (int,float) and math.isfinite(elapsed) and 0 <= elapsed <= 5000
+                  if name.startswith('cancel-'):
+                      assert case['result'] == 'CONTROL_PASS' and not case['post_exit_response']
+                  else:
+                      assert case['result'] == ('CONFIRMED' if case['post_exit_response'] else 'INCONCLUSIVE')
+                  duration = case['challenge_roundtrip_ms']
+                  if case['post_exit_response']:
+                      assert type(duration) in (int,float) and math.isfinite(duration) and 0 <= duration <= 1000
+                  else:
+                      assert duration is None
+              assert re.fullmatch('[0-9a-f]{40}', commit)
+              return {'reviewed_commit': commit, 'probe': data}
+
+          def main():
+              status = int(sys.argv[1])
+              root = pathlib.Path(os.environ['RUNNER_TEMP'])
+              try:
+                  path = root / 'bf-shutdown-result.json'
+                  assert path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= MAX_BYTES
+                  data = json.loads(path.read_bytes())
+                  if status:
+                      print(validate_failure(data))
+                      return 1
+                  manifest = (root / 'bf-shutdown-manifest.json').read_bytes()
+                  output = validate(data, manifest, os.environ['BF_PROBE_HEAD_SHA'])
+                  payload = (json.dumps(output, sort_keys=True, allow_nan=False) + '\n').encode()
+                  assert len(payload) <= MAX_BYTES
+                  dest = pathlib.Path('.build/shutdown-probe-artifact')
+                  assert not dest.exists()
+                  dest.mkdir(parents=True)
+                  (dest / 'result.json').write_bytes(payload)
+                  print('Shutdown probe completed with verified cleanup; fixed JSON staged.')
+                  return 0
+              except Exception:
+                  print('Shutdown probe: INCONCLUSIVE; stage=unavailable')
+                  return 1
+
+          if __name__ == '__main__':
+              sys.exit(main())
+          PY
+      - name: Upload fixed shutdown diagnostic JSON
+        if: success() && steps.shutdown_probe.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-shutdown-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .build/shutdown-probe-artifact/result.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

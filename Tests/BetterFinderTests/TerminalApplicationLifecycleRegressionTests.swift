@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 @MainActor
 struct TerminalApplicationLifecycleRegressionTests {
@@ -8,6 +9,7 @@ struct TerminalApplicationLifecycleRegressionTests {
         try testTimeoutRetryAndStaleCallbacks()
         try await testHeldProductionStarts()
         try await testProductionWorkerCompletion()
+        try await testNestedModalDelivery()
     }
 
     private func testEmptyAndPendingAdmission() throws {
@@ -122,14 +124,78 @@ struct TerminalApplicationLifecycleRegressionTests {
         // Even a synchronous test enqueuer cannot synchronously release/reply;
         // start() always marshals completion asynchronously to the main actor.
         try expect(replies.isEmpty && completions == 0)
-        for _ in 0..<100 where completions < 1 { try await Task.sleep(nanoseconds: 1_000_000) }
+        for _ in 0..<100 where completions < 1 { pumpDefaultRunLoop(); try await Task.sleep(nanoseconds: 1_000_000) }
         try expect(completions == 1 && lifecycle.activeCount == 1 && replies.isEmpty)
         workers.removeFirst()()
-        for _ in 0..<100 where completions < 2 { try await Task.sleep(nanoseconds: 1_000_000) }
+        for _ in 0..<100 where completions < 2 { pumpDefaultRunLoop(); try await Task.sleep(nanoseconds: 1_000_000) }
         try expect(completions == 2 && replies == [true] && lifecycle.activeCount == 0)
         try expect(firstLease == nil && secondLease == nil)
         deadlines[0]()
         try expect(replies == [true])
+    }
+
+    // The async CLI runner is not NSApplication.main; explicitly service the
+    // default run loop when testing the production delivery mechanism.
+    private func pumpDefaultRunLoop() {
+        precondition(Thread.isMainThread)
+        _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false)
+    }
+
+    private func testNestedModalDelivery() async throws {
+        let failure: String? = await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                // Keep this dispatch callback on the stack while pumping modal
+                // mode, the boundary created by AppKit's terminateLater contract.
+                func pumpModal(until condition: () -> Bool, seconds: TimeInterval) {
+                    let limit = DispatchTime.now().uptimeNanoseconds + UInt64(seconds * 1_000_000_000)
+                    let timer = Timer(timeInterval: 0.01, repeats: true) { _ in }
+                    RunLoop.main.add(timer, forMode: .modalPanel)
+                    defer { timer.invalidate() }
+                    while !condition() && DispatchTime.now().uptimeNanoseconds < limit {
+                        _ = CFRunLoopRunInMode(RunLoop.Mode.modalPanel.rawValue as CFString, 0.01, false)
+                    }
+                }
+                var legacyDispatch = false
+                var legacyActor = false
+                DispatchQueue.main.async { legacyDispatch = true }
+                Task { @MainActor in legacyActor = true }
+                pumpModal(until: { false }, seconds: 0.05)
+                guard !legacyDispatch && !legacyActor else {
+                    continuation.resume(returning: "Nested-loop negative control did not reproduce queued delivery starvation")
+                    return
+                }
+
+                let lifecycle = TerminalApplicationLifecycle(timeout: 1.5)
+                var completed = 0
+                var replies: [Bool] = []
+                _ = lifecycle.start(command: "sleep 30", directory: URL(fileURLWithPath: "/tmp")) { _ in completed += 1 }
+                _ = lifecycle.beginTermination { replies.append($0) }
+                pumpModal(until: { !replies.isEmpty }, seconds: 2)
+                guard replies == [true], completed == 1, lifecycle.activeCount == 0 else {
+                    continuation.resume(returning: "Production worker completion did not drain in nested modal mode")
+                    return
+                }
+
+                var held: [@Sendable () -> Void] = []
+                let stalled = TerminalApplicationLifecycle(timeout: 0.05, enqueueWorker: { held.append($0) })
+                var refused: [Bool] = []
+                _ = stalled.start(command: "exit 0", directory: URL(fileURLWithPath: "/tmp")) { _ in }
+                _ = stalled.beginTermination { refused.append($0) }
+                pumpModal(until: { !refused.isEmpty }, seconds: 1)
+                guard refused == [false], stalled.activeCount == 1, held.count == 1 else {
+                    continuation.resume(returning: "Production deadline did not refuse quit and retain lease in modal mode")
+                    return
+                }
+                held.removeFirst()()
+                pumpModal(until: { stalled.activeCount == 0 }, seconds: 1)
+                guard stalled.activeCount == 0, refused == [false], !legacyDispatch, !legacyActor else {
+                    continuation.resume(returning: "Late completion or nested-dispatch ownership violated")
+                    return
+                }
+                continuation.resume(returning: nil)
+            }
+        }
+        if let failure { throw RegressionFailure(description: failure) }
     }
 
     private func testProductionWorkerCompletion() async throws {
@@ -138,7 +204,7 @@ struct TerminalApplicationLifecycleRegressionTests {
         var result: Result<TerminalCommandResult, Error>?
         let session = lifecycle.start(command: "exit 7", directory: directory) { result = $0 }
         try expect(session != nil && lifecycle.activeCount == 1)
-        for _ in 0..<500 where result == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        for _ in 0..<500 where result == nil { pumpDefaultRunLoop(); try await Task.sleep(nanoseconds: 10_000_000) }
         try expect(result != nil && lifecycle.activeCount == 0)
         if case .success(let value) = result { try expect(value.status == 7) }
         else { throw RegressionFailure(description: "Production terminal worker did not return exit 7") }
@@ -148,7 +214,7 @@ struct TerminalApplicationLifecycleRegressionTests {
         _ = lifecycle.start(command: "exit 0", directory: directory.appendingPathComponent(UUID().uuidString)) { result in
             if case .failure = result { failures += 1 }
         }
-        for _ in 0..<500 where lifecycle.activeCount != 0 { try await Task.sleep(nanoseconds: 10_000_000) }
+        for _ in 0..<500 where lifecycle.activeCount != 0 { pumpDefaultRunLoop(); try await Task.sleep(nanoseconds: 10_000_000) }
         try expect(failures == 1 && lifecycle.activeCount == 0)
 
         // Quit can be requested immediately after enqueue, before any main-actor
@@ -160,7 +226,7 @@ struct TerminalApplicationLifecycleRegressionTests {
         }
         try expect(cancelling != nil)
         try expect(lifecycle.beginTermination { replies.append($0) } == .later)
-        for _ in 0..<500 where replies.isEmpty { try await Task.sleep(nanoseconds: 10_000_000) }
+        for _ in 0..<500 where replies.isEmpty { pumpDefaultRunLoop(); try await Task.sleep(nanoseconds: 10_000_000) }
         try expect(replies == [true] && cancellations == 1 && lifecycle.activeCount == 0)
     }
 }

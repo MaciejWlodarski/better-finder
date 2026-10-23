@@ -1,4 +1,31 @@
 import Foundation
+import AppKit
+
+/// AppKit terminateLater pumps modalPanel mode, possibly inside an active main-
+/// dispatch callback. Main-queue/Task hops cannot reliably escape that nesting.
+/// Deliver directly through the main run loop without changing its common modes.
+enum TerminalMainRunLoop {
+    static func perform(_ work: @escaping @MainActor @Sendable () -> Void) {
+        let main = CFRunLoopGetMain()
+        // eventTracking preserves completion/timeout service during UI tracking.
+        let modes = [RunLoop.Mode.default.rawValue, RunLoop.Mode.modalPanel.rawValue,
+                     RunLoop.Mode.eventTracking.rawValue] as CFArray
+        CFRunLoopPerformBlock(main, modes) {
+            // CFRunLoopGetMain guarantees main-thread execution. This checked
+            // synchronous bridge must not enqueue another main-actor Task.
+            MainActor.assumeIsolated { work() }
+        }
+        CFRunLoopWakeUp(main)
+    }
+
+    static func after(_ delay: TimeInterval, work: @escaping @MainActor @Sendable () -> Void) {
+        // Monotonic deadline timing must also be independent of the main queue.
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) {
+            perform(work)
+        }
+    }
+}
+
 
 /// Owns admitted drawer workers independently of SwiftUI view identity/lifetime.
 /// This barrier covers normal application quit and the existing session's foreground
@@ -8,7 +35,7 @@ final class TerminalApplicationLifecycle {
     static let shared = TerminalApplicationLifecycle()
 
     enum TerminationDecision: Equatable { case now, later }
-    typealias DeadlineScheduler = (TimeInterval, @escaping @MainActor () -> Void) -> Void
+    typealias DeadlineScheduler = (TimeInterval, @escaping @MainActor @Sendable () -> Void) -> Void
     typealias WorkerEnqueuer = (@escaping @Sendable () -> Void) -> Void
     private let enqueueWorker: WorkerEnqueuer
     private var sessions: [ObjectIdentifier: TerminalCommandSession] = [:]
@@ -22,7 +49,7 @@ final class TerminalApplicationLifecycle {
          enqueueWorker: @escaping WorkerEnqueuer = { work in
              DispatchQueue.global(qos: .userInitiated).async(execute: work)
          }, scheduleDeadline: @escaping DeadlineScheduler = { delay, work in
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { work() }
+        TerminalMainRunLoop.after(delay, work: work)
     }) {
         self.enqueueWorker = enqueueWorker
         self.timeout = timeout
@@ -46,7 +73,7 @@ final class TerminalApplicationLifecycle {
         guard admit(session) else { return nil }
         enqueueWorker {
             let result = Result { try session.run(command: command, directory: directory) }
-            Task { @MainActor in
+            TerminalMainRunLoop.perform {
                 // Unconditional ownership release, even if the drawer was replaced.
                 self.finished(session)
                 completion(result)

@@ -330,7 +330,7 @@ public struct ParsedFSearchQuery: Sendable {
             }
 
             if (token.hasPrefix("!") || token.hasPrefix("-")) && token.count > 1 {
-                let term = String(token.dropFirst()).lowercased()
+                let term = Self.normalizedNameSearchText(String(token.dropFirst()))
                 result.terms.append(.excluded(term))
                 result.pills.append(ActiveFilterPill(
                     id: "\(idx)-\(token)",
@@ -341,17 +341,17 @@ public struct ParsedFSearchQuery: Sendable {
                     icon: "minus.circle"
                 ))
             } else if token.hasPrefix("^") && token.count > 1 {
-                let term = String(token.dropFirst()).lowercased()
+                let term = Self.normalizedNameSearchText(String(token.dropFirst()))
                 result.terms.append(.prefix(term))
             } else if token.hasSuffix("$") && token.count > 1 {
-                let term = String(token.dropLast()).lowercased()
+                let term = Self.normalizedNameSearchText(String(token.dropLast()))
                 result.terms.append(.suffix(term))
             } else if (token.hasPrefix("\"") && token.hasSuffix("\"") && token.count > 2) ||
                       (token.hasPrefix("'") && token.hasSuffix("'") && token.count > 2) {
-                let inner = decodeQuotedValue(token).lowercased()
+                let inner = Self.normalizedNameSearchText(decodeQuotedValue(token))
                 result.terms.append(.exact(inner))
             } else {
-                let lower = token.lowercased()
+                let lower = Self.normalizedNameSearchText(token)
                 let bytes = Array(lower.utf8)
                 let mask = Self.computeAsciiBitmask(bytes)
                 result.terms.append(.fuzzyOrSubstring(lower, lowerBytes: bytes, charMask: mask))
@@ -359,6 +359,12 @@ public struct ParsedFSearchQuery: Sendable {
         }
 
         return result
+    }
+
+    /// Canonical equivalence for derived name-search data only. Keep raw names,
+    /// operation paths and token spans untouched; edits still count UTF-8 bytes.
+    static func normalizedNameSearchText(_ text: String) -> String {
+        text.lowercased().precomposedStringWithCanonicalMapping
     }
 
     /// Computes a 64-bit ASCII presence bitmask for O(1) Bloom-style rejection

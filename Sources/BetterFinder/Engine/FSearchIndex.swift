@@ -435,7 +435,7 @@ public final class FSearchIndex: @unchecked Sendable {
                 guard let ext = String(bytes: extSlice, encoding: .utf8) else { return nil }
                 offset += extLen
 
-                let lowerBytes = Array(name.lowercased().utf8)
+                let lowerBytes = Array(ParsedFSearchQuery.normalizedNameSearchText(name).utf8)
                 result.append(IndexedFileEntry(
                     name: name,
                     lowerNameUTF8: lowerBytes,
@@ -1082,9 +1082,14 @@ public final class FSearchIndex: @unchecked Sendable {
 
     #if BETTERFINDER_TESTING
     static func ageFilteredEntryMatchesForTesting(_ entry: IndexedFileEntry, rawQuery: String, now: Date) -> Bool {
-        let query = ParsedFSearchQuery.parse(rawQuery, fuzzyEnabled: false)
-        guard query.validationError == nil else { return false }
-        return evaluateEntry(entry, query: query, compiledRegex: nil, gitStatusMap: [:], now: now) != nil
+        entrySearchScoreForTesting(entry, rawQuery: rawQuery, fuzzyEnabled: false, now: now) != nil
+    }
+
+    static func entrySearchScoreForTesting(_ entry: IndexedFileEntry, rawQuery: String,
+                                          fuzzyEnabled: Bool, now: Date) -> Int? {
+        let query = ParsedFSearchQuery.parse(rawQuery, fuzzyEnabled: fuzzyEnabled)
+        guard query.validationError == nil else { return nil }
+        return evaluateEntry(entry, query: query, compiledRegex: nil, gitStatusMap: [:], now: now)
     }
 
     // Expose the production matcher separately from intentional subsequence fallback.

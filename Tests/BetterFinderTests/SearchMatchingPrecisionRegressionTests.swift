@@ -6,6 +6,7 @@ struct SearchMatchingPrecisionRegressionTests {
     static func runAll() throws {
         #if BETTERFINDER_TESTING
         try oneEditAndAdmission()
+        try canonicalNameSearch()
         try fractionalModificationAge()
         print("PASS one-edit alternatives, mask admission, subsequence separation and fractional mtime")
         #endif
@@ -79,6 +80,78 @@ struct SearchMatchingPrecisionRegressionTests {
                 try expect(cancelled.items.isEmpty && cancelled.isPartial)
             }
         }
+    }
+
+    private static func canonicalNameSearch() throws {
+        // Keep explicit scalar spellings: filesystem APIs may decompose either input.
+        let composed = "caf\u{00E9}x"
+        let decomposed = "cafe\u{0301}x"
+        let expectedBytes: [UInt8] = [99, 97, 102, 195, 169, 120]
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        for rawName in [composed, decomposed] {
+            let root = try fixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try Data().write(to: root.appendingPathComponent(rawName))
+            let index = engine(root)
+            index.refreshDirectoryInIndex(root.path)
+            let crawled = BulkCrawler.readDirectoryFast(at: root.path)
+            try expect(crawled.count == 1)
+            try expect(crawled.first?.lowerNameUTF8 == expectedBytes)
+            try expect(crawled.first?.charMask == ParsedFSearchQuery.computeAsciiBitmask(expectedBytes))
+            for queryName in [composed, decomposed] {
+                for scope in [SearchScopeMode.currentFolder, .recursiveFolder, .wholeIndex] {
+                    for fuzzy in [false, true] {
+                        for queryText in [queryName, "\"\(queryName)\"", "^\(queryName)", "\(queryName)$"] {
+                            let result = index.search(rawQuery: queryText, scope: scope, scopeDirectory: root.path,
+                                                      includeHidden: true, fuzzyEnabled: fuzzy)
+                            guard result.items.count == 1 else {
+                                throw RegressionFailure(description: "Canonical name search failed: raw=\(Array(rawName.utf8)), query=\(Array(queryText.utf8)), scope=\(scope), fuzzy=\(fuzzy), actual=\(result.items.map(\.name))")
+                            }
+                            // Preserve filesystem spelling and operation paths, not just Swift's
+                            // canonically-equivalent String equality.
+                            try expect(Array(result.items[0].name.utf8) == Array(crawled[0].name.utf8))
+                            try expect(Array(result.items[0].path.utf8) == Array(crawled[0].fullPath.utf8))
+                            if queryText == queryName { try expect(result.items[0].searchScore == 1100) }
+                        }
+                    }
+                    let excluded = index.search(rawQuery: "^caf !\(queryName)", scope: scope,
+                                                scopeDirectory: root.path, includeHidden: true)
+                    try expect(excluded.items.isEmpty)
+                }
+            }
+            // Model an existing v2 cache whose name and stored mask predate NFC.
+            // Decode must rebuild both derived bytes and mask, without changing raw name/path.
+            let oldBytes = Array(rawName.lowercased().utf8)
+            let oldEntry = IndexedFileEntry(name: rawName, lowerNameUTF8: oldBytes, parentPath: root.path,
+                ext: "", charMask: ParsedFSearchQuery.computeAsciiBitmask(oldBytes), size: 0,
+                mtimeEpoch: 1_700_000_000, isDirectory: false, isSymlink: false, isHidden: false)
+            guard let decoded = index.decodeIndexCache(index.encodeIndexCache([oldEntry])), decoded.count == 1 else {
+                throw RegressionFailure(description: "Canonical name cache round trip failed")
+            }
+            try expect(Array(decoded[0].name.utf8) == Array(rawName.utf8))
+            try expect(Array(decoded[0].fullPath.utf8) == Array(oldEntry.fullPath.utf8))
+            try expect(decoded[0].lowerNameUTF8 == expectedBytes)
+            try expect(decoded[0].charMask == ParsedFSearchQuery.computeAsciiBitmask(expectedBytes))
+            for queryName in [composed, decomposed] {
+                try expect(FSearchIndex.entrySearchScoreForTesting(decoded[0], rawQuery: queryName,
+                    fuzzyEnabled: false, now: now) == 1100)
+                try expect(FSearchIndex.entrySearchScoreForTesting(decoded[0], rawQuery: "\"\(queryName)\"",
+                    fuzzyEnabled: false, now: now) == 600)
+            }
+            for typo in ["caf\u{00E8}x", "cafe\u{0300}x"] {
+                try expect(FSearchIndex.entrySearchScoreForTesting(decoded[0], rawQuery: typo,
+                    fuzzyEnabled: true, now: now) == 340)
+                try expect(FSearchIndex.entrySearchScoreForTesting(decoded[0], rawQuery: typo,
+                    fuzzyEnabled: false, now: now) == nil)
+            }
+        }
+        // Normalization is only for filename terms, never regex/content/path values.
+        let operators = ParsedFSearchQuery.parse("regex:\(decomposed) grep:\(decomposed) in:\(decomposed)")
+        try expect(Array((operators.regexPattern ?? "").utf8) == Array(decomposed.utf8))
+        try expect(Array((operators.grepPattern ?? "").utf8) == Array(decomposed.utf8))
+        try expect(operators.pathSubstrings.map { Array($0.utf8) } == [Array(decomposed.utf8)])
+        let excluded = ParsedFSearchQuery.parse("!\(decomposed)")
+        try expect(Array((excluded.pills.first?.rawToken ?? "").utf8) == Array("!\(decomposed)".utf8))
     }
 
     private static func fractionalModificationAge() throws {

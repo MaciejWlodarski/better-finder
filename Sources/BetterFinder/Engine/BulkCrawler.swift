@@ -197,7 +197,7 @@ public enum BulkCrawler {
                 if name != ".", name != "..", includeHidden || !name.hasPrefix(".") {
                     guard results.count < maxEntries else { return DirectoryReadResult(entries: results, isComplete: false, errorCode: nil) }
                     let ext = (name as NSString).pathExtension.lowercased()
-                    let lower = Array(name.lowercased().utf8)
+                    let lower = Array(ParsedFSearchQuery.normalizedNameSearchText(name).utf8)
                     results.append(IndexedFileEntry(name: name, lowerNameUTF8: lower, parentPath: parent,
                         ext: ext, charMask: ParsedFSearchQuery.computeAsciiBitmask(lower), size: objType == 2 ? 0 : size,
                         mtimeEpoch: Int64(mtime.tv_sec), isDirectory: objType == 2, isSymlink: objType == 5,

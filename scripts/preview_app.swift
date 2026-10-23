@@ -260,7 +260,7 @@ extension NativePreview {
 
     // Failure-only fixed-category counts from this isolated application's own UI.
     // Never print accessibility text, values, paths, class names or other applications.
-    @MainActor static func networkExposureDiagnostic(window: NSWindow, expected: String) -> String {
+    @MainActor static func networkExposureDiagnostic(window: NSWindow, expected: String, output: URL) -> String {
         let state = AppState.shared
         let groups = state.networkServerGroups
         let fixturePresent = groups.contains { $0.title == "studio-preview.invalid" && $0.volumes.count == 2 }
@@ -269,7 +269,8 @@ extension NativePreview {
         var visited = Set<ObjectIdentifier>()
         var inspected = 0
         var truncated = false
-        var exactLabels = 0, fixtureLabels = 0
+        var exactLabels = 0, fixtureLabels = 0, exactTitles = 0
+        var sidebar = false, favorite = false, tag = false
         while !queue.isEmpty && inspected < 2048 {
             let object = queue.removeFirst()
             let identity = ObjectIdentifier(object as AnyObject)
@@ -283,7 +284,11 @@ extension NativePreview {
             }
             if let item = object as? any NSAccessibilityProtocol {
                 let label = item.accessibilityLabel() ?? ""
+                sidebar = sidebar || label == "Pasek boczny"
+                favorite = favorite || label == "Projekty — ręcznie jako pierwsze"
+                tag = tag || FinderTagColor.allCases.contains { label == "Tag: " + $0.displayName }
                 if label == expected { exactLabels += 1 }
+                if item.accessibilityTitle() == expected { exactTitles += 1 }
                 if label.contains("studio-preview.invalid") { fixtureLabels += 1 }
                 let children = item.accessibilityChildren() ?? []
                 let remaining = max(0, 2048 - queue.count)
@@ -291,8 +296,17 @@ extension NativePreview {
                 for child in children.prefix(remaining) { queue.append(child) }
             }
         }
+        let metadata: [String: Any] = [
+            "sidebar": sidebar, "favorite": favorite, "tag": tag,
+            "exactLabel": exactLabels > 0, "exactTitle": exactTitles > 0,
+            "visited": inspected, "truncated": truncated || !queue.isEmpty,
+        ]
+        if let encoded = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]) {
+            try? encoded.write(to: output.appendingPathComponent("diagnostic-network-ax.json"), options: .atomic)
+        }
         if !fixturePresent { return "broad network exposure: fixture missing" }
         if exactLabels > 0 { return "broad network exposure: exact label in view-seeded hierarchy" }
+        if exactTitles > 0 { return "broad network exposure: exact native title without label" }
         if fixtureLabels > 0 { return "broad network exposure: fixture label differs" }
         if truncated || !queue.isEmpty { return "broad network exposure: traversal capped" }
         return "broad network exposure: fixture present without accessible label"
@@ -355,7 +369,10 @@ extension NativePreview {
         await scene("sidebar-reordered", window: window, base: base)
         let disclosureLabel = "Serwer studio-preview.invalid, 2 udziałów"
         guard let disclosure = accessible(window, label: disclosureLabel) else {
-            require(false, networkExposureDiagnostic(window: window, expected: disclosureLabel)); return
+            // Diagnostic only: the assertion remains failed and this image is not
+            // part of the required passing render set. No desktop/global capture.
+            capture(window, to: base.appendingPathComponent("diagnostic-network-disclosure.png"))
+            require(false, networkExposureDiagnostic(window: window, expected: disclosureLabel, output: base)); return
         }
         require(disclosure.accessibilityPerformPress(), "broad network disclosure action")
         await settle()

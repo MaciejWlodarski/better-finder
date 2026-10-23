@@ -5,6 +5,9 @@ This is not desktop capture, Accessibility automation, or a permission grant.
 Run only on an ephemeral GitHub-hosted macOS runner after code gates pass.
 """
 import os
+import json
+import re
+import stat
 import re
 import ctypes
 import errno
@@ -136,13 +139,92 @@ class PreviewFailure(RuntimeError):
     pass
 
 
+# One own-window failure image, never a successful33-scene replacement.
+DIAG_DEST = ROOT / '.build' / 'previews-ci-diagnostic'
+DIAG_PNG = 'diagnostic-network-disclosure.png'
+DIAG_LIMIT = 1024 * 1024  # Total PNG plus reconstructed metadata, stricter than2MiB.
+DIAG_FAILURES = {
+    'broad network exposure: fixture missing',
+    'broad network exposure: exact label in view-seeded hierarchy',
+    'broad network exposure: fixture label differs',
+    'broad network exposure: traversal capped',
+    'broad network exposure: fixture present without accessible label',
+    'broad network exposure: exact native title without label',
+}
+
+
+class DiagnosticPreviewFailure(PreviewFailure):
+    """Exact network selector failure with validated synthetic diagnostic only."""
+    pass
+
+
+def bounded_regular(path, limit):
+    # No symlink or device/pipe; read at most the fixed bound, never raw paths.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        checked(stat.S_ISREG(info.st_mode) and 0 <= info.st_size <= limit, 'diagnostic-file-bound')
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            data = stream.read(limit + 1)
+        checked(len(data) <= limit and len(data) == info.st_size, 'diagnostic-file-bound')
+        return data
+    finally:
+        os.close(fd)
+
+
+def diagnostic_payload(output, failure):
+    checked(failure in DIAG_FAILURES, 'diagnostic-category')
+    png = bounded_regular(output / DIAG_PNG, DIAG_LIMIT)
+    checked(len(png) >= 24 and png[:8] == b'\x89PNG\r\n\x1a\n' and png[12:16] == b'IHDR', 'diagnostic-png')
+    width, height = struct.unpack('>II', png[16:24])
+    checked(1 <= width <= 3000 and 1 <= height <= 2200, 'diagnostic-dimensions')
+    raw = bounded_regular(output / 'diagnostic-network-ax.json', 1024)
+    # Reject duplicate JSON keys rather than silently keeping the last one.
+    def pairs(values):
+        result = {}
+        for key, value in values:
+            checked(key not in result, 'diagnostic-schema')
+            result[key] = value
+        return result
+    data = json.loads(raw, object_pairs_hook=pairs)
+    flags = {'sidebar', 'favorite', 'tag', 'exactLabel', 'exactTitle', 'truncated'}
+    checked(type(data) is dict and set(data) == flags | {'visited'}, 'diagnostic-schema')
+    checked(all(type(data[key]) is bool for key in flags), 'diagnostic-schema')
+    checked(type(data['visited']) is int and 0 <= data['visited'] <= 2048, 'diagnostic-schema')
+    head = os.environ.get('BF_PREVIEW_HEAD_SHA', '')
+    run = os.environ.get('GITHUB_RUN_ID', '')
+    attempt = os.environ.get('GITHUB_RUN_ATTEMPT', '')
+    checked(re.fullmatch('[0-9a-f]{40}', head) is not None and
+            re.fullmatch('[1-9][0-9]{0,19}', run) is not None and
+            re.fullmatch('[1-9][0-9]{0,9}', attempt) is not None, 'diagnostic-provenance')
+    metadata = {'schema': 1, 'kind': 'synthetic-ui-failure', 'success': False,
+                'failure_category': failure, 'head_sha': head, 'run_id': run,
+                'run_attempt': attempt, 'ax': data}
+    encoded = (json.dumps(metadata, sort_keys=True, separators=(',', ':')) + '\n').encode('ascii')
+    checked(len(encoded) <= 2048 and len(png) + len(encoded) <= DIAG_LIMIT, 'diagnostic-total-bound')
+    return {DIAG_PNG: png, 'diagnostic.json': encoded}
+
+
+def emit_diagnostic_ready():
+    # Hosted Actions command file only. Never serialize its private pathname.
+    path = os.environ.get('GITHUB_OUTPUT', '')
+    checked(os.path.isabs(path), 'diagnostic-output-unavailable')
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        checked(stat.S_ISREG(os.fstat(fd).st_mode), 'diagnostic-output-unavailable')
+        token = b'diagnostic_ready=true\n'
+        checked(os.write(fd, token) == len(token), 'diagnostic-output-unavailable')
+    finally:
+        os.close(fd)
+
+
 CANCELLED = False
 RETENTION_READY = False
 CENSUS = None
 END = 0.0
 SOURCE_PINS = {
     'scripts/preview_app.sh': 'e2508373f2385a04cd29026a38926197d1b245efa19c18e9bfc5bd2eee3761df',
-    'scripts/preview_app.swift': '207cffe520857d445d8943990faeb94494f6ae7827f6b179a2ad579626822f61',
+    'scripts/preview_app.swift': '02dc2af9a833946bb1aad3ed87bece88335835c1c4755dcb6ff4dc7a8fe1dfeb',
 }
 
 
@@ -221,14 +303,17 @@ class PreviewResources:
         self.root = None
         self.staging = None
         self.uncertain = False
+        self.diagnostic = False
 
     def __enter__(self):
         self.root = Path(tempfile.mkdtemp(prefix='better-finder-preview-ci-'))
         return self.root
 
-    def stage(self, payload):
+    def stage(self, payload, diagnostic=False):
         checked(not self.owners and not self.uncertain, 'unverified-cleanup')
         checked(not CANCELLED and time.monotonic() < END, 'artifact-budget-or-cancel')
+        checked(self.staging is None, "artifact-already-staged")
+        self.diagnostic = diagnostic
         DEST.parent.mkdir(parents=True, exist_ok=True)
         self.staging = Path(tempfile.mkdtemp(prefix='.preview-pending-', dir=DEST.parent))
         for name, data in payload.items():
@@ -245,11 +330,20 @@ class PreviewResources:
             except BaseException: errors = True; self.uncertain = True
         # Fixed upload directory appears only after complete disposal and writes.
         if self.staging is not None:
-            if kind is None and not errors:
+            eligible = (kind is None and not self.diagnostic) or (kind is DiagnosticPreviewFailure and self.diagnostic)
+            if eligible and not errors:
                 try:
                     checked(not CANCELLED and time.monotonic() < END, 'artifact-budget-or-cancel')
-                    checked(not DEST.exists(), 'artifact-already-exists')
-                    self.staging.rename(DEST); self.staging = None
+                    destination = DIAG_DEST if self.diagnostic else DEST
+                    checked(not destination.exists(), 'artifact-already-exists')
+                    self.staging.rename(destination); self.staging = None
+                    if self.diagnostic:
+                        try:
+                            checked(not CANCELLED and time.monotonic() < END, 'artifact-budget-or-cancel')
+                            emit_diagnostic_ready()
+                        except BaseException:
+                            shutil.rmtree(destination)  # Only the directory just committed by us.
+                            raise
                 except BaseException: errors = True
             if self.staging is not None:
                 try: shutil.rmtree(self.staging); self.staging = None
@@ -431,7 +525,7 @@ def main():
     CANCELLED = False
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
         raise PreviewFailure("Use only an ephemeral GitHub-hosted macOS runner")
-    if DEST.exists():
+    if DEST.exists() or DIAG_DEST.exists():
         raise PreviewFailure("Artifact directory already exists; use a fresh checkout")
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
@@ -518,9 +612,19 @@ def main():
                         "broad network exposure: fixture label differs",
                         "broad network exposure: traversal capped",
                         "broad network exposure: fixture present without accessible label",
+                        "broad network exposure: exact native title without label",
                     })
-                    if marker.is_file() and marker.stat().st_size <= 2048:
-                        message = marker.read_text().removeprefix("FAIL: ").strip()
+                    if marker.is_file() and not marker.is_symlink() and marker.stat().st_size <= 2048:
+                        message = bounded_regular(marker, 2048).decode("utf8").removeprefix("FAIL: ").strip()
+                        if message in DIAG_FAILURES:
+                            try:
+                                payload = diagnostic_payload(output, message)
+                                resources.stage(payload, diagnostic=True)
+                            except Exception:
+                                # Missing/invalid capture never replaces the original assertion
+                                # with raw metadata, logs or exception text, and never publishes.
+                                raise PreviewFailure("Native preview assertion: " + message + "; diagnostic unavailable") from None
+                            raise DiagnosticPreviewFailure("Native preview assertion: " + message + "; diagnostic only, preview failed")
                         if message in allowed:
                             raise PreviewFailure("Native preview assertion: " + message)
                     # Harness-only compilation/bootstrap failures are distinct from

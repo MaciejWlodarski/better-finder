@@ -38,6 +38,8 @@ jobs:
       - name: Render isolated broad native preview
         id: native_preview
         timeout-minutes: 5
+        env:
+          BF_PREVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: python3 scripts/run_preview_ci.py
       - name: Upload bounded synthetic native renders
         if: success() && steps.native_preview.outcome == 'success'
@@ -45,6 +47,15 @@ jobs:
         with:
           name: broad-native-renders-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .build/previews-ci-artifact/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Upload bounded synthetic failure diagnostic
+        if: failure() && steps.native_preview.outcome == 'failure' && steps.native_preview.outputs.diagnostic_ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: broad-native-diagnostic-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .build/previews-ci-diagnostic/
           if-no-files-found: error
           retention-days: 1
           compression-level: 0

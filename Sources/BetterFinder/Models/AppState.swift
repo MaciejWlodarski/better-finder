@@ -268,6 +268,17 @@ public final class AppState: ObservableObject {
         }
     }
 
+    /// Shell commands can change tags/permissions without changing indexed
+    /// size/mtime. Refresh their consumers independently of index differences.
+    func reconcileTerminalCommand(at path: String) {
+        FSearchIndex.shared.enqueueDirectoryRefresh(path)
+        FileIconCache.shared.invalidate(containing: path)
+        FolderSizeCache.shared.revalidate(containing: path)
+        for tab in tabs + [rightPane] where tab.isAffectedByDirectoryChanges([path]) {
+            tab.reloadDirectory(invalidateCaches: false)
+        }
+    }
+
     private static var initialSidebarFavorites: [SidebarFavoritesStore.Entry] {
         let home = Self.homeDirectoryURL.path
         // Pure initial configuration: never probe disks/cloud roots while restoring the sidebar.

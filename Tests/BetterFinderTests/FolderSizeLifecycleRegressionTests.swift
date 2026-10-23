@@ -162,7 +162,52 @@ struct FolderSizeLifecycleRegressionTests {
         try await testNormalizedAliasesCoalesceAcrossPublicAPI()
         try await testParentComponentsRemainDistinctCacheKeys()
         try testNormalizedKeyPreservesSymlinkParentSpelling()
-        print("PASS 23 folder-size lifecycle checks: ownership, bounded admission, cancellation, invalidation, LRU, demand and lexical keys")
+        try await testReacquiredCachedDemandRevalidatesWithoutErasingValue()
+        try await testRevalidationRetainsPhysicalSlotsAndRejectsOldResult()
+        print("PASS 25 folder-size lifecycle checks: ownership, bounded admission, cancellation, invalidation, LRU, demand and lexical keys")
+    }
+
+    private func testReacquiredCachedDemandRevalidatesWithoutErasingValue() async throws {
+        let gate = FolderSizeCalculatorGate()
+        defer { gate.releaseAll() }
+        let cache = FolderSizeCache(maxWorkers: 1, maxDemand: 4, maxResults: 4,
+            cancellableCalculator: { gate.calculate($0, isCancelled: $1) })
+        let owner = UUID(), replacement = UUID(), path = "/revisit/project"
+        defer { cache.release(owner: owner); cache.release(owner: replacement) }
+        cache.updateDemand(owner: owner, paths: [path])
+        try await waitFor("initial cached size") { gate.startedPaths.count == 1 }
+        gate.complete(0, bytes: 10)
+        try await waitFor("published cached size") { cache.size(for: path) == 10 }
+        cache.release(owner: owner)
+        cache.updateDemand(owner: replacement, paths: [path])
+        try expect(cache.size(for: path) == 10)
+        try await waitFor("revisit revalidation") { gate.startedPaths.count == 2 }
+        gate.complete(1, bytes: 20)
+        try await waitFor("fresh revisited size") { cache.size(for: path) == 20 }
+    }
+
+    private func testRevalidationRetainsPhysicalSlotsAndRejectsOldResult() async throws {
+        let gate = FolderSizeCalculatorGate()
+        defer { gate.releaseAll() }
+        let cache = FolderSizeCache(maxWorkers: 1, maxDemand: 4, maxResults: 4,
+            cancellableCalculator: { gate.calculate($0, isCancelled: $1) })
+        let owner = UUID(), path = "/revisit/project"
+        defer { cache.release(owner: owner) }
+        cache.updateDemand(owner: owner, paths: [path])
+        try await waitFor("initial revalidation fixture") { gate.startedPaths.count == 1 }
+        gate.complete(0, bytes: 10)
+        try await waitFor("initial revalidation result") { cache.size(for: path) == 10 }
+        cache.revalidate(containing: "/revisit")
+        try await waitFor("first refresh worker") { gate.startedPaths.count == 2 }
+        for _ in 0..<20 { cache.revalidate(containing: "/revisit") }
+        try expect(cache.size(for: path) == 10)
+        try expect(cache.debugSnapshot.running == 1 && cache.debugSnapshot.queued == 1)
+        try await expectCancellation(true, call: 1, gate: gate)
+        gate.complete(1, bytes: 999)
+        try await waitFor("coalesced refresh worker") { gate.startedPaths.count == 3 }
+        try expect(cache.size(for: path) == 10 && gate.maximumActiveCount == 1)
+        gate.complete(2, bytes: 30)
+        try await waitFor("latest refresh result") { cache.size(for: path) == 30 }
     }
 
     private func testSharedOwnersCoalesceRepeatedDemand() async throws {
@@ -413,14 +458,16 @@ struct FolderSizeLifecycleRegressionTests {
         try expect(cache.debugSnapshot.running == 1 && cache.debugSnapshot.queued == 1)
         cache.release(owner: occupyingOwner)
         cache.updateDemand(owner: retryOwner, paths: [cached])
-        try expect(cache.debugSnapshot.demanded == 1 && cache.debugSnapshot.queued == 0)
+        try expect(cache.debugSnapshot.demanded == 1 && cache.debugSnapshot.queued == 1)
         try expect(cache.size(for: cached) == 70 && gate.startedPaths.count == 2)
         try await expectCancellation(true, call: 1, gate: gate)
         gate.complete(1, bytes: 99)
-        try await waitFor("obsolete occupying scan return") { cache.debugSnapshot.running == 0 }
+        try await waitFor("cached refresh after obsolete occupying scan") { gate.startedPaths.count == 3 }
         try expect(occupied.allSatisfy { cache.result(for: $0) == nil })
         try expect(cache.size(for: cached) == 70 && cache.debugSnapshot.completed == 1)
-        try expect(gate.startedPaths.count == 2)
+        try expect(gate.startedPaths[2] == cached && gate.maximumActiveCount == 1)
+        gate.complete(2, bytes: 80)
+        try await waitFor("reacquired cached result") { cache.size(for: cached) == 80 }
     }
 
     private func testSaturatedBackgroundAndVisibleDemandPreservesInspectorAdmission() async throws {
@@ -529,13 +576,16 @@ struct FolderSizeLifecycleRegressionTests {
         try expect(cache.displaySize(for: cached) != nil)
         cache.release(owner: backgroundOwner)
         cache.updateDemand(owner: retryOwner, paths: [cached], priority: .background)
-        try expect(cache.debugSnapshot.demanded == 1 && cache.debugSnapshot.queued == 0)
+        try expect(cache.debugSnapshot.demanded == 1 && cache.debugSnapshot.queued == 1)
         try expect(cache.size(for: cached) == 81 && gate.startedPaths.count == 2)
         try await expectCancellation(true, call: 1, gate: gate)
         gate.complete(1, bytes: 99)
-        try await waitFor("retired background scan after cached retry") { cache.debugSnapshot.running == 0 }
+        try await waitFor("cached refresh after retired background scan") { gate.startedPaths.count == 3 }
         try expect(cache.debugSnapshot.completed == 1 && cache.size(for: cached) == 81)
         try expect(background.allSatisfy { cache.result(for: $0) == nil })
+        try expect(gate.startedPaths[2] == cached && gate.maximumActiveCount == 1)
+        gate.complete(2, bytes: 82)
+        try await waitFor("background cached refresh") { cache.size(for: cached) == 82 }
     }
 
     private func testOwnerReplacementRemovesObsoleteDemand() async throws {
@@ -584,15 +634,19 @@ struct FolderSizeLifecycleRegressionTests {
             try await waitFor("idle candidate result \(path)") { cache.result(for: path) != nil }
             cache.release(owner: temporaryOwner)
         }
-        // Reacquiring a cached result makes it recent without a second crawl.
+        // Reacquiring keeps the last value while its bounded recheck makes it recent.
         cache.updateDemand(owner: temporaryOwner, paths: [a])
+        try await waitFor("recent cached result recheck") { gate.startedPaths.count == 4 }
+        try expect(cache.size(for: a) == 1)
+        gate.complete(3, bytes: 1)
+        try await waitFor("recent cached recheck completed") { cache.debugSnapshot.running == 0 }
         cache.release(owner: temporaryOwner)
-        try expect(cache.size(for: a) == 1 && gate.startedPaths.count == 3)
+        try expect(cache.size(for: a) == 1 && gate.startedPaths.count == 4)
         for index in 0..<8 {
             let path = "/folder-size/lru-new-\(index)"
             cache.updateDemand(owner: temporaryOwner, paths: [path])
-            try await waitFor("eviction candidate \(index)") { gate.startedPaths.count == index + 4 }
-            gate.complete(index + 3, bytes: Int64(20 + index))
+            try await waitFor("eviction candidate \(index)") { gate.startedPaths.count == index + 5 }
+            gate.complete(index + 4, bytes: Int64(20 + index))
             try await waitFor("eviction result \(index)") { cache.size(for: path) == Int64(20 + index) }
             try expect(cache.debugSnapshot.completed == 3 && cache.size(for: pinned) == 100)
             if index == 0 {

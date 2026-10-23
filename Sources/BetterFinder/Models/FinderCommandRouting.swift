@@ -1,10 +1,24 @@
 import AppKit
 
+/// A dedicated responder whose keys belong to a control rather than the file pane.
+@MainActor
+protocol FinderFileKeyboardOwner: AnyObject {}
+
 /// Commands can be evaluated without a live application or key window.
 /// Read the optional NSApp global; never create NSApplication as a side effect
 /// of checking whether a command is enabled.
 @MainActor
 enum FinderCommandRouting {
+    /// The local monitor runs before responder delivery. Use the event's own
+    /// window and its live responder, never a global focus flag or key window.
+    static func shouldRouteFileKeyEvent(_ event: NSEvent) -> Bool {
+        guard let window = event.window, !(window is NSPanel),
+              window.sheetParent == nil, window.attachedSheet == nil else { return false }
+        let responder = window.firstResponder
+        return !(responder is NSTextView || responder is NSTextField ||
+                 responder is FinderFileKeyboardOwner)
+    }
+
     static var isEditingText: Bool {
         guard let responder = NSApp?.keyWindow?.firstResponder else { return false }
         return responder is NSTextView || responder is NSTextField

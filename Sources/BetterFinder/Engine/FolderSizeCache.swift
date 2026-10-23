@@ -115,10 +115,11 @@ public final class FolderSizeCache: ObservableObject {
         var accepted = previous.intersection(requested)
         for path in requested.subtracting(accepted).sorted() {
             guard canAdmit(path: path, priority: priority) else { continue }
+            let needsRevalidation = demand[path] == nil && results[path] != nil
             demand[path, default: []].insert(owner)
             accepted.insert(path)
             touch(path)
-            enqueueIfNeeded(path)
+            enqueueIfNeeded(path, refreshingCached: needsRevalidation)
         }
         owners[owner] = accepted.isEmpty ? nil : accepted
         if accepted.isEmpty { priorities.removeValue(forKey: owner) }
@@ -159,8 +160,8 @@ public final class FolderSizeCache: ObservableObject {
             pending.removeAll { $0 == path }
         }
     }
-    private func enqueueIfNeeded(_ path: String) {
-        guard demand[path] != nil, results[path] == nil, current[path] == nil else { return }
+    private func enqueueIfNeeded(_ path: String, refreshingCached: Bool = false) {
+        guard demand[path] != nil, (results[path] == nil || refreshingCached), current[path] == nil else { return }
         current[path] = FolderSizeCancellation()
         pending.append(path)
     }
@@ -256,6 +257,24 @@ public final class FolderSizeCache: ObservableObject {
                 || cached.hasPrefix(normalized == "/" ? "/" : normalized + "/")
         }
         invalidatePaths(Array(affected))
+    }
+
+    /// The search index intentionally skips trees that size calculation includes.
+    /// Recheck live consumers on navigation/command completion without clearing
+    /// their last value. Existing worker and demand limits still own every scan.
+    public func revalidate(containing changedPath: String) {
+        let normalized = key(changedPath)
+        let affected = demand.keys.filter { cached in
+            cached == normalized || normalized.hasPrefix(cached == "/" ? "/" : cached + "/")
+                || cached.hasPrefix(normalized == "/" ? "/" : normalized + "/")
+        }
+        for path in affected {
+            current.removeValue(forKey: path)?.cancel()
+            pending.removeAll { $0 == path }
+            enqueueIfNeeded(path, refreshingCached: true)
+        }
+        drain()
+        changed()
     }
 
     static func columnDemandPaths(items: [FileItem], sortBySize: Bool) -> [String] {

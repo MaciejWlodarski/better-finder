@@ -284,13 +284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            if let responder = NSApp.keyWindow?.firstResponder,
-               responder is NSTextView || responder is NSTextField {
-                return event
-            }
-
-            guard let window = event.window, !(window is NSPanel), window.sheetParent == nil,
-                  window.attachedSheet == nil else { return event }
+            guard FinderCommandRouting.shouldRouteFileKeyEvent(event) else { return event }
             let appState = AppState.shared
             if appState.showQuickFSearchModal || appState.showNewFileSheet ||
                appState.showNewFolderSheet || appState.showCompareSheet ||

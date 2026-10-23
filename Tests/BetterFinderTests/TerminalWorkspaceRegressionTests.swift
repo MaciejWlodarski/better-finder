@@ -4,6 +4,8 @@ import CoreFoundation
 @MainActor
 struct TerminalWorkspaceRegressionTests {
     func runAll() async throws {
+        try TerminalResizeKeyboardFocusRegressionTests.runAll()
+        try await testDirectoryEscapeAndWorkerOwnership()
         let root = URL(fileURLWithPath: ProcessInfo.processInfo.environment["BETTERFINDER_TEST_ROOT"]!)
         var held: [@Sendable () -> Void] = []
         let lifecycle = TerminalApplicationLifecycle(enqueueWorker: { held.append($0) }, scheduleDeadline: { _, _ in })
@@ -102,6 +104,100 @@ struct TerminalWorkspaceRegressionTests {
         pane.refresh()
         try check(cache.result(for: child.path) == nil, "Explicit Refresh still invalidates sizes")
         print("PASS terminal tabs preserve independent state, close ownership and quit barrier")
+    }
+
+    private func testDirectoryEscapeAndWorkerOwnership() async throws {
+        let root = URL(fileURLWithPath: ProcessInfo.processInfo.environment["BETTERFINDER_TEST_ROOT"]!)
+            .appendingPathComponent("terminal-cd-regression-" + UUID().uuidString, isDirectory: true)
+        let original = root.appendingPathComponent("original", isDirectory: true)
+        let destination = root.appendingPathComponent("destination", isDirectory: true)
+        let nested = destination.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: original, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lifecycle = TerminalApplicationLifecycle()
+        var reconciled: [String] = []
+        let tab = TerminalTab(directory: original, lifecycle: lifecycle, reconcile: { reconciled.append($0) })
+        try FileManager.default.removeItem(at: original)
+        tab.execute("cd " + TerminalTab.shellQuote(destination.path))
+        try await wait { !tab.isRunning }
+        try check(tab.directory.path == destination.path, "Absolute cd escapes a removed cwd")
+        try check(!tab.transcript.lines.contains(where: \.isError), "Successful escape has no spawn/chdir error")
+        tab.execute("cd nested")
+        try await wait { !tab.isRunning }
+        try check(tab.directory.path == nested.path, "Relative cd resolves against tab cwd, not stable launch root")
+        tab.execute("cd ..")
+        try await wait { !tab.isRunning }
+        try check(tab.directory.path == destination.path, "Parent cd preserves relative semantics")
+
+        let renamed = root.appendingPathComponent("renamed", isDirectory: true)
+        try FileManager.default.moveItem(at: destination, to: renamed)
+        tab.clear()
+        tab.execute("cd " + TerminalTab.shellQuote(root.appendingPathComponent("missing").path))
+        try await wait { !tab.isRunning }
+        try check(tab.directory.path == destination.path, "Invalid target from renamed cwd preserves tab directory")
+        try check(tab.transcript.lines.contains { $0.isError && $0.text.contains("błędem") }, "Invalid target is validated by builtin cd, not spawn cwd")
+        let regularFile = root.appendingPathComponent("file")
+        try Data("not a directory".utf8).write(to: regularFile)
+        tab.execute("cd " + TerminalTab.shellQuote(regularFile.path))
+        try await wait { !tab.isRunning }
+        try check(tab.directory.path == destination.path, "cd rejects a regular file")
+        tab.execute("cd " + TerminalTab.shellQuote(renamed.path))
+        try await wait { !tab.isRunning }
+        try check(tab.directory.path == renamed.path, "Absolute cd also escapes a renamed cwd")
+        try check(lifecycle.activeCount == 0 && reconciled.isEmpty, "cd retains worker lifecycle without filesystem reconciliation")
+
+        var held: [@Sendable () -> Void] = []
+        let queued = TerminalApplicationLifecycle(enqueueWorker: { held.append($0) }, scheduleDeadline: { _, _ in })
+        let pending = TerminalTab(directory: root, lifecycle: queued, reconcile: { _ in })
+        let transient = root.appendingPathComponent("transient", isDirectory: true)
+        try FileManager.default.createDirectory(at: transient, withIntermediateDirectories: true)
+        pending.execute("cd " + TerminalTab.shellQuote(transient.path))
+        try check(pending.isRunning && queued.activeCount == 1 && held.count == 1, "cd admission precedes worker validation")
+        try check(pending.directory.path == root.path, "cd cannot commit before its worker completes")
+        // Removing the target after admission must be observed by the worker.
+        try FileManager.default.removeItem(at: transient)
+        held.removeFirst()()
+        try await wait { !pending.isRunning }
+        try check(pending.directory.path == root.path && queued.activeCount == 0, "Target validation occurs inside the worker")
+
+        pending.execute("cd " + TerminalTab.shellQuote(renamed.path))
+        pending.cancel()
+        held.removeFirst()()
+        try await wait { !pending.isRunning }
+        try check(pending.directory.path == root.path && queued.activeCount == 0, "Cancellation before spawn cannot commit cd")
+        try check(pending.transcript.lines.contains { $0.isError && $0.text.contains("przerwane") }, "Cancelled cd reports cancellation")
+
+        pending.execute("cd " + TerminalTab.shellQuote(renamed.path))
+        // Complete physical work, then close before the main-loop completion.
+        held.removeFirst()()
+        pending.close()
+        let closedTranscript = pending.transcript.lines.map(\.text)
+        try await wait { queued.activeCount == 0 }
+        try check(pending.directory.path == root.path && pending.transcript.lines.map(\.text) == closedTranscript,
+                  "Closed tab token fences even a successful late cd completion")
+
+        var capacityWorkers: [@Sendable () -> Void] = []
+        let capped = TerminalApplicationLifecycle(enqueueWorker: { capacityWorkers.append($0) }, scheduleDeadline: { _, _ in })
+        var tabs: [TerminalTab] = []
+        for _ in 0..<8 {
+            let admitted = TerminalTab(directory: root, lifecycle: capped, reconcile: { _ in })
+            admitted.execute("cd " + TerminalTab.shellQuote(renamed.path))
+            tabs.append(admitted)
+        }
+        let rejected = TerminalTab(directory: root, lifecycle: capped, reconcile: { _ in })
+        rejected.execute("cd " + TerminalTab.shellQuote(renamed.path))
+        try check(!rejected.isRunning && rejected.directory.path == root.path && capacityWorkers.count == 8,
+                  "cd respects the global eight-worker admission cap")
+        var replies: [Bool] = []
+        try check(capped.beginTermination { replies.append($0) } == .later, "Quit waits for admitted cd workers")
+        rejected.execute("cd " + TerminalTab.shellQuote(renamed.path))
+        try check(!rejected.isRunning && capacityWorkers.count == 8, "Quit rejects cd admission")
+        for work in capacityWorkers { work() }
+        try await wait { capped.activeCount == 0 }
+        try check(replies == [true] && tabs.allSatisfy { !$0.isRunning && $0.directory.path == root.path },
+                  "Quit cancels cd before launch and releases all physical leases")
+        print("PASS cd escapes stale cwd, validates targets in workers, and preserves relative paths, cancellation and admission")
     }
     private func wait(_ condition: () -> Bool) async throws {
         for _ in 0..<500 {

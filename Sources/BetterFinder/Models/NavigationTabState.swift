@@ -451,6 +451,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
         // Install exactly the validated snapshot, never a second filesystem read.
         installDirectoryEntries(entries)
         updateColumnTrail(for: standardized)
+        FolderSizeCache.shared.revalidate(containing: standardized.path)
         FSearchIndex.shared.ensureDirectoryIndexed(standardized.path)
         AppState.shared.persistTabsState()
         return true

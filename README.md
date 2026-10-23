@@ -8,7 +8,7 @@ BetterFinder brings everyday file operations and developer tools into one SwiftU
 
 ![BetterFinder light-mode file list with synthetic preview files](docs/images/betterfinder-light.png)
 
-*Native light-mode view render from the preview branch, using synthetic files. Not a desktop screenshot or proof of full GUI validation.*
+*Earlier native light-mode view render using synthetic files. It predates the latest sidebar and address-bar changes; it is not a desktop screenshot or proof of current GUI validation.*
 
 ## Project status
 
@@ -53,19 +53,22 @@ An existing app bundle is kept until compilation, icon generation, and signing s
 - **Dual panes** for side-by-side browsing, folder comparison, and copying a selection to the other pane.
 - **Four views:** list, icon grid, Miller columns, and a disk-usage treemap.
 - **Tabs** with duplication, reopening closed tabs, and [opt-in resumption of restored views](#session-restoration) across both panes.
-- **Editable breadcrumbs** with support for `~` and relative paths.
+- **An always-visible address field in each pane.** Click it or press **⌘L** to edit; **Return** navigates and **Escape** cancels. Paths support `~` and relative locations.
 - **Adjustable layout** with resizable panes, an optional sidebar and inspector, and system light and dark appearances.
 
 Back and Forward validate the destination before changing the current folder or history. If a destination is missing, unreadable, or no longer a directory, the current location, listing, and history are retained and an error is shown. Hiding and showing the right pane preserves its established location.
 
-Pinned folders remain in the sidebar when their locations are offline; opening an unavailable pin reports a navigation error rather than removing it. The mounted-volume list refreshes in the background when volumes change or the app becomes active. If a refresh fails, the last-known list stays visible with a warning that it may be out of date.
+The sidebar has one **manually ordered Favorites list**. Add folders, rename their labels, remove them, or reorder them by drag or the row menu. Existing pins migrate into the list; unavailable locations are retained. Defaults initialize the list once, and an explicitly empty list stays empty. Damaged or unsupported saved data is not silently overwritten.
 
-### Find files and keep useful searches
+Mounted network shares are grouped by their known server endpoint, with separate share rows and expandable server headings. Unknown server metadata falls back without inventing a host. Unknown capacity is not shown as zero free or a full disk. Volumes refresh in the background; failures retain the last-known rows with a warning. The server heading is not itself a navigable filesystem folder or a collective eject action.
+
+The system Trash favorite opens **Finder's Trash**, even after its label is renamed, rather than trying to browse the protected `.Trash` directory. Other inaccessible folders retain the current location and show a readable permission message. This does not grant additional macOS permissions.
+
+### Find files
 
 - Search the **current folder**, its **subfolders**, or the **configured file index**.
 - Combine names with extension, size, modification-time, path, file-type, tag-color, content, and Git-status filters.
 - Use fuzzy matching, quoted phrases, exclusions, and regular expressions.
-- Save queries as **smart folders**, including their scope, folder, hidden-file setting, and fuzzy-matching setting.
 - The built-in engine uses bulk filesystem enumeration, an in-memory index, an optional persistent metadata cache, and FSEvents updates. No separate search service is required for the built-in engine.
 
 ### Work with files
@@ -81,13 +84,15 @@ Pinned folders remain in the sidebar when their locations are offline; opening a
 - Visualize disk usage and inspect large files in the analysis view.
 - Find duplicate candidates using file sizes and SHA-256 hashes, with content and identity revalidation before cleanup. Review them before deleting anything.
 - See Git-status information for files in a repository.
-- Run shell commands in the active folder using the embedded command drawer. It invokes `zsh -c` and displays output; it is **not a full interactive terminal emulator**.
+- Run shell commands in a **resizable, tabbed command drawer**. Each new command tab starts in the active folder, then keeps its own directory, draft and output. It invokes `zsh -c`; it is **not a full interactive terminal emulator**.
 
 Folder sizes are calculated in bounded background work, with inspector selections prioritized over visible rows and background size-sorting requests. Work beyond the admission limit is marked deferred, not silently queued forever. Use the retry control after narrowing the view or closing other views; refreshing, changing the selection, or showing a row again can also retry deferred requests.
 
 Incomplete scans display **≥** to mark a lower bound, not an exact size. Cancellation is cooperative: a blocked filesystem call can still occupy a worker, so leaving a folder does not guarantee immediate interruption of its scan.
 
-The command drawer runs each shell command in a fresh, noninteractive `zsh`. A simple standalone `cd`, including a quoted path or `~/…`, can navigate the pane; compound commands run unchanged in the shell, and their directory changes do not carry over to the pane or the next command. Console output is bounded: long entries may be shortened and older entries removed, with visible notices. Display truncation does not shorten the command that is executed.
+The command drawer supports up to eight tabs. Drag its separator to resize it, or focus the separator and use the arrow keys; its menu also provides resize and reset actions. Hiding the drawer or switching tabs does not cancel a command. Closing a command tab requests cancellation of its command; cleanup remains application-owned.
+
+Each command runs in a fresh, noninteractive `zsh`. A simple standalone `cd`, including a quoted path or `~/…`, changes that command tab's directory after successful completion, without navigating the file pane. Compound commands run unchanged in the shell; their directory changes do not carry into the next command. Completion of commands other than recognized standalone `cd` requests a bounded refresh for the command's original directory. Console output is bounded: long entries may be shortened and older entries removed, with visible notices. Display truncation does not shorten the executed command. Tab state is not restored after app restart.
 
 ## Search syntax
 
@@ -115,7 +120,7 @@ Additional syntax includes `regex:`, `tag:`, `^prefix`, and `suffix$`. The Filte
 
 Content search and Git filters also have bounded coverage. Partial results are indicated when a limit is reached or some data cannot be read. A search result is not an exhaustive filesystem or repository audit.
 
-Saved folder-scoped searches keep their original folder rather than following whichever folder happens to be open. If that location is unavailable, the search reports the problem instead of silently widening its scope or substituting your home folder. Whole-index saved searches use the configured index without a saved folder root.
+The Smart Folders sidebar and save-search control are no longer exposed. Existing saved-search records are retained for compatibility; removing those controls does not delete their stored data.
 
 ## Keyboard shortcuts
 
@@ -155,7 +160,7 @@ A saved whole-index search can show results without opening a paused folder; cle
 In Settings:
 
 - **“Zapisuj i przywracaj sesję” (Save and restore session)** takes effect immediately, separately from saving index settings. Turning it off stops new saves and restoration but retains the previous record. Turning it back on saves the current layout.
-- **“Wyczyść zapis sesji i wyłącz przywracanie” (Clear saved session and disable restoration)** removes the saved session and legacy tab-path record, then disables further session saves until re-enabled. It does not close tabs or delete bookmarks and smart folders.
+- **“Wyczyść zapis sesji i wyłącz przywracanie” (Clear saved session and disable restoration)** removes the saved session and legacy tab-path record, then disables further session saves until re-enabled. It does not close tabs or delete Favorites and retained legacy saved-search records.
 - Unsupported or damaged session records are protected against overwriting until explicitly cleared.
 
 Selection, clipboard contents, undo/redo history, command-drawer state, analysis results, and unfinished operations are not restored. Session data is stored locally and is not sent or synchronized by the app. Named workspaces are not supported yet.
@@ -172,7 +177,7 @@ Icon-grid thumbnails have separate limits for active requests, queued work, and 
 
 ### Local data and access
 
-Saved indexing configuration, bookmarks, scoped smart folders, and session state are stored locally through macOS preferences. The optional index cache contains filenames, paths, and metadata. Its preferred location is `~/Library/Caches/BetterFinder/fsearch_index.bin`; a validated private temporary directory is used as a fallback. If no suitable private location is available, caching is skipped. Paths and filenames may be sensitive.
+Saved indexing configuration, Favorites, retained legacy saved-search records, and session state are stored locally through macOS preferences. The optional index cache contains filenames, paths, and metadata. Its preferred location is `~/Library/Caches/BetterFinder/fsearch_index.bin`; a validated private temporary directory is used as a fallback. If no suitable private location is available, caching is skipped. Paths and filenames may be sensitive.
 
 If saved index settings are damaged or from an unsupported version, startup automatic indexing and cache writing stay paused rather than falling back to default roots. Settings offers an explicit repair option that preserves a copy of the original record before replacing it. Turning persistent caching off prevents new cache writes from being authorized, but an already-authorized write may finish; it does not delete an existing cache.
 

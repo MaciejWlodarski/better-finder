@@ -54,6 +54,7 @@ private final class VolumeTestSource: @unchecked Sendable {
             url: URL(fileURLWithPath: "/fake/\(name)"), totalBytes: 0, freeBytes: 0, isRemovable: false)]))
     }
     static func runAll() async throws {
+        try NetworkVolumeGroupingRegressionTests.runAll()
         var refreshes = 0
         let fakeURL = URL(fileURLWithPath: "/fake/eject")
         try VolumeEjectAction.perform(fakeURL, eject: { _ in }, refresh: { refreshes += 1 })

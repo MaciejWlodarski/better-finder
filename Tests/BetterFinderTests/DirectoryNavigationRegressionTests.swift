@@ -10,6 +10,8 @@ struct DirectoryNavigationRegressionTests {
                 try testFailedHistory(forward: forward, failure: failure)
             }
         }
+        try testSystemTrashRoutesWithoutListingOrPaneMutation()
+        try testPermissionDiagnosticAndGuardedDismissal()
         try testCommitAndSnapshotOwnership()
         try testPreparedEmptySnapshotIsInstalledOnce()
         try await testRightPaneVisibility()
@@ -17,7 +19,7 @@ struct DirectoryNavigationRegressionTests {
         try testRetryRejectsReplacementFileAndChangedContext()
         try await testRetryIsSupersededBySavedSearchAndResume()
         try testRetainedRetryActionCannotRouteToReplacedPane()
-        print("19 directory navigation/history regression groups passed")
+        print("21 directory navigation/history regression groups passed")
     }
 
     private func fixture() throws -> URL {
@@ -301,4 +303,67 @@ struct DirectoryNavigationRegressionTests {
         try expect(pane.historyBack == [originalLocation] && pane.historyForward.isEmpty)
         try expect(pane.navigationDiagnostic == nil && pane.navigationFailureID == nil)
     }
+    @MainActor private func testSystemTrashRoutesWithoutListingOrPaneMutation() throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let a = root.appendingPathComponent("A")
+        let trash = root.appendingPathComponent(".Trash", isDirectory: true)
+        let pane = PaneTabState(initialURL: a)
+        let oldURL = pane.currentURL, oldHistory = pane.historyBack
+        let oldItems = pane.directoryItems.map(\.path)
+        var reads = 0, opens = 0
+        pane.navigationDirectoryReader = { _, _ in
+            reads += 1
+            return BulkCrawler.DirectoryReadResult(entries: [], isComplete: false, errorCode: EPERM)
+        }
+        // No Trash directory exists. Special routing must not stat or enumerate it.
+        let outcome = SystemTrashNavigation.open(trash, systemTrashURL: trash, openInFinder: { url in
+            opens += 1
+            return url == trash
+        }, navigate: { _ = pane.navigate(to: $0) })
+        try expect(outcome == .openedInFinder && opens == 1 && reads == 0)
+        try expect(pane.currentURL == oldURL && pane.historyBack == oldHistory)
+        try expect(pane.directoryItems.map(\.path) == oldItems && pane.navigationDiagnostic == nil)
+        let failed = SystemTrashNavigation.open(trash, systemTrashURL: trash,
+            openInFinder: { _ in false }, navigate: { _ in reads += 1 })
+        try expect(failed == .failedToOpenFinder && reads == 0)
+        let renamed = SidebarLocationItem(bookmarkPath: "custom-trash", title: "Moje archiwum", iconName: "folder", url: trash, isCustomBookmark: true)
+        try expect(SystemTrashNavigation.isSystemTrash(renamed.url, systemTrashURL: trash))
+        for unrelated in [root.appendingPathComponent("A/.Trash"), root.appendingPathComponent("Trash"),
+                          root.appendingPathComponent(".Trash-old"), URL(string: "smb://server/.Trash")!] {
+            var routed: URL?
+            let result = SystemTrashNavigation.open(unrelated, systemTrashURL: trash,
+                openInFinder: { _ in opens += 1; return true }, navigate: { routed = $0 })
+            try expect(result == .navigated && routed == unrelated && opens == 1)
+        }
+    }
+
+    @MainActor private func testPermissionDiagnosticAndGuardedDismissal() throws {
+        try expect(DirectoryNavigationFailure.isPermissionDenied(NSError(domain: NSCocoaErrorDomain,
+            code: CocoaError.fileReadNoPermission.rawValue)))
+        let wrapped = NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileReadUnknown.rawValue,
+            userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM))])
+        try expect(DirectoryNavigationFailure.isPermissionDenied(wrapped))
+        try expect(!DirectoryNavigationFailure.isPermissionDenied(NSError(domain: NSPOSIXErrorDomain,
+            code: Int(EIO), userInfo: [NSLocalizedDescriptionKey: "Operation not permitted"])))
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let a = root.appendingPathComponent("A"), b = root.appendingPathComponent("B")
+        let pane = PaneTabState(initialURL: a)
+        for code in [EACCES, EPERM, EIO] {
+            pane.navigationDirectoryReader = { _, _ in
+                BulkCrawler.DirectoryReadResult(entries: [], isComplete: false, errorCode: code)
+            }
+            try expect(!pane.navigate(to: b))
+            try expect(pane.navigationFailureIsPermissionDenied == (code != EIO))
+            try expect(pane.navigationDiagnostic?.contains(b.path) == true)
+            let id = pane.navigationFailureID!
+            pane.dismissNavigationFailure(expectedFailureID: UUID())
+            try expect(pane.navigationFailureID == id)
+            pane.dismissNavigationFailure(expectedFailureID: id)
+            try expect(pane.navigationDiagnostic == nil && pane.navigationFailureID == nil)
+            try expect(!pane.navigationFailureIsPermissionDenied && pane.currentURL == a.standardizedFileURL)
+        }
+    }
+
 }

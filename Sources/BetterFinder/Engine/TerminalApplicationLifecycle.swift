@@ -69,6 +69,8 @@ final class TerminalApplicationLifecycle {
 
     func start(command: String, directory: URL,
                completion: @escaping @MainActor (Result<TerminalCommandResult, Error>) -> Void) -> TerminalCommandSession? {
+        // Closed tabs may still own physically running workers during cancellation.
+        guard sessions.count < 8 else { return nil }
         let session = TerminalCommandSession()
         guard admit(session) else { return nil }
         enqueueWorker {

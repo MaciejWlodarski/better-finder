@@ -17,20 +17,6 @@ public struct SidebarLocationItem: Identifiable, Hashable {
     public let isCustomBookmark: Bool
 }
 
-public struct VolumeInfoItem: Identifiable, Sendable {
-    public var id: String { url.path }
-    public let name: String
-    public let url: URL
-    public let totalBytes: Int64
-    public let freeBytes: Int64
-    public let isRemovable: Bool
-
-    public var usedFraction: Double {
-        guard totalBytes > 0 else { return 0 }
-        return Double(totalBytes - freeBytes) / Double(totalBytes)
-    }
-}
-
 @MainActor
 public final class AppState: ObservableObject {
     public static let shared = AppState()
@@ -59,6 +45,11 @@ public final class AppState: ObservableObject {
         return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         #endif
     }
+
+    /// Exact special sidebar location; test builds use the isolated fixture home.
+    var systemTrashURL: URL { Self.homeDirectoryURL.appendingPathComponent(".Trash", isDirectory: true) }
+
+    let terminalWorkspace = TerminalWorkspace()
 
     @Published public var tabs: [PaneTabState] = [] {
         didSet { observeSessionPanes(); synchronizeQuickLookOwnership() }
@@ -156,16 +147,20 @@ public final class AppState: ObservableObject {
 
     // Sidebar Locations & Smart Folders
     @Published public var favorites: [SidebarLocationItem] = []
-    @Published public var customBookmarks: [SidebarLocationItem] = []
+    public var customBookmarks: [SidebarLocationItem] { favorites }
     @Published public var savedSmartFolders: [SavedSmartFolderItem] = []
     private var savedSearchArchive: SavedSearchArchive? = SavedSearchArchive()
     private var savedSearchLaunchSerials: [UUID: UInt64] = [:]
     @Published public private(set) var volumeInventory = VolumeInventoryState()
     public var mountedVolumes: [VolumeInfoItem] { volumeInventory.items }
+    public var localMountedVolumes: [VolumeInfoItem] { VolumeSidebarGroups.build(from: mountedVolumes).localVolumes }
+    public var networkServerGroups: [NetworkVolumeGroup] { VolumeSidebarGroups.build(from: mountedVolumes).networkServers }
     private var volumeService: VolumeRefreshService?
-    private lazy var pinnedFolderStore = PinnedFolderStore(
-        read: { Self.preferences.object(forKey: PinnedFolderStore.key) },
-        write: { Self.preferences.set($0, forKey: PinnedFolderStore.key) })
+    private lazy var sidebarFavoritesStore = SidebarFavoritesStore(
+        defaults: Self.initialSidebarFavorites,
+        read: { Self.preferences.object(forKey: SidebarFavoritesStore.key) },
+        readLegacy: { Self.preferences.object(forKey: PinnedFolderStore.key) },
+        write: { Self.preferences.set($0, forKey: SidebarFavoritesStore.key) })
     @Published public private(set) var pinnedFolderNotice: String?
 
 
@@ -269,45 +264,29 @@ public final class AppState: ObservableObject {
             FileIconCache.shared.invalidate(containing: path)
         }
         for tab in tabs + [rightPane] where tab.isAffectedByDirectoryChanges(changedDirs) {
-            tab.refresh()
+            tab.reloadDirectory(invalidateCaches: false)
         }
     }
 
-    public func setupSidebarLocations() {
+    private static var initialSidebarFavorites: [SidebarFavoritesStore.Entry] {
         let home = Self.homeDirectoryURL.path
-        let iCloudPath = "\(home)/Library/Mobile Documents/com~apple~CloudDocs"
-        let trashPath = "\(home)/.Trash"
-
+        // Pure initial configuration: never probe disks/cloud roots while restoring the sidebar.
         var candidates: [(String, String, String)] = [
             ("Dom", "house.fill", home),
             ("Biurko", "menubar.dock.rectangle", "\(home)/Desktop"),
             ("Dokumenty", "doc.fill", "\(home)/Documents"),
-            ("Pobrane", "arrow.down.circle.fill", "\(home)/Downloads")
-        ]
-        if FileManager.default.fileExists(atPath: iCloudPath) {
-            candidates.append(("iCloud Drive", "icloud.fill", iCloudPath))
-        }
-        candidates.append(contentsOf: [
+            ("Pobrane", "arrow.down.circle.fill", "\(home)/Downloads"),
+            ("iCloud Drive", "icloud.fill", "\(home)/Library/Mobile Documents/com~apple~CloudDocs"),
             ("Projekty", "hammer.fill", "\(home)/dev"),
-            ("Kosz", "trash.fill", trashPath)
-        ])
+            ("Kosz", "trash.fill", "\(home)/.Trash")
+        ]
         #if !BETTERFINDER_TESTING
         candidates.append(("Aplikacje", "app.badge.fill", "/Applications"))
         #endif
-
-        var favs: [SidebarLocationItem] = []
-        for (title, icon, path) in candidates {
-            if FileManager.default.fileExists(atPath: path) {
-                favs.append(SidebarLocationItem(
-                    title: title,
-                    iconName: icon,
-                    url: URL(fileURLWithPath: path, isDirectory: true),
-                    isCustomBookmark: false
-                ))
-            }
-        }
-        self.favorites = favs
+        return candidates.map { SidebarFavoritesStore.Entry(path: $0.2, title: $0.0, iconName: $0.1) }
     }
+
+    public func setupSidebarLocations() { updatePinnedFolderRows() }
 
     // MARK: - UserDefaults Persistence for Bookmarks, Smart Folders & Tabs
 
@@ -341,31 +320,46 @@ public final class AppState: ObservableObject {
     #endif
 
     private func updatePinnedFolderRows() {
-        customBookmarks = pinnedFolderStore.displayedPaths.map { path in
-            let url = URL(fileURLWithPath: path, isDirectory: true)
-            return SidebarLocationItem(bookmarkPath: path, title: url.lastPathComponent, iconName: "bookmark.fill",
-                url: url, isCustomBookmark: true)
+        favorites = sidebarFavoritesStore.items.map { entry in
+            SidebarLocationItem(bookmarkPath: entry.path, title: entry.title, iconName: entry.iconName,
+                url: URL(fileURLWithPath: entry.path, isDirectory: true), isCustomBookmark: true)
         }
-        pinnedFolderNotice = pinnedFolderStore.notice
+        pinnedFolderNotice = sidebarFavoritesStore.notice
+    }
+
+    private func finishFavoritesMutation(_ succeeded: Bool) {
+        if !succeeded {
+            FileOperationsManager.shared.lastStatusMessage = "Nie potwierdzono zapisu zmiany ulubionych."
+        }
+        updatePinnedFolderRows()
     }
 
     public func addBookmark(for url: URL) {
-        guard pinnedFolderStore.notice == nil else { updatePinnedFolderRows(); return }
+        guard sidebarFavoritesStore.notice == nil else { updatePinnedFolderRows(); return }
         guard url.isFileURL, PinnedFolderStore.validPath(url.path) else { return }
-        // Only a new, explicitly requested target is probed; restored pins never are.
+        // Only a new, explicitly requested target is probed; restored favorites never are.
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { return }
-        if !pinnedFolderStore.add(url.path) {
-            FileOperationsManager.shared.lastStatusMessage = "Nie potwierdzono zapisu przypiętego folderu."
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+            FileOperationsManager.shared.lastStatusMessage = "Nie dodano ulubionego: folder jest niedostępny."
+            return
         }
-        updatePinnedFolderRows()
+        finishFavoritesMutation(sidebarFavoritesStore.add(url.path))
     }
 
     public func removeBookmark(_ item: SidebarLocationItem) {
-        if !pinnedFolderStore.remove(item.id) {
-            FileOperationsManager.shared.lastStatusMessage = "Nie potwierdzono zapisu zmiany przypiętych folderów."
-        }
-        updatePinnedFolderRows()
+        finishFavoritesMutation(sidebarFavoritesStore.remove(item.id))
+    }
+
+    public func moveFavorite(_ item: SidebarLocationItem, by offset: Int) {
+        finishFavoritesMutation(sidebarFavoritesStore.move(item.id, by: offset))
+    }
+
+    public func moveFavorite(id: String, beforeID: String?) {
+        finishFavoritesMutation(sidebarFavoritesStore.move(id, before: beforeID))
+    }
+
+    public func renameFavorite(_ item: SidebarLocationItem, title: String) {
+        finishFavoritesMutation(sidebarFavoritesStore.rename(item.id, title: title))
     }
 
     public func isCurrentSearchSaved(in pane: PaneTabState) -> Bool {
@@ -422,6 +416,12 @@ public final class AppState: ObservableObject {
     }
 
     // MARK: - Volumes & Eject (`⏏`)
+
+    #if BETTERFINDER_TESTING
+    func installVolumeFixturesForTesting(_ volumes: [VolumeInfoItem]) {
+        volumeInventory.apply(.success(VolumeSnapshot(items: volumes)))
+    }
+    #endif
 
     public func refreshMountedVolumes() { volumeService?.requestRefresh() }
 

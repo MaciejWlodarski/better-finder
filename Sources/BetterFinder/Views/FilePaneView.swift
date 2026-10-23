@@ -92,16 +92,40 @@ public struct FilePaneView: View {
             PathBreadcrumbBar(appState: appState, pane: pane)
 
             if let diagnostic = pane.navigationDiagnostic, let failureID = pane.navigationFailureID {
-                HStack {
-                    Text(diagnostic).font(FinderUI.captionFont)
-                    Spacer()
-                    Button("Spróbuj ponownie") {
-                        FinderPaneActionRouting.performIfCurrent(appState: appState, pane: pane, paneSide: paneSide) {
-                            pane.retryNavigation(expectedFailureID: failureID)
+                HStack(alignment: .top, spacing: FinderUI.rowSpacing) {
+                    Image(systemName: pane.navigationFailureIsPermissionDenied ? "lock.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 2)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+                        Text(pane.navigationFailureIsPermissionDenied ? "Brak dostępu do folderu" : "Nie można otworzyć folderu")
+                            .font(FinderUI.bodyFont.weight(.semibold))
+                        ScrollView(.vertical) {
+                            Text(diagnostic)
+                                .font(FinderUI.detailFont)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
+                        .frame(maxHeight: 96)
+                        .accessibilityLabel("Szczegóły błędu otwierania folderu")
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: FinderUI.rowSpacing) {
+                                navigationFailureButtons(failureID: failureID)
+                            }
+                            VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
+                                navigationFailureButtons(failureID: failureID)
+                            }
+                        }
+                        .controlSize(.regular)
                     }
                 }
-                .padding(FinderUI.compactSpacing)
+                .padding(.horizontal, FinderUI.panelInset)
+                .padding(.vertical, FinderUI.chromeInset)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(FinderUI.sidebarSurface)
+                .overlay(alignment: .bottom) { Divider() }
                 .accessibilityElement(children: .contain)
             }
 
@@ -210,11 +234,14 @@ public struct FilePaneView: View {
     }
 
     private var restoredSessionPlaceholder: some View {
-        VStack(spacing: FinderUI.sectionSpacing) {
+        VStack(spacing: FinderUI.chromeInset) {
             Image(systemName: "pause.circle").font(.largeTitle).accessibilityHidden(true)
-            Text("Zapisany widok jest wstrzymany").font(FinderUI.bodyFont.weight(.semibold))
-            Text(pane.currentURL.path).font(FinderUI.detailFont).textSelection(.enabled)
-                .lineLimit(3).truncationMode(.middle).help(pane.currentURL.path)
+            VStack(spacing: FinderUI.compactSpacing) {
+                Text("Zapisany widok jest wstrzymany").font(FinderUI.titleFont)
+                Text(pane.currentURL.path).font(FinderUI.detailFont).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(3).truncationMode(.middle).help(pane.currentURL.path)
+            }
             if case .unavailable(let reason) = pane.sessionAvailability {
                 Text(reason).font(FinderUI.detailFont).foregroundStyle(.secondary)
             } else {
@@ -256,7 +283,7 @@ public struct FilePaneView: View {
         }
         .multilineTextAlignment(.center)
         .padding(FinderUI.sheetPadding)
-        .frame(maxWidth: 520)
+        .frame(maxWidth: 440)
     }
 
     // MARK: - 1. Native List View with Expandable Outline Tree (`▸`) & Drag/Drop
@@ -692,6 +719,24 @@ public struct FilePaneView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func navigationFailureButtons(failureID: UUID) -> some View {
+        if !pane.navigationFailureIsPermissionDenied {
+            Button("Spróbuj ponownie") {
+                FinderPaneActionRouting.performIfCurrent(appState: appState, pane: pane, paneSide: paneSide) {
+                    pane.retryNavigation(expectedFailureID: failureID)
+                }
+            }
+            .fixedSize()
+        }
+        Button("Zamknij komunikat") {
+            FinderPaneActionRouting.performIfCurrent(appState: appState, pane: pane, paneSide: paneSide) {
+                pane.dismissNavigationFailure(expectedFailureID: failureID)
+            }
+        }
+        .fixedSize()
     }
 
     // MARK: - Trash Banner (`~/.Trash`)

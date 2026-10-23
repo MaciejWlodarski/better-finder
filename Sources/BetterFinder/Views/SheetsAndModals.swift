@@ -1047,6 +1047,7 @@ public struct FSearchSettingsSheetView: View {
     }
 
     public var body: some View {
+        VStack(spacing: 0) {
         ScrollView {
         VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
             HStack {
@@ -1186,6 +1187,24 @@ public struct FSearchSettingsSheetView: View {
             .font(FinderUI.captionFont.monospacedDigit())
             .foregroundStyle(.secondary)
 
+
+        }
+        .font(FinderUI.bodyFont)
+        .controlSize(.regular)
+        .padding(FinderUI.sheetPadding)
+        }
+        Divider()
+        settingsActions
+            .controlSize(.regular)
+            .padding(.horizontal, FinderUI.sheetPadding)
+            .padding(.vertical, FinderUI.panelInset)
+            .background(FinderUI.sidebarSurface)
+        }
+        .frame(width: 580)
+        .frame(maxHeight: 760)
+    }
+
+    private var settingsActions: some View {
             HStack {
                 Spacer()
                 Button("Anuluj") {
@@ -1212,13 +1231,6 @@ public struct FSearchSettingsSheetView: View {
                 }
                 .keyboardShortcut(.defaultAction)
             }
-        }
-        .font(FinderUI.bodyFont)
-        .controlSize(.regular)
-        .padding(FinderUI.sheetPadding)
-        .frame(width: 580)
-        }
-        .frame(maxHeight: 760)
     }
 
     private func addRoot() {

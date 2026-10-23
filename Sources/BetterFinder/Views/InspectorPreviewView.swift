@@ -73,8 +73,8 @@ public struct InspectorPreviewView: View {
                     .help("Otwórz natywny Quick Look (Spacja)")
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.horizontal, FinderUI.panelInset)
+            .frame(minHeight: 40)
             .background(Color(nsColor: .windowBackgroundColor))
 
             Divider()
@@ -292,7 +292,7 @@ public struct InspectorPreviewView: View {
                             }
                         }
                     }
-                    .padding(12)
+                    .padding(FinderUI.panelInset)
                 }
                 .onAppear {
                     loadPreviewAndMetadata(for: item)
@@ -357,12 +357,12 @@ public struct InspectorPreviewView: View {
                             shortcutHintRow(keys: "Cmd + L", desc: "Edytuj pasek adresu ręcznie")
                         }
                     }
-                    .padding(12)
+                    .padding(FinderUI.panelInset)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         }
-        .background(VisualEffectBackground(material: .sidebar, blendingMode: .withinWindow))
+        .background(FinderUI.sidebarSurface)
         .onAppear { updateFolderSizeDemand() }
         .onChange(of: folderSizeDemandPaths) { _, _ in updateFolderSizeDemand() }
         .onChange(of: activeTab.id) { _, _ in updateFolderSizeDemand() }
@@ -403,14 +403,26 @@ public struct InspectorPreviewView: View {
                     .font(FinderUI.captionFont)
             }
             Divider()
-            Button("Podgląd zaznaczenia", systemImage: "eye") { appState.toggleQuickLook() }
-            Button("Udostępnij…", systemImage: "square.and.arrow.up") { fileOps.showShareSheet(for: items) }
-            Button("Kopiuj ścieżki", systemImage: "link") { fileOps.copyPaths(items) }
+            VStack(spacing: FinderUI.rowSpacing) {
+                inspectorAction("Podgląd zaznaczenia", icon: "eye") { appState.toggleQuickLook() }
+                inspectorAction("Udostępnij…", icon: "square.and.arrow.up") { fileOps.showShareSheet(for: items) }
+                inspectorAction("Kopiuj ścieżki", icon: "link") { fileOps.copyPaths(items) }
+            }
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
-        .padding(12)
+        .padding(FinderUI.panelInset)
         .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private func inspectorAction(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
+                .padding(.horizontal, FinderUI.compactSpacing)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.regular)
     }
 
     // MARK: - Interactive chmod Box

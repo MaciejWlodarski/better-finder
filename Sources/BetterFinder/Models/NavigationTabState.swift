@@ -113,6 +113,12 @@ public final class PaneTabState: ObservableObject, Identifiable {
 
     // Inline editing / path bar state
     @Published public var isEditingPathBar: Bool = false
+    @Published public private(set) var pathEditRequest: UInt64 = 0
+
+    public func requestPathEditing() {
+        isEditingPathBar = true
+        pathEditRequest &+= 1
+    }
     @Published public var renamingItemPath: String? = nil
     @Published public var focusFilePaneTrigger: UInt64 = 0
     @Published public var selectionCursorPath: String?
@@ -319,6 +325,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
     }
     var fileOpener: (URL) -> Void = { _ = NSWorkspace.shared.open($0) }
     @Published private(set) var navigationDiagnostic: String?
+    @Published private(set) var navigationFailureIsPermissionDenied = false
     private enum NavigationTransition { case direct(Bool, Bool), back, forward }
     @Published private(set) var navigationFailureID: UUID?
     private var failedNavigation: (URL, NavigationTransition, String)?
@@ -330,6 +337,12 @@ public final class PaneTabState: ObservableObject, Identifiable {
         failedNavigation = nil
         navigationFailureID = nil
         navigationDiagnostic = nil
+        navigationFailureIsPermissionDenied = false
+    }
+
+    func dismissNavigationFailure(expectedFailureID: UUID) {
+        guard navigationFailureID == expectedFailureID else { return }
+        clearNavigationFailure()
     }
     private var initialLocationEstablished = false
 
@@ -383,7 +396,12 @@ public final class PaneTabState: ObservableObject, Identifiable {
         } catch {
             failedNavigation = (standardized, transition, navigationRetryContext)
             navigationFailureID = UUID()
-            navigationDiagnostic = "Nie otwarto folderu „\(standardized.path)”: \(error.localizedDescription) Bieżąca lokalizacja i jej zawartość zostały zachowane. Spróbuj ponownie."
+            navigationFailureIsPermissionDenied = DirectoryNavigationFailure.isPermissionDenied(error)
+            if navigationFailureIsPermissionDenied {
+                navigationDiagnostic = "macOS odmówił dostępu do folderu „\(standardized.path)”. Bieżąca lokalizacja i jej zawartość zostały zachowane. Wybierz inną lokalizację lub sprawdź uprawnienia do tego folderu."
+            } else {
+                navigationDiagnostic = "Nie otwarto folderu „\(standardized.path)”: \(error.localizedDescription) Bieżąca lokalizacja i jej zawartość zostały zachowane."
+            }
             return false
         }
 
@@ -599,7 +617,7 @@ public final class PaneTabState: ObservableObject, Identifiable {
         rebuildDisplayedItemsWithExpandedTree()
     }
 
-    public func reloadDirectory() {
+    public func reloadDirectory(invalidateCaches: Bool = true) {
         guard !isSessionBrowsingPaused else {
             // Refresh an explicitly opened global query, never the paused root.
             triggerSearch()
@@ -607,18 +625,20 @@ public final class PaneTabState: ObservableObject, Identifiable {
         }
         cancelPendingSavedSearches()
         let entries = BulkCrawler.readDirectoryFast(at: currentURL.path, includeHidden: showHiddenFiles)
-        installDirectoryEntries(entries)
+        installDirectoryEntries(entries, invalidateCaches: invalidateCaches)
     }
 
-    private func installDirectoryEntries(_ entries: [IndexedFileEntry]) {
+    private func installDirectoryEntries(_ entries: [IndexedFileEntry], invalidateCaches: Bool = false) {
         let targetPath = currentURL.path
         directoryLoadGeneration &+= 1
         let loadGeneration = directoryLoadGeneration
         // Invalidate consumers of this directory snapshot before a local query
         // starts asynchronous work. Its eventual result commit has its own revision.
         directoryRevision &+= 1
-        FileIconCache.shared.invalidate(containing: targetPath)
-        FolderSizeCache.shared.invalidate(containing: targetPath)
+        if invalidateCaches {
+            FileIconCache.shared.invalidate(containing: targetPath)
+            FolderSizeCache.shared.invalidate(containing: targetPath)
+        }
         clearAnalysisSelection()
 
         metadataGeneration &+= 1

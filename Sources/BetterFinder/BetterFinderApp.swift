@@ -147,11 +147,11 @@ struct BetterFinderApp: App {
                 Divider()
 
                 Button("Edytuj pasek ścieżki") {
-                    appState.activeTab.isEditingPathBar.toggle()
+                    appState.activeTab.requestPathEditing()
                 }
                 .keyboardShortcut("l", modifiers: [.command])
 
-                Button("Idź do folderu…") { appState.activeTab.isEditingPathBar = true }
+                Button("Idź do folderu…") { appState.activeTab.requestPathEditing() }
                     .keyboardShortcut("g", modifiers: [.command, .shift])
                 Button("Folder domowy") {
                     appState.activeTab.navigate(to: FileManager.default.homeDirectoryForCurrentUser)

@@ -8,8 +8,9 @@ public struct PathBreadcrumbSegment: Identifiable {
     public let isRoot: Bool
 }
 
-/// Reserve a separate, bounded slot for the current location. Ancestors keep
-/// at least 40% of the trail when present; scroll offsets cannot hide this slot.
+/// Retained layout regression contract for the previous breadcrumb renderer.
+/// The visible address field now uses native NSTextField scrolling; these metrics
+/// are not evidence of the new field's native focus or layout correctness.
 struct BreadcrumbLayoutMetrics {
     let currentWidth: CGFloat
     let ancestorWidth: CGFloat
@@ -29,37 +30,12 @@ struct BreadcrumbLayoutMetrics {
     }
 }
 
-/// The first subview is the scrollable ancestors; the second is the current
-/// button. Explicit proposals avoid relying on scroll-to timing or HStack's
-/// compression choices to keep the current location visible.
-private struct BreadcrumbTrailLayout: Layout {
-    let hasAncestors: Bool
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        CGSize(width: BreadcrumbLayoutMetrics.finiteWidth(proposal.width), height: 28)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        guard subviews.count == 2 else { return }
-        let metrics = BreadcrumbLayoutMetrics(
-            availableWidth: bounds.width,
-            idealCurrentWidth: subviews[1].sizeThatFits(.unspecified).width,
-            hasAncestors: hasAncestors
-        )
-        subviews[0].place(at: bounds.origin, anchor: .topLeading,
-                          proposal: ProposedViewSize(width: metrics.ancestorWidth, height: bounds.height))
-        subviews[1].place(at: CGPoint(x: bounds.minX + metrics.ancestorWidth + metrics.spacing, y: bounds.minY),
-                          anchor: .topLeading,
-                          proposal: ProposedViewSize(width: metrics.currentWidth, height: bounds.height))
-    }
-}
-
 public struct PathBreadcrumbBar: View {
     @ObservedObject var appState: AppState
     @ObservedObject var pane: PaneTabState
     @ViewState private var editablePathText: String = ""
     @ViewState private var pathValidationMessage: String? = nil
-    @FocusState private var isPathFieldFocused: Bool
+    @ViewState private var isPathFieldFocused = false
 
     public init(appState: AppState, pane: PaneTabState) {
         self.appState = appState
@@ -85,23 +61,13 @@ public struct PathBreadcrumbBar: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                if pane.isEditingPathBar {
-                    pathEditor
-                } else {
-                    breadcrumbTrail
-                        .frame(maxWidth: .infinity)
-
-                    HStack(spacing: 2) {
-                        pathActionButton(icon: "pencil", label: "Edytuj ścieżkę", help: "Przejdź do folderu (⌘L)") {
-                            beginEditing()
-                        }
-                        pathActionButton(icon: "doc.on.doc", label: "Kopiuj ścieżkę bieżącego folderu", help: pane.currentURL.path) {
-                            FileOperationsManager.shared.copyPathString(pane.currentURL.path)
-                        }
-                        folderActionsMenu
-                    }
-                    .fixedSize()
+                pathEditor
+                pathActionButton(icon: "doc.on.doc", label: "Kopiuj ścieżkę bieżącego folderu", help: pane.currentURL.path) {
+                    activatePane()
+                    FileOperationsManager.shared.copyPathString(pane.currentURL.path)
                 }
+                .accessibilityIdentifier("folder.address.copy")
+                folderActionsMenu
             }
 
             if pane.isEditingPathBar, let pathValidationMessage {
@@ -114,91 +80,28 @@ public struct PathBreadcrumbBar: View {
             }
         }
         .font(FinderUI.bodyFont)
-        .padding(.horizontal, 10)
+        .padding(.horizontal, FinderUI.chromeInset)
         .padding(.vertical, 6)
         .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .bottom) {
             Divider()
         }
-        .onChange(of: pane.isEditingPathBar) { _, isEditing in
-            if !isEditing {
-                pathValidationMessage = nil
-                isPathFieldFocused = false
-            }
+        .onAppear { editablePathText = pane.currentURL.path }
+        .onChange(of: pane.isEditingPathBar) { _, editing in
+            if !editing { resetEditor() }
         }
-    }
-
-    private var breadcrumbTrail: some View {
-        let pathSegments = segments
-        return BreadcrumbTrailLayout(hasAncestors: pathSegments.count > 1) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 2) {
-                    ForEach(Array(pathSegments.dropLast())) { segment in
-                        breadcrumbButton(segment, maximumWidth: 280)
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.tertiary)
-                            .accessibilityHidden(true)
-                    }
-                }
-            }
-            .defaultScrollAnchor(.trailing)
-            // Reset ancestors only on navigation, never on unrelated updates or
-            // manual scrolling. The current chip does not belong to this view.
-            .id(pane.currentURL.path)
-            .clipped()
-
-            if let current = pathSegments.last {
-                breadcrumbButton(current, maximumWidth: 280)
-                    .frame(minWidth: 0, maxWidth: .infinity)
-                    .clipped()
-                    .accessibilityIdentifier("breadcrumb.current")
-            }
+        .onChange(of: pane.pathEditRequest) { _, _ in
+            activatePane()
+            editablePathText = pane.currentURL.path
+            pathValidationMessage = nil
         }
-        .frame(height: 28)
-        .clipped()
-        .help(pane.currentURL.path)
-        .contentShape(Rectangle())
-        .onTapGesture(count: 2) {
-            beginEditing()
+        .onChange(of: pane.currentURL) { _, _ in
+            // A newer navigation wins over the old draft, even when another
+            // control initiated it. Ordinary listing refreshes do not erase text.
+            cancelEditing()
         }
-    }
-
-    private func breadcrumbButton(_ segment: PathBreadcrumbSegment, maximumWidth: CGFloat) -> some View {
-        let isCurrent = segment.url.path == pane.currentURL.path
-
-        return Button {
-            navigate(to: segment.url)
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: segment.isRoot ? "internaldrive" : "folder")
-                    .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary)
-                    .accessibilityHidden(true)
-                Text(segment.name)
-                    .font(.system(size: 13, weight: isCurrent ? .semibold : .regular))
-                    .foregroundStyle(isCurrent ? Color.primary : Color.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            .padding(.horizontal, 6)
-            .frame(maxWidth: maximumWidth, alignment: .leading)
-            .frame(minHeight: 28)
-            .background {
-                if isCurrent {
-                    RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
-                        .fill(Color(nsColor: .controlBackgroundColor))
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(segment.url.path)
-        .accessibilityLabel(segment.name)
-        .accessibilityValue(isCurrent ? "Bieżący folder: \(segment.url.path)" : segment.url.path)
-        .accessibilityHint("Otwiera folder. Menu kontekstowe zawiera działania dla tego folderu.")
-        .accessibilityAddTraits(isCurrent ? .isSelected : [])
-        .contextMenu {
-            folderContextActions(for: segment.url)
+        .onChange(of: appState.activePaneSide) { _, _ in
+            if appState.isDualPane && appState.activeTab.id != pane.id { cancelEditing() }
         }
     }
 
@@ -208,50 +111,48 @@ public struct PathBreadcrumbBar: View {
                 .foregroundStyle(Color.accentColor)
                 .accessibilityHidden(true)
 
-            TextField("Ścieżka folderu, np. ~/Documents", text: $editablePathText)
-                .textFieldStyle(.plain)
-                .font(FinderUI.bodyFont)
-                .focused($isPathFieldFocused)
-                .accessibilityLabel("Ścieżka folderu")
-                .accessibilityHint(pathValidationMessage ?? "Return otwiera folder, Escape anuluje. Możesz użyć ~ lub ścieżki względnej.")
-                .help("Wpisz ścieżkę bezwzględną, ścieżkę względem bieżącego folderu lub użyj ~ dla folderu domowego.")
-                .onSubmit {
-                    submitPath()
-                }
-                .onExitCommand {
-                    cancelEditing()
-                }
-                .onChange(of: editablePathText) { _, _ in
-                    pathValidationMessage = nil
-                }
+            FolderAddressTextField(
+                text: $editablePathText,
+                isEditing: pane.isEditingPathBar,
+                focusRequest: pane.pathEditRequest,
+                mayFocus: { pane.isEditingPathBar && appState.activeTab.id == pane.id },
+                beginEditing: {
+                    activatePane()
+                    pane.isEditingPathBar = true
+                    isPathFieldFocused = true
+                },
+                endEditing: { isPathFieldFocused = false },
+                changed: { pathValidationMessage = nil },
+                submit: submitPath,
+                cancel: cancelEditing
+            )
+            .frame(minWidth: 40, maxWidth: .infinity, minHeight: 24)
+            .help("Kliknij, aby edytować lub skopiować ścieżkę (⌘L). Return otwiera folder, Escape anuluje. Obsługuje ~ i adresy file:///.")
 
-            Button("Idź") {
-                submitPath()
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            .help("Otwórz wpisany folder (Return)")
-
-            pathActionButton(icon: "xmark", label: "Anuluj edycję ścieżki", help: "Anuluj (Escape)") {
-                cancelEditing()
+            if pane.isEditingPathBar {
+                pathActionButton(icon: "arrow.right", label: "Otwórz wpisany folder", help: "Otwórz folder (Return)", action: submitPath)
+                    .accessibilityIdentifier("folder.address.go")
+                pathActionButton(icon: "xmark", label: "Anuluj edycję ścieżki", help: "Anuluj (Escape)", action: cancelEditing)
+                    .accessibilityIdentifier("folder.address.cancel")
             }
         }
-        .padding(.horizontal, 8)
-        .frame(minHeight: 30)
+        .padding(.horizontal, 10)
+        .frame(minHeight: 32)
         .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
         .overlay {
             RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
-                .strokeBorder(pathValidationMessage == nil ? Color.accentColor : Color.red, lineWidth: 1)
-        }
-        .onAppear {
-            editablePathText = pane.currentURL.path
-            pathValidationMessage = nil
-            isPathFieldFocused = true
+                .strokeBorder(pathValidationMessage != nil ? Color.red : (isPathFieldFocused ? Color.accentColor : Color.secondary.opacity(0.25)), lineWidth: 1)
         }
     }
 
     private var folderActionsMenu: some View {
         Menu {
+            Section("Foldery nadrzędne") {
+                ForEach(Array(segments.dropLast().reversed())) { segment in
+                    Button(segment.isRoot ? segment.name : segment.url.path) { navigate(to: segment.url) }
+                }
+            }
+            Divider()
             folderContextActions(for: pane.currentURL)
 
             if !pane.selectedItems.isEmpty {
@@ -320,7 +221,7 @@ public struct PathBreadcrumbBar: View {
         Button {
             appState.addBookmark(for: url)
         } label: {
-            Label("Przypnij folder do paska bocznego", systemImage: "pin")
+            Label("Dodaj folder do Ulubionych", systemImage: "star")
         }
         .disabled(appState.customBookmarks.contains { $0.url.path == url.path })
     }
@@ -337,41 +238,37 @@ public struct PathBreadcrumbBar: View {
         .accessibilityLabel(label)
     }
 
-    private func beginEditing() {
+    private func resetEditor() {
         editablePathText = pane.currentURL.path
-        pathValidationMessage = nil
-        pane.isEditingPathBar = true
-    }
-
-    private func cancelEditing() {
-        pane.isEditingPathBar = false
         isPathFieldFocused = false
         pathValidationMessage = nil
     }
 
+    private func cancelEditing() {
+        pane.isEditingPathBar = false
+        resetEditor()
+    }
+
     private func submitPath() {
-        let expandedPath = (editablePathText as NSString).expandingTildeInPath
-        guard !expandedPath.isEmpty else {
-            pathValidationMessage = "Wpisz ścieżkę folderu."
-            isPathFieldFocused = true
-            return
+        activatePane()
+        do {
+            let target = try FolderAddress.resolve(editablePathText, relativeTo: pane.currentURL,
+                                                   home: FileManager.default.homeDirectoryForCurrentUser)
+            // Do not preflight fileExists here. Navigation validates and commits
+            // once; failure must retain the draft as well as the pane snapshot.
+            guard pane.navigate(to: target, clearSearch: true) else {
+                pathValidationMessage = pane.navigationDiagnostic ?? "Nie udało się otworzyć folderu."
+                return
+            }
+            cancelEditing()
+        } catch {
+            pathValidationMessage = error.localizedDescription
         }
-
-        let baseURL = URL(fileURLWithPath: pane.currentURL.path, isDirectory: true)
-        let targetURL = URL(fileURLWithPath: expandedPath, isDirectory: true, relativeTo: baseURL).standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: targetURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            pathValidationMessage = "Nie znaleziono folderu pod podaną ścieżką."
-            isPathFieldFocused = true
-            return
-        }
-
-        navigate(to: targetURL)
-        cancelEditing()
     }
 
     private func navigate(to url: URL) {
-        pane.navigate(to: url, clearSearch: true)
+        activatePane()
+        if pane.navigate(to: url, clearSearch: true) { cancelEditing() }
     }
 
     private func activatePane() {

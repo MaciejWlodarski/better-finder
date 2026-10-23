@@ -1,7 +1,22 @@
 import SwiftUI
+import AppKit
 
 /// Shared native desktop metrics. System fonts and semantic colors follow macOS settings.
 enum FinderUI {
+    // Keep chrome geometry separate from document content. These surfaces are
+    // deliberately opaque: behind-window vibrancy made the sidebar depend on
+    // the wallpaper and turn into a pale slab beside a dark document pane.
+    static let sidebarSurface = Color(nsColor: .windowBackgroundColor)
+    static let contentSurface = Color(nsColor: .controlBackgroundColor)
+    static let chromeInset: CGFloat = 12
+    static let panelInset: CGFloat = 16
+    static let sidebarInset: CGFloat = 12
+    static let sidebarRowInset: CGFloat = 8
+    static let sidebarRowHeight: CGFloat = 30
+    static let sidebarRowGap: CGFloat = 2
+    static let sidebarSectionGap: CGFloat = 14
+    static let sidebarIconWidth: CGFloat = 20
+    static let chromeHeight: CGFloat = 36
     static let sheetPadding: CGFloat = 24
     static let sectionSpacing: CGFloat = 16
     static let rowSpacing: CGFloat = 8

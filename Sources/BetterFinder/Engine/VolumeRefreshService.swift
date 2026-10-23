@@ -152,8 +152,8 @@ private final class VolumeRefreshIngress: @unchecked Sendable {
     }
     nonisolated private static func enumerate() -> VolumeRefreshResult {
         let keys: Set<URLResourceKey> = [.volumeNameKey, .volumeTotalCapacityKey,
-            .volumeAvailableCapacityForImportantUsageKey, .volumeIsRemovableKey,
-            .volumeIsEjectableKey, .volumeIsInternalKey]
+            .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey, .volumeIsRemovableKey,
+            .volumeIsEjectableKey, .volumeIsInternalKey, .volumeIsLocalKey, .volumeURLForRemountingKey]
         guard let urls = FileManager.default.mountedVolumeURLs(
             includingResourceValuesForKeys: Array(keys), options: [.skipHiddenVolumes]) else { return .failure }
         var seen = Set<String>()
@@ -165,10 +165,12 @@ private final class VolumeRefreshIngress: @unchecked Sendable {
             let values = try? url.resourceValues(forKeys: keys)
             if values == nil { partial = true }
             items.append(VolumeInfoItem(name: values?.volumeName ?? (url.path == "/" ? "/" : url.lastPathComponent),
-                url: url, totalBytes: Int64(values?.volumeTotalCapacity ?? 0),
-                freeBytes: values?.volumeAvailableCapacityForImportantUsage ?? 0,
+                url: url, totalBytes: values?.volumeTotalCapacity.map(Int64.init),
+                freeBytes: values?.volumeAvailableCapacityForImportantUsage ?? values?.volumeAvailableCapacity.map(Int64.init),
                 isRemovable: values?.volumeIsRemovable == true || values?.volumeIsEjectable == true ||
-                    (values?.volumeIsInternal == false && url.path != "/")))
+                    (values?.volumeIsInternal == false && url.path != "/"),
+                isNetwork: values?.volumeIsLocal == false,
+                networkServer: NetworkServerIdentity.parse(remountURL: values?.volumeURLForRemounting)))
         }
         items.sort { $0.url.path < $1.url.path }
         return .success(VolumeSnapshot(items: items, partial: partial))

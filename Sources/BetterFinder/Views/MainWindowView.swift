@@ -5,6 +5,10 @@ public struct MainWindowView: View {
     @ObservedObject var appState = AppState.shared
     @ObservedObject var fileOps = FileOperationsManager.shared
 
+    @ViewState private var terminalHeight = TerminalDrawerLayout.defaultHeight
+    @ViewState private var terminalDragStart: CGFloat?
+    @GestureState private var isResizingTerminal = false
+
     public init() {}
 
     public var body: some View {
@@ -16,25 +20,34 @@ public struct MainWindowView: View {
             HSplitView {
                 if appState.showSidebar {
                     SidebarView(appState: appState, activeTab: activeTab)
-                        .frame(minWidth: 200, idealWidth: 220, maxWidth: 300)
+                        .frame(minWidth: 220, idealWidth: 240, maxWidth: 320)
                 }
 
-                VStack(spacing: 0) {
-                    if appState.isDualPane {
-                        HSplitView {
-                            FilePaneView(appState: appState, pane: appState.leftTab, paneSide: .left,
-                                         isFocusedPane: appState.activePaneSide == .left)
-                                .frame(minWidth: 260)
-                            FilePaneView(appState: appState, pane: appState.rightPane, paneSide: .right,
-                                         isFocusedPane: appState.activePaneSide == .right)
-                                .frame(minWidth: 260)
+                GeometryReader { geometry in
+                    VStack(spacing: 0) {
+                        if appState.isDualPane {
+                            HSplitView {
+                                FilePaneView(appState: appState, pane: appState.leftTab, paneSide: .left,
+                                             isFocusedPane: appState.activePaneSide == .left)
+                                    .frame(minWidth: 260)
+                                FilePaneView(appState: appState, pane: appState.rightPane, paneSide: .right,
+                                             isFocusedPane: appState.activePaneSide == .right)
+                                    .frame(minWidth: 260)
+                            }
+                        } else {
+                            FilePaneView(appState: appState, pane: appState.leftTab, paneSide: .left, isFocusedPane: true)
                         }
-                    } else {
-                        FilePaneView(appState: appState, pane: appState.leftTab, paneSide: .left, isFocusedPane: true)
+                        if appState.showTerminalDrawer {
+                            terminalDivider(availableHeight: geometry.size.height)
+                            EmbeddedTerminalDrawerView(appState: appState, activeTab: activeTab)
+                                .frame(height: TerminalDrawerLayout.height(
+                                    requested: terminalHeight, availableHeight: geometry.size.height))
+                        }
                     }
-                    if appState.showTerminalDrawer {
-                        Divider()
-                        EmbeddedTerminalDrawerView(appState: appState, activeTab: activeTab)
+                    .coordinateSpace(name: "terminalSplit")
+                    .onChange(of: appState.showTerminalDrawer) { _, _ in terminalDragStart = nil }
+                    .onChange(of: isResizingTerminal) { _, dragging in
+                        if !dragging { terminalDragStart = nil }
                     }
                 }
                 .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
@@ -67,6 +80,26 @@ public struct MainWindowView: View {
         .sheet(item: windowConflict) { ConflictResolutionSheetView(conflict: $0) }
     }
 
+    private func terminalDivider(availableHeight: CGFloat) -> some View {
+        let actualHeight = TerminalDrawerLayout.height(requested: terminalHeight, availableHeight: availableHeight)
+        return TerminalResizeHandle(
+            height: actualHeight,
+            onIncrease: { terminalHeight = TerminalDrawerLayout.height(requested: actualHeight + TerminalDrawerLayout.keyboardStep, availableHeight: availableHeight) },
+            onDecrease: { terminalHeight = TerminalDrawerLayout.height(requested: actualHeight - TerminalDrawerLayout.keyboardStep, availableHeight: availableHeight) },
+            onReset: { terminalHeight = TerminalDrawerLayout.defaultHeight }
+        )
+        .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .named("terminalSplit"))
+            .updating($isResizingTerminal) { _, dragging, _ in dragging = true }
+            .onChanged { value in
+                if terminalDragStart == nil { terminalDragStart = actualHeight }
+                terminalHeight = TerminalDrawerLayout.draggedHeight(
+                    start: terminalDragStart ?? actualHeight,
+                    translation: value.translation.height,
+                    availableHeight: availableHeight)
+            }
+            .onEnded { _ in terminalDragStart = nil })
+    }
+
     // A conflict requested from comparison belongs to that sheet, not its window.
     private var windowConflict: Binding<PendingTransferConflict?> {
         Binding(
@@ -82,13 +115,13 @@ public struct MainWindowView: View {
         HStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 1) {
+                    HStack(spacing: FinderUI.compactSpacing) {
                         ForEach(appState.tabs) { tab in
                             FinderTabView(tab: tab, appState: appState)
                                 .id(tab.id)
                         }
                     }
-                    .padding(.horizontal, 6)
+                    .padding(.horizontal, FinderUI.rowSpacing)
                 }
                 .onChange(of: appState.activeTabId) { _, id in
                     withAnimation(.easeInOut(duration: 0.15)) { proxy.scrollTo(id) }
@@ -120,7 +153,7 @@ public struct MainWindowView: View {
                 .padding(.horizontal, 10)
             }
         }
-        .frame(height: 34)
+        .frame(height: FinderUI.chromeHeight)
         .background(.bar)
         .overlay(alignment: .bottom) { Divider() }
     }

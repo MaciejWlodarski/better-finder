@@ -552,13 +552,10 @@ public final class FSearchIndex: @unchecked Sendable {
         }
     }
 
-    /// Dynamically ensures a specific folder tree is indexed when user navigates into it
+    /// Navigation reconciles even previously indexed trees: supplemental/network
+    /// roots may not have a reliable watcher. Unchanged scans publish no change.
     public func ensureDirectoryIndexed(_ dirPath: String) {
-        pthread_rwlock_rdlock(lockPtr)
-        let alreadyIndexed = dirToIndices[dirPath] != nil
-        pthread_rwlock_unlock(lockPtr)
-
-        if !alreadyIndexed { enqueueDirectoryRefresh(dirPath) }
+        enqueueDirectoryRefresh(dirPath)
     }
 
     /// UI-facing refresh. Never wait for a crawl or filesystem reads on the
@@ -627,8 +624,18 @@ public final class FSearchIndex: @unchecked Sendable {
             stateLock.unlock()
             // New requests stay in the pending set while this batch reads disk.
             // They are never swallowed by the currently running ancestor scan.
-            for root in roots.sorted() { refreshDirectoryInIndex(root) }
-            onIndexUpdated?(indexedCount, lastCrawlDurationMs)
+            pthread_rwlock_rdlock(lockPtr)
+            let wasPartial = indexIsPartial
+            pthread_rwlock_unlock(lockPtr)
+            var changedDirectories = Set<String>()
+            for root in roots.sorted() { changedDirectories.formUnion(refreshDirectoryInIndex(root)) }
+            pthread_rwlock_rdlock(lockPtr)
+            let isPartial = indexIsPartial
+            pthread_rwlock_unlock(lockPtr)
+            if !changedDirectories.isEmpty || wasPartial != isPartial {
+                onIndexUpdated?(indexedCount, lastCrawlDurationMs)
+            }
+            if !changedDirectories.isEmpty { onDirectoryChangedOnDisk?(changedDirectories) }
             for completion in completions { completion() }
             // A dropped/root-change event also refreshes the watcher. This runs
             // outside its callback and shares the bounded/coalescing drain.
@@ -639,7 +646,8 @@ public final class FSearchIndex: @unchecked Sendable {
     /// Synchronous background primitive. The lock owns read and publication, and
     /// reconciliation replaces the entire subtree, not just new child names:
     /// another directory tree can replace an existing path between events.
-    public func refreshDirectoryInIndex(_ dirPath: String) {
+    @discardableResult
+    public func refreshDirectoryInIndex(_ dirPath: String) -> Set<String> {
         updateLock.lock()
         defer { updateLock.unlock() }
         let normalized = URL(fileURLWithPath: dirPath).standardizedFileURL.path
@@ -659,7 +667,7 @@ public final class FSearchIndex: @unchecked Sendable {
         }) { partial = true }
         if let error = probe.errorCode, error != ENOENT && error != ENOTDIR {
             pthread_rwlock_wrlock(lockPtr); indexIsPartial = true; pthread_rwlock_unlock(lockPtr)
-            return
+            return []
         }
         var replacement = previous.filter { entry in
             !Self.isWithin(entry.fullPath, root: normalized) || (!missing && entry.fullPath == normalized)
@@ -670,10 +678,33 @@ public final class FSearchIndex: @unchecked Sendable {
             replacement.append(contentsOf: crawl.entries)
             partial = partial || !crawl.isComplete
         }
+        let changed = Self.changedDirectoryPaths(previous: previous, replacement: replacement)
         installEntries(replacement, isPartial: partial)
         trigramLock.lock()
         trigramBloomCache = trigramBloomCache.filter { !Self.isWithin($0.key, root: normalized) }
         trigramLock.unlock()
+        return changed
+    }
+
+    /// Metadata reconciliation, not command execution, is evidence of disk changes.
+    static func changedDirectoryPaths(previous: [IndexedFileEntry], replacement: [IndexedFileEntry]) -> Set<String> {
+        struct Stamp: Equatable {
+            let size: Int64; let seconds: Int64; let nanos: Int64
+            let directory: Bool; let symlink: Bool; let hidden: Bool
+        }
+        func stamp(_ e: IndexedFileEntry) -> Stamp {
+            Stamp(size: e.size, seconds: e.mtimeEpoch, nanos: e.mtimeNanoseconds,
+                  directory: e.isDirectory, symlink: e.isSymlink, hidden: e.isHidden)
+        }
+        var old: [String: IndexedFileEntry] = [:]
+        for entry in previous { old[entry.fullPath] = entry }
+        var changed = Set<String>()
+        for entry in replacement {
+            if let before = old.removeValue(forKey: entry.fullPath), stamp(before) == stamp(entry) { continue }
+            changed.insert(entry.parentPath)
+        }
+        for entry in old.values { changed.insert(entry.parentPath) }
+        return changed
     }
 
     // MARK: - Sub-millisecond Search Execution

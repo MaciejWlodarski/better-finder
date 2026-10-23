@@ -1,8 +1,8 @@
 import Foundation
 
 /// Deliberately not a shell interpreter. Only a small, literal standalone cd
-/// grammar may navigate the pane. Everything else runs unchanged in the per-run
-/// zsh, whose cwd changes do not persist into the pane or the next command.
+/// grammar may change the terminal tab directory. Everything else runs unchanged in the per-run
+/// zsh, whose cwd changes do not persist into the terminal tab or the next command.
 enum TerminalDirectoryCommand {
     static func target(for command: String, directory: URL, home: String = NSHomeDirectory()) -> URL? {
         // Classification must not copy/scan an arbitrarily large executable input.
@@ -69,7 +69,7 @@ enum TerminalDirectoryCommand {
         if endOfOptions { operands.removeFirst() }
         guard operands.count <= 1 else { return nil }
         guard let operand = operands.first else { return URL(fileURLWithPath: home, isDirectory: true) }
-        // cd - / +N depend on shell directory-stack state, not pane state.
+        // cd - / +N depend on shell directory-stack state, not terminal-tab state.
         guard !operand.text.isEmpty, operand.text != "-", !operand.text.hasPrefix("+"),
               endOfOptions || !operand.text.hasPrefix("-") else { return nil }
         let path = operand.home ? home + String(operand.text.dropFirst()) : operand.text

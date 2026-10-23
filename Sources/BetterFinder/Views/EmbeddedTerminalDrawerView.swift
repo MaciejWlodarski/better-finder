@@ -143,79 +143,101 @@ final class TerminalCommandSession: @unchecked Sendable {
 public struct EmbeddedTerminalDrawerView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var activeTab: PaneTabState
-
-    @ViewState private var commandInput: String = ""
-    @ViewState private var transcript: TerminalTranscript = {
-        var buffer = TerminalTranscript()
-        buffer.append(text: "BetterFinder Terminal (Zsh). Samodzielne cd zmienia folder karty; polecenia złożone zmieniają folder tylko w swoim procesie.")
-        return buffer
-    }()
-    private var outputLines: [TerminalOutputLine] { transcript.lines }
-    @ViewState private var commandHistory: [String] = []
-    @ViewState private var isRunning: Bool = false
-    @ViewState private var session: TerminalCommandSession?
-    @ViewState private var commandToken: UUID?
-    @FocusState private var isInputFocused: Bool
-
-    private let quickCommands = ["git status -sb", "ls -la", "du -sh * | sort -h", "git log -n 5 --oneline"]
-
+    @ObservedObject private var workspace: TerminalWorkspace
     public init(appState: AppState, activeTab: PaneTabState) {
-        self.appState = appState
-        self.activeTab = activeTab
+        self.appState = appState; self.activeTab = activeTab
+        self.workspace = appState.terminalWorkspace
     }
-
     public var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 4) {
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(workspace.tabs) { tab in
+                                HStack(spacing: 4) {
+                                    Button { workspace.select(tab.id) } label: {
+                                        Text("Terminal \(tab.ordinal)")
+                                            .lineLimit(1).padding(.horizontal, 8).padding(.vertical, 5)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityAddTraits(workspace.selectedID == tab.id ? .isSelected : [])
+                                    Button { workspace.close(tab.id) } label: { Image(systemName: "xmark").frame(width: 24, height: 24) }
+                                        .buttonStyle(.plain).help("Zamknij kartę i przerwij jej polecenie")
+                                        .accessibilityLabel("Zamknij terminal \(tab.ordinal)")
+                                }
+                                .background(workspace.selectedID == tab.id ? Color.accentColor.opacity(0.14) : Color.clear,
+                                            in: RoundedRectangle(cornerRadius: 6))
+                                .id(tab.id)
+                            }
+                        }
+                    }
+                    .onChange(of: workspace.selectedID) { _, id in
+                        if let id { proxy.scrollTo(id, anchor: .center) }
+                    }
+                    .onAppear {
+                        if let id = workspace.selectedID { proxy.scrollTo(id, anchor: .center) }
+                    }
+                }
+                Button { _ = workspace.add(directory: activeTab.currentURL) } label: { Image(systemName: "plus").frame(width: 26, height: 26) }
+                    .buttonStyle(.plain).disabled(workspace.tabs.count >= TerminalWorkspace.tabLimit)
+                    .help("Nowa karta terminala w folderze aktywnego panelu")
+                    .accessibilityLabel("Nowa karta terminala")
+                Button { appState.showTerminalDrawer = false } label: { Image(systemName: "chevron.down").frame(width: 26, height: 26) }
+                    .buttonStyle(.plain).help("Ukryj terminal (Ctrl+`)")
+                    .accessibilityLabel("Ukryj terminal")
+            }
+            .padding(.horizontal, FinderUI.panelInset).padding(.vertical, 4)
+            .background(Color(nsColor: .windowBackgroundColor))
+            Divider()
+            if let tab = workspace.selected {
+                TerminalTabContent(appState: appState, terminal: tab).id(tab.id)
+            } else {
+                VStack(spacing: 12) {
+                    Text("Brak kart terminala").foregroundStyle(.secondary)
+                    Button("Nowa karta") { _ = workspace.add(directory: activeTab.currentURL) }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .onAppear { workspace.ensureInitial(directory: activeTab.currentURL) }
+    }
+}
+
+private struct TerminalTabContent: View {
+    @ObservedObject var appState: AppState
+    @ObservedObject var terminal: TerminalTab
+    @FocusState private var isInputFocused: Bool
+    private var outputLines: [TerminalOutputLine] { terminal.transcript.lines }
+    private var isRunning: Bool { terminal.isRunning }
+    var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: FinderUI.rowSpacing) {
                 Label("Terminal", systemImage: "terminal")
                     .font(FinderUI.titleFont)
                     .fixedSize()
 
-                Text(activeTab.currentURL.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                Text(terminal.directory.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
                     .font(FinderUI.detailFont.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
-                    .help(activeTab.currentURL.path)
-                    .accessibilityLabel("Bieżący folder: \(activeTab.currentURL.path)")
+                    .help(terminal.directory.path)
+                    .accessibilityLabel("Bieżący folder: \(terminal.directory.path)")
 
                 terminalIconButton("Wyczyść wyjście terminala", icon: "trash") {
-                    transcript.removeAll()
+                    terminal.clear()
                 }
                 .disabled(outputLines.isEmpty)
 
                 terminalIconButton("Otwórz folder w zewnętrznym terminalu", icon: "arrow.up.forward.app") {
-                    FileOperationsManager.shared.openInTerminal(at: activeTab.currentURL)
+                    FileOperationsManager.shared.openInTerminal(at: terminal.directory)
                 }
 
-                terminalIconButton("Ukryj terminal (Ctrl+`)", icon: "xmark") {
-                    session?.cancel()
-                    appState.showTerminalDrawer = false
-                }
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, FinderUI.panelInset)
             .padding(.vertical, FinderUI.compactSpacing)
-            .background(Color(nsColor: .windowBackgroundColor))
-
-            // A separate horizontal strip keeps shortcuts from squeezing the path and controls.
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: FinderUI.compactSpacing) {
-                    ForEach(quickCommands, id: \.self) { cmd in
-                        Button(cmd) { executeCommand(cmd) }
-                            .font(FinderUI.detailFont.monospaced())
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(isRunning)
-                            .help("Uruchom w bieżącym folderze: \(cmd)")
-                            .accessibilityLabel("Uruchom polecenie: \(cmd)")
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.bottom, FinderUI.compactSpacing)
-            }
-            .frame(height: 32)
             .background(Color(nsColor: .windowBackgroundColor))
 
             Divider()
@@ -224,7 +246,7 @@ public struct EmbeddedTerminalDrawerView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
                         if outputLines.isEmpty {
-                            Text(isRunning ? "Polecenie jest wykonywane…" : "Brak wyjścia. Wpisz polecenie poniżej lub wybierz skrót.")
+                            Text(isRunning ? "Polecenie jest wykonywane…" : "Brak wyjścia. Wpisz polecenie poniżej.")
                                 .font(FinderUI.detailFont)
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -242,7 +264,7 @@ public struct EmbeddedTerminalDrawerView: View {
                                 .id(line.id)
                         }
                     }
-                    .padding(.horizontal, 12)
+                    .padding(.horizontal, FinderUI.panelInset)
                     .padding(.vertical, FinderUI.rowSpacing)
                 }
                 .background(Color(nsColor: .textBackgroundColor))
@@ -256,16 +278,16 @@ public struct EmbeddedTerminalDrawerView: View {
             Divider()
 
             HStack(spacing: FinderUI.rowSpacing) {
-                Text("\(activeTab.currentURL.lastPathComponent) %")
+                Text("\(terminal.directory.lastPathComponent) %")
                     .font(FinderUI.detailFont.monospaced().weight(.semibold))
                     .foregroundStyle(Color.accentColor)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .frame(maxWidth: 100, alignment: .leading)
-                    .help(activeTab.currentURL.path)
+                    .help(terminal.directory.path)
                     .accessibilityHidden(true)
 
-                TextField("Wpisz polecenie zsh…", text: $commandInput)
+                TextField("Wpisz polecenie zsh…", text: $terminal.commandInput)
                     .textFieldStyle(.plain)
                     .font(FinderUI.bodyFont.monospaced())
                     .focused($isInputFocused)
@@ -273,34 +295,28 @@ public struct EmbeddedTerminalDrawerView: View {
                     .accessibilityLabel("Polecenie terminala")
                     .help("Naciśnij Return, aby uruchomić polecenie w bieżącym folderze. Polecenia interaktywne wymagają zewnętrznego terminala.")
                     .onSubmit {
-                        let cmd = commandInput
+                        let cmd = terminal.commandInput
                         guard !isRunning, !cmd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-                        commandInput = ""
-                        executeCommand(cmd)
+                        terminal.commandInput = ""
+                        terminal.execute(cmd)
                     }
 
                 if isRunning {
                     ProgressView()
                         .controlSize(.small)
                         .accessibilityLabel("Wykonywanie polecenia")
-                    Button("Przerwij") { session?.cancel() }
+                    Button("Przerwij") { terminal.cancel() }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .help("Przerwij bieżące polecenie")
                 }
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, FinderUI.panelInset)
             .padding(.vertical, FinderUI.rowSpacing)
             .background(Color(nsColor: .controlBackgroundColor))
         }
-        .frame(height: 220)
         .onAppear { isInputFocused = true }
-        .onDisappear {
-            session?.cancel()
-            session = nil
-            commandToken = nil
-            isRunning = false
-        }
+
     }
 
     private func terminalIconButton(_ label: String, icon: String, action: @escaping () -> Void) -> some View {
@@ -315,66 +331,4 @@ public struct EmbeddedTerminalDrawerView: View {
         .accessibilityLabel(label)
     }
 
-    @MainActor
-    private func executeCommand(_ rawCmd: String) {
-        guard !isRunning else { return }
-        let dirURL = activeTab.currentURL
-        transcript.append(parts: ["[", dirURL.lastPathComponent, "] % ", rawCmd], isCommand: true)
-        // Display bounds must never rewrite executable command or history text.
-        // Oversized commands still execute intact, but are not retained in history.
-        if rawCmd.utf8.prefix(16_385).count <= 16_384 {
-            commandHistory.append(rawCmd)
-            commandHistory = Array(commandHistory.suffix(100))
-        }
-
-        if rawCmd == "clear" {
-            transcript.removeAll()
-            return
-        }
-
-        if let targetURL = TerminalDirectoryCommand.target(for: rawCmd, directory: dirURL) {
-            let targetPath = targetURL.path
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: targetPath, isDirectory: &isDir), isDir.boolValue {
-                if activeTab.navigate(to: targetURL) {
-                    transcript.append(text: "→ \(targetURL.path)", isCommand: false, isError: false)
-                } else {
-                    transcript.append(text: activeTab.navigationDiagnostic ?? "cd: nie można odczytać folderu", isCommand: false, isError: true)
-                }
-            } else {
-                transcript.append(text: "cd: brak takiego katalogu: \(targetPath)", isCommand: false, isError: true)
-            }
-            return
-        }
-
-        let token = UUID()
-        commandToken = token
-        guard let current = TerminalApplicationLifecycle.shared.start(command: rawCmd, directory: dirURL, completion: { result in
-            // Worker ownership was released independently of this stale-view check.
-            guard self.commandToken == token else { return }
-            switch result {
-            case .success(let result):
-                self.transcript.appendOutput(result.output)
-                if result.wasTruncated {
-                    self.transcript.append(text: "[Wyjście ograniczone do 1 MiB; dalsze dane odczytano i pominięto.]", isCommand: false, isError: false)
-                }
-                if result.wasCancelled || result.status != 0 {
-                    self.transcript.append(text: result.wasCancelled ? "[Polecenie przerwane]" : "[Polecenie zakończone błędem: \(result.status)]", isCommand: false, isError: true)
-                }
-                FSearchIndex.shared.enqueueDirectoryRefresh(dirURL.path)
-                if self.activeTab.currentURL.path == dirURL.path { self.activeTab.reloadDirectory() }
-            case .failure(let error):
-                self.transcript.append(text: "Błąd wykonania: \(error.localizedDescription)", isCommand: false, isError: true)
-            }
-            self.isRunning = false
-            self.session = nil
-            self.commandToken = nil
-        }) else {
-            commandToken = nil
-            transcript.append(text: "[Trwa zamykanie aplikacji; polecenie nie zostało uruchomione.]", isCommand: false, isError: true)
-            return
-        }
-        isRunning = true
-        session = current
-    }
 }

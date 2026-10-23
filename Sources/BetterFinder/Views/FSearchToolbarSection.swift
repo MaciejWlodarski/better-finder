@@ -37,8 +37,8 @@ public struct FSearchToolbarSection: View {
 
                 filterMenu
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+            .padding(.horizontal, FinderUI.panelInset)
+            .padding(.vertical, FinderUI.chromeInset)
 
             if !activeTab.activeFilterPills.isEmpty {
                 activeFilters
@@ -77,6 +77,11 @@ public struct FSearchToolbarSection: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
+                // Native toolbar containers gained larger rounded chrome on
+                // newer macOS. Give the custom title breathing room inside it.
+                .padding(.horizontal, FinderUI.chromeInset)
+                .padding(.vertical, 6)
+                .frame(maxWidth: 260)
                 .help(activeTab.currentURL.path)
             }
             ToolbarItem {
@@ -86,8 +91,12 @@ public struct FSearchToolbarSection: View {
                     }
                 }
                 .labelsHidden()
+                .labelStyle(.iconOnly)
                 .pickerStyle(.segmented)
-                .frame(width: 132)
+                // Do not force four native segments into a 132 pt box. Their
+                // intrinsic width follows the running macOS control metrics.
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, FinderUI.compactSpacing)
                 .help("Lista ⌘1 · Ikony ⌘2 · Kolumny ⌘3 · Mapa dysku ⌘4")
             }
             ToolbarItem {
@@ -149,6 +158,12 @@ public struct FSearchToolbarSection: View {
                 .help("Nowy folder, ukryte pliki i inne czynności")
             }
             ToolbarItemGroup {
+                Button { appState.showTerminalDrawer.toggle() } label: {
+                    Label("Terminal", systemImage: "terminal")
+                }
+                .tint(appState.showTerminalDrawer ? .accentColor : .secondary)
+                .help("Pokaż lub ukryj terminal (Ctrl+`)")
+                .accessibilityValue(appState.showTerminalDrawer ? "Widoczny" : "Ukryty")
                 Button { appState.toggleDualPane() } label: {
                     Label("Dwa panele", systemImage: "rectangle.split.2x1")
                 }
@@ -183,12 +198,6 @@ public struct FSearchToolbarSection: View {
                 ProgressView().controlSize(.small)
                     .accessibilityLabel(activeTab.isActivatingSavedSearch ? "Otwieranie zapisanego wyszukiwania" : "Wyszukiwanie plików")
             } else if !activeTab.searchQuery.isEmpty {
-                Button { appState.saveSmartFolder(from: activeTab) } label: {
-                    Image(systemName: "star").frame(width: 24, height: 24)
-                }
-                .disabled(appState.isCurrentSearchSaved(in: activeTab))
-                .help("Zapisz wyszukiwanie wraz z zakresem i opcjami w pasku bocznym")
-                .accessibilityLabel("Zapisz wyszukiwanie")
                 Button { activeTab.clearSearch() } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).frame(width: 24, height: 24)
                 }
@@ -201,7 +210,7 @@ public struct FSearchToolbarSection: View {
         .font(FinderUI.bodyFont)
         .buttonStyle(.plain)
         .padding(.horizontal, 10)
-        .frame(height: 30)
+        .frame(height: FinderUI.chromeHeight)
         .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
         .overlay {
             RoundedRectangle(cornerRadius: 7)

@@ -8,15 +8,49 @@ public struct PathBreadcrumbSegment: Identifiable {
     public let isRoot: Bool
 }
 
-/// Only a location or viewport change requests a reveal. Content offsets and
-/// unrelated pane updates deliberately do not participate, so manual scrolling
-/// through ancestors is left alone until the next navigation or resize.
-struct BreadcrumbRevealRequest: Equatable {
-    let path: String
-    let viewportWidth: CGFloat
+/// Reserve a separate, bounded slot for the current location. Ancestors keep
+/// at least 40% of the trail when present; scroll offsets cannot hide this slot.
+struct BreadcrumbLayoutMetrics {
+    let currentWidth: CGFloat
+    let ancestorWidth: CGFloat
+    let spacing: CGFloat
 
-    var maximumSegmentWidth: CGFloat {
-        min(280, max(0, viewportWidth))
+    static func finiteWidth(_ proposedWidth: CGFloat?) -> CGFloat {
+        guard let width = proposedWidth, width.isFinite else { return 280 }
+        return max(0, width)
+    }
+
+    init(availableWidth: CGFloat, idealCurrentWidth: CGFloat, hasAncestors: Bool) {
+        let width = Self.finiteWidth(availableWidth)
+        spacing = hasAncestors ? min(2, width) : 0
+        let usable = max(0, width - spacing)
+        currentWidth = min(Self.finiteWidth(idealCurrentWidth), 280, hasAncestors ? usable * 0.6 : usable)
+        ancestorWidth = hasAncestors ? max(0, usable - currentWidth) : 0
+    }
+}
+
+/// The first subview is the scrollable ancestors; the second is the current
+/// button. Explicit proposals avoid relying on scroll-to timing or HStack's
+/// compression choices to keep the current location visible.
+private struct BreadcrumbTrailLayout: Layout {
+    let hasAncestors: Bool
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        CGSize(width: BreadcrumbLayoutMetrics.finiteWidth(proposal.width), height: 28)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard subviews.count == 2 else { return }
+        let metrics = BreadcrumbLayoutMetrics(
+            availableWidth: bounds.width,
+            idealCurrentWidth: subviews[1].sizeThatFits(.unspecified).width,
+            hasAncestors: hasAncestors
+        )
+        subviews[0].place(at: bounds.origin, anchor: .topLeading,
+                          proposal: ProposedViewSize(width: metrics.ancestorWidth, height: bounds.height))
+        subviews[1].place(at: CGPoint(x: bounds.minX + metrics.ancestorWidth + metrics.spacing, y: bounds.minY),
+                          anchor: .topLeading,
+                          proposal: ProposedViewSize(width: metrics.currentWidth, height: bounds.height))
     }
 }
 
@@ -95,44 +129,39 @@ public struct PathBreadcrumbBar: View {
     }
 
     private var breadcrumbTrail: some View {
-        GeometryReader { geometry in
-            let request = BreadcrumbRevealRequest(
-                path: pane.currentURL.path,
-                viewportWidth: geometry.size.width
-            )
-            ScrollViewReader { scrollProxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 2) {
-                        ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
-                            if index > 0 {
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(.tertiary)
-                                    .accessibilityHidden(true)
-                            }
-                            breadcrumbButton(segment, maximumWidth: request.maximumSegmentWidth)
-                                .id(segment.id)
-                        }
+        let pathSegments = segments
+        return BreadcrumbTrailLayout(hasAncestors: pathSegments.count > 1) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 2) {
+                    ForEach(Array(pathSegments.dropLast())) { segment in
+                        breadcrumbButton(segment, maximumWidth: 280)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
                     }
                 }
-                .defaultScrollAnchor(.trailing)
-                .task(id: request) { @MainActor in
-                    // Defer out of this view update before revealing the destination.
-                    // Yield is not a layout barrier; native resize checks cover
-                    // timing. A newer resize/navigation cancels stale work.
-                    await Task.yield()
-                    guard !Task.isCancelled, request.viewportWidth > 0,
-                          request.path == pane.currentURL.path else { return }
-                    scrollProxy.scrollTo(request.path, anchor: .trailing)
-                }
-                .help(pane.currentURL.path)
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2) {
-                    beginEditing()
-                }
+            }
+            .defaultScrollAnchor(.trailing)
+            // Reset ancestors only on navigation, never on unrelated updates or
+            // manual scrolling. The current chip does not belong to this view.
+            .id(pane.currentURL.path)
+            .clipped()
+
+            if let current = pathSegments.last {
+                breadcrumbButton(current, maximumWidth: 280)
+                    .frame(minWidth: 0, maxWidth: .infinity)
+                    .clipped()
+                    .accessibilityIdentifier("breadcrumb.current")
             }
         }
         .frame(height: 28)
+        .clipped()
+        .help(pane.currentURL.path)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            beginEditing()
+        }
     }
 
     private func breadcrumbButton(_ segment: PathBreadcrumbSegment, maximumWidth: CGFloat) -> some View {

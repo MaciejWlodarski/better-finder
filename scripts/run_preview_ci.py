@@ -478,6 +478,13 @@ def main():
                         "cannot construct native key event",
                         "native key event must resolve to the target window",
                     }
+                    allowed.update({
+                        "broad network exposure: fixture missing",
+                        "broad network exposure: exact label in view-seeded hierarchy",
+                        "broad network exposure: fixture label differs",
+                        "broad network exposure: traversal capped",
+                        "broad network exposure: fixture present without accessible label",
+                    })
                     if marker.is_file() and marker.stat().st_size <= 2048:
                         message = marker.read_text().removeprefix("FAIL: ").strip()
                         if message in allowed:

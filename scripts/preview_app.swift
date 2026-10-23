@@ -240,14 +240,62 @@ extension NativePreview {
         var count = 0
         while !queue.isEmpty && count < 2048 {
             let object = queue.removeFirst()
-            guard let item = object as? any NSAccessibilityProtocol else { continue }
-            let identity = ObjectIdentifier(item)
+            let identity = ObjectIdentifier(object as AnyObject)
             guard visited.insert(identity).inserted else { continue }
             count += 1
-            if item.accessibilityLabel() == label { return item }
-            queue.append(contentsOf: item.accessibilityChildren() ?? [])
+            // AppKit hosting views can bridge SwiftUI accessibility descendants
+            // without exposing them directly through the window's AX children.
+            if let window = object as? NSWindow, let content = window.contentView,
+               queue.count < 2048 { queue.append(content) }
+            if let view = object as? NSView {
+                queue.append(contentsOf: view.subviews.prefix(max(0, 2048 - queue.count)))
+            }
+            if let item = object as? any NSAccessibilityProtocol {
+                if item.accessibilityLabel() == label { return item }
+                queue.append(contentsOf: (item.accessibilityChildren() ?? []).prefix(max(0, 2048 - queue.count)))
+            }
         }
         return nil
+    }
+
+    // Failure-only fixed-category counts from this isolated application's own UI.
+    // Never print accessibility text, values, paths, class names or other applications.
+    @MainActor static func networkExposureDiagnostic(window: NSWindow, expected: String) -> String {
+        let state = AppState.shared
+        let groups = state.networkServerGroups
+        let fixturePresent = groups.contains { $0.title == "studio-preview.invalid" && $0.volumes.count == 2 }
+        var queue: [Any] = [window]
+        if let content = window.contentView { queue.append(content) }
+        var visited = Set<ObjectIdentifier>()
+        var inspected = 0
+        var truncated = false
+        var exactLabels = 0, fixtureLabels = 0
+        while !queue.isEmpty && inspected < 2048 {
+            let object = queue.removeFirst()
+            let identity = ObjectIdentifier(object as AnyObject)
+            guard visited.insert(identity).inserted else { continue }
+            inspected += 1
+            if let view = object as? NSView {
+                let children = view.subviews
+                let remaining = max(0, 2048 - queue.count)
+                truncated = truncated || children.count > remaining
+                queue.append(contentsOf: children.prefix(remaining))
+            }
+            if let item = object as? any NSAccessibilityProtocol {
+                let label = item.accessibilityLabel() ?? ""
+                if label == expected { exactLabels += 1 }
+                if label.contains("studio-preview.invalid") { fixtureLabels += 1 }
+                let children = item.accessibilityChildren() ?? []
+                let remaining = max(0, 2048 - queue.count)
+                truncated = truncated || children.count > remaining
+                queue.append(contentsOf: children.prefix(remaining))
+            }
+        }
+        if !fixturePresent { return "broad network exposure: fixture missing" }
+        if exactLabels > 0 { return "broad network exposure: exact label in view-seeded hierarchy" }
+        if fixtureLabels > 0 { return "broad network exposure: fixture label differs" }
+        if truncated || !queue.isEmpty { return "broad network exposure: traversal capped" }
+        return "broad network exposure: fixture present without accessible label"
     }
 
     @MainActor static func settle() async {
@@ -307,7 +355,7 @@ extension NativePreview {
         await scene("sidebar-reordered", window: window, base: base)
         let disclosureLabel = "Serwer studio-preview.invalid, 2 udziałów"
         guard let disclosure = accessible(window, label: disclosureLabel) else {
-            require(false, "broad network disclosure exposed"); return
+            require(false, networkExposureDiagnostic(window: window, expected: disclosureLabel)); return
         }
         require(disclosure.accessibilityPerformPress(), "broad network disclosure action")
         await settle()

@@ -499,6 +499,10 @@ public final class FileOperationsManager: ObservableObject {
     private var clipboardChangeCount: Int = -1
     private var transferCancellation: TransferCancellationFlag?
     private var preflightRequestID: UUID?
+    private static let duplicateCleanupQueue = DispatchQueue(label: "com.betterfinder.duplicate-cleanup", qos: .userInitiated)
+    @Published private(set) var activeDuplicateCleanupID: UUID?
+    private var duplicateCleanupCancellation: DuplicateCleanupCancellation?
+    private let duplicateCleanupIO: DuplicateCleanupIO
 
     private let fileIO: FileOperationIO
     private let reloadVisiblePanes: @MainActor () -> Void
@@ -507,9 +511,11 @@ public final class FileOperationsManager: ObservableObject {
     // Internal injection keeps regression tests on the actual manager path without
     // touching the user's Trash, clipboard, or visible panes.
     init(fileIO: FileOperationIO = .live,
+         duplicateCleanupIO: DuplicateCleanupIO = .live,
          reloadVisiblePanes: @escaping @MainActor () -> Void = { AppState.shared.reloadVisiblePanes() },
          enqueueDirectoryRefresh: @escaping @Sendable (String) -> Void = { FSearchIndex.shared.enqueueDirectoryRefresh($0) }) {
         self.fileIO = fileIO
+        self.duplicateCleanupIO = duplicateCleanupIO
         self.reloadVisiblePanes = reloadVisiblePanes
         self.enqueueDirectoryRefresh = enqueueDirectoryRefresh
         #if !BETTERFINDER_TESTING
@@ -938,7 +944,11 @@ public final class FileOperationsManager: ObservableObject {
     }
 
     public func cancelActiveTransfer() {
-        transferCancellation?.cancel()
+        if let id = activeDuplicateCleanupID {
+            cancelDuplicateCleanup(id)
+        } else {
+            transferCancellation?.cancel()
+        }
     }
 
     // MARK: - Create Folder / Create File
@@ -1130,6 +1140,68 @@ public final class FileOperationsManager: ObservableObject {
                 self.reloadVisiblePanes()
                 completion?(finalCreated)
             }
+        }
+    }
+
+    /// Duplicate-only async mutation. Content verification and live-owner
+    /// admission happen before this call; the worker preserves the verified plan
+    /// and checks keeper/candidate snapshots immediately before each Trash.
+    /// Rejection does not queue a later destructive action.
+    @discardableResult
+    func startDuplicateCleanup(_ plan: DuplicateCleanupPlan, requestID: UUID,
+        completion: (@MainActor (DuplicateCleanupResult) -> Void)? = nil) -> Bool {
+        let total = plan.candidateCount
+        guard total > 0 else {
+            lastStatusMessage = "Brak nadmiarowych plików do przeniesienia."
+            return false
+        }
+        guard beginMutation(title: "Usuwanie duplikatów", totalCount: total) else { return false }
+        let cancellation = DuplicateCleanupCancellation()
+        duplicateCleanupCancellation = cancellation
+        activeDuplicateCleanupID = requestID
+        activeTransfer = TransferProgressInfo(title: "Usuwanie duplikatów", currentFile: "",
+            completedCount: 0, totalCount: total, isCancellable: true)
+        let io = DuplicateCleanupWorkerIO(cleanup: duplicateCleanupIO, history: fileIO)
+        let relay = DuplicateCleanupProgressRelay { [weak self] progress in
+            guard let self, self.activeDuplicateCleanupID == requestID, !cancellation.isCancelled else { return }
+            self.activeTransfer = TransferProgressInfo(title: "Usuwanie duplikatów", currentFile: progress.currentFile,
+                completedCount: progress.attempted, totalCount: progress.total, isCancellable: true)
+        }
+        Self.duplicateCleanupQueue.async { [self] in
+            let result = DuplicateCleanupExecutor.execute(plan, io: io, cancellation: cancellation,
+                progress: { relay.offer($0) })
+            for directory in result.touchedDirectories { self.enqueueDirectoryRefresh(directory) }
+            Task { @MainActor in
+                // Complete manager-owned history even after the initiating view
+                // disappears. The gate remains held through physical return and
+                // this single finalization; stale progress cannot affect a new job.
+                relay.close()
+                guard self.activeDuplicateCleanupID == requestID else { return }
+                if !result.undoActions.isEmpty {
+                    self.pushUndo(UndoableFileOperation(label: "Usuwanie duplikatów (\(result.undoActions.count) rekordów)",
+                        kind: .actions(result.undoActions)))
+                }
+                for directory in result.touchedDirectories { FolderSizeCache.shared.invalidate(containing: directory) }
+                self.lastStatusMessage = result.summary
+                self.reloadVisiblePanes()
+                self.activeDuplicateCleanupID = nil
+                self.duplicateCleanupCancellation = nil
+                self.activeTransfer = nil
+                completion?(result)
+            }
+        }
+        return true
+    }
+
+    /// Ownership prevents a disappearing old analysis pane from cancelling a
+    /// later transfer or another cleanup operation.
+    func cancelDuplicateCleanup(_ requestID: UUID) {
+        guard activeDuplicateCleanupID == requestID, let cancellation = duplicateCleanupCancellation,
+              !cancellation.isCancelled else { return }
+        cancellation.cancel()
+        if let progress = activeTransfer {
+            activeTransfer = TransferProgressInfo(title: "Anulowanie po bieżącej operacji…", currentFile: progress.currentFile,
+                completedCount: progress.completedCount, totalCount: progress.totalCount, isCancellable: false)
         }
     }
 

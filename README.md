@@ -6,6 +6,10 @@ BetterFinder brings everyday file operations and developer tools into one SwiftU
 
 [Get started](#get-started) · [Features](#features) · [Search syntax](#search-syntax) · [Keyboard shortcuts](#keyboard-shortcuts) · [Development](#development)
 
+![BetterFinder light-mode file list with synthetic preview files](docs/images/betterfinder-light.png)
+
+*Native light-mode view render from the preview branch, using synthetic files. Not a desktop screenshot or proof of full GUI validation.*
+
 ## Project status
 
 BetterFinder is under active development. This README describes the source revision containing it. Changes viewed on a pull request branch are not part of `main` until merged. See the [open pull requests](https://github.com/MaciejWlodarski/better-finder/pulls) for ongoing work, and check the results for the exact revision you are evaluating. Documented features and the presence of tests do not imply that a revision has passed native testing.
@@ -54,6 +58,8 @@ An existing app bundle is kept until compilation, icon generation, and signing s
 
 Back and Forward validate the destination before changing the current folder or history. If a destination is missing, unreadable, or no longer a directory, the current location, listing, and history are retained and an error is shown. Hiding and showing the right pane preserves its established location.
 
+Pinned folders remain in the sidebar when their locations are offline; opening an unavailable pin reports a navigation error rather than removing it. The mounted-volume list refreshes in the background when volumes change or the app becomes active. If a refresh fails, the last-known list stays visible with a warning that it may be out of date.
+
 ### Find files and keep useful searches
 
 - Search the **current folder**, its **subfolders**, or the **configured file index**.
@@ -77,6 +83,12 @@ Back and Forward validate the destination before changing the current folder or 
 - See Git-status information for files in a repository.
 - Run shell commands in the active folder using the embedded command drawer. It invokes `zsh -c` and displays output; it is **not a full interactive terminal emulator**.
 
+Folder sizes are calculated in bounded background work, with inspector selections prioritized over visible rows and background size-sorting requests. Work beyond the admission limit is marked deferred, not silently queued forever. Use the retry control after narrowing the view or closing other views; refreshing, changing the selection, or showing a row again can also retry deferred requests.
+
+Incomplete scans display **≥** to mark a lower bound, not an exact size. Cancellation is cooperative: a blocked filesystem call can still occupy a worker, so leaving a folder does not guarantee immediate interruption of its scan.
+
+The command drawer runs each shell command in a fresh, noninteractive `zsh`. A simple standalone `cd`, including a quoted path or `~/…`, can navigate the pane; compound commands run unchanged in the shell, and their directory changes do not carry over to the pane or the next command. Console output is bounded: long entries may be shortened and older entries removed, with visible notices. Display truncation does not shorten the command that is executed.
+
 ## Search syntax
 
 Type a query into the search bar or open quick search with **⌘P**.
@@ -85,6 +97,7 @@ Type a query into the search bar or open quick search with **⌘P**.
 | --- | --- |
 | `report ext:pdf` | Find PDFs matching “report” |
 | `size:>10mb mtime:<7d` | Find files over 10 MiB modified within the last 7 days |
+| `size:=1.5kb` | Match exactly 1,536 bytes |
 | `type:image` | Filter by image type |
 | `in:Sources grep:TODO` | Look for TODO content in matching source paths |
 | `git:modified` | Filter by recorded Git status |
@@ -93,7 +106,12 @@ Type a query into the search bar or open quick search with **⌘P**.
 
 Additional syntax includes `regex:`, `tag:`, `^prefix`, and `suffix$`. The Filters menu provides syntax help and removable filter chips.
 
-**The index is not the entire disk.** Even where the UI calls it “Whole Disk (fsearch),” it covers configured roots, subject to exclusions, permissions, and search limits. Default roots include existing Desktop, Documents, Downloads, `dev`, `Projects`, and `Developer` folders in your home directory, plus `/Applications`. Review the indexing settings before relying on its coverage.
+- **Exclusions:** `!` or `-` can exclude ordinary terms and extension filters (`!ext:log` or `-ext:log`). Negating other recognized filters, such as `!type:image`, shows a diagnostic and returns no results rather than ignoring the restriction.
+- **Invalid values:** malformed filter values, such as `size:huge`, `sym:maybe`, or `ext:pdf,`, show a diagnostic and return no results. Unknown keys and empty values, such as `unknown:value` and `ext:`, remain ordinary search terms rather than active filters.
+- **Sizes:** `kb`, `mb`, and `gb` use binary units, as do `kib`, `mib`, and `gib`. Use `=` for an exact byte count; a bare value means “at least.” Decimal quantities are scaled without floating-point rounding, then fractional bytes are discarded. Out-of-range values are rejected.
+- **Filename matching:** name terms are lowercased and normalized to Unicode NFC, so composed and decomposed spellings match without changing the original filenames or paths. This normalization does not apply to regex, content, or path predicates. Fuzzy typo tolerance and subsequence matching still operate on normalized UTF-8 bytes, not full Unicode character edit distance.
+
+**The index is not the entire disk.** Even where the UI calls it “Whole Disk (fsearch),” it covers configured roots, subject to exclusions, permissions, and search limits. On first use, default roots include existing Desktop, Documents, Downloads, `dev`, `Projects`, and `Developer` folders in your home directory, plus `/Applications`. Review the indexing settings before relying on its coverage. After saving, your configured roots, excluded directory names, heavy-development-folder exclusion setting, and persistent-cache setting are retained across launches. An explicitly empty root list stays empty; saved offline locations are retained rather than replaced with defaults.
 
 Content search and Git filters also have bounded coverage. Partial results are indicated when a limit is reached or some data cannot be read. A search result is not an exhaustive filesystem or repository audit.
 
@@ -154,7 +172,9 @@ Icon-grid thumbnails have separate limits for active requests, queued work, and 
 
 ### Local data and access
 
-Preferences, bookmarks, scoped smart folders, and session state are stored locally through macOS preferences. The optional index cache contains filenames, paths, and metadata. Its preferred location is `~/Library/Caches/BetterFinder/fsearch_index.bin`; a validated private temporary directory is used as a fallback. If no suitable private location is available, caching is skipped. Paths and filenames may be sensitive.
+Saved indexing configuration, bookmarks, scoped smart folders, and session state are stored locally through macOS preferences. The optional index cache contains filenames, paths, and metadata. Its preferred location is `~/Library/Caches/BetterFinder/fsearch_index.bin`; a validated private temporary directory is used as a fallback. If no suitable private location is available, caching is skipped. Paths and filenames may be sensitive.
+
+If saved index settings are damaged or from an unsupported version, startup automatic indexing and cache writing stay paused rather than falling back to default roots. Settings offers an explicit repair option that preserves a copy of the original record before replacing it. Turning persistent caching off prevents new cache writes from being authorized, but an already-authorized write may finish; it does not delete an existing cache.
 
 Browsing, indexing, and previews depend on your account's permissions and macOS privacy controls. Inaccessible locations may be missing from results. Grant access only to locations you intend the app to use. Shell commands run with your user's access; do not run unfamiliar commands.
 
@@ -174,7 +194,13 @@ Changing a Finder tag color preserves custom named tags. The separate Remove all
 
 Folder comparison examines **direct children**, not a recursive synchronization tree. Shared subfolders are marked as unexamined; type conflicts require manual resolution. Regular files are compared by content and modification time, and replacement requires a conflict-policy choice.
 
-A directory size marked **≥**, or a total described as “at least,” is a lower bound rather than an exact size. Duplicate cleanup rechecks content and identity, including the copy being retained, and stops when a change is detected. This does not prevent another application from writing concurrently. Inspect the actual files before cleanup or replacement.
+Analysis scans have an entry cap; folder comparison has a combined listing cap across both sides. Incomplete analysis totals are lower bounds, marked **≥** or “at least.” An incomplete comparison listing disables copying rather than treating missing entries as differences.
+
+Analysis, comparison, and duplicate verification share bounded background capacity. Busy requests can be deferred for an explicit retry. Cancel stops queued or cooperative work and prevents stale results from replacing the current view; it cannot guarantee interruption of a blocked system read.
+
+Dedicated duplicate cleanup requires a complete, current scan and rechecks content and identity, including the copy being retained. Cleanup runs in the background; Cancel stops further steps but does not undo a Trash operation already in progress. Available recovery records are grouped into one Undo operation, even after partial completion. If Trash returns no recovery URL, Undo cannot restore that item; if its recovery identity cannot be verified, the record stays pending and cannot currently run. Read the completion summary and inspect the folder and Trash after an uncertain outcome.
+
+These checks do not prevent another application from writing concurrently. Inspect the actual files before cleanup or replacement.
 
 Automatic Git inspection disables executable fsmonitor helpers and clean/process filters, and skips submodule contents. It compares raw files: repositories using filters such as Git LFS can appear modified even when trusted Git reports them clean. An inspection error or exceeded limit means status is unavailable, not that the repository is clean. These restrictions are not a general sandbox for repositories or commands you run yourself.
 
@@ -196,15 +222,15 @@ Use the repository's runner rather than assuming `swift test` is equivalent: `Pa
 
 ### Preview the native UI
 
+Run the preview harness in a disposable macOS account or test environment. It remains unisolated and can still read real user locations and write preferences; a separate app bundle does not make it isolated.
+
 From an active graphical macOS session:
 
 ```sh
 zsh ./scripts/preview_app.sh
 ```
 
-This builds a separate preview app, exercises keyboard interactions, and writes native view renders to `.build/previews`. Scenarios include list and search views, a narrow window, dual panes, the inspector, renaming, and dark-mode icons. These renders are not desktop screenshots or a substitute for full interactive UI validation.
-
-Run the preview harness in a disposable macOS account or test environment. The preview harness can still read real user locations and write preferences; a separate app bundle does not make it isolated.
+This experimental local harness builds a separate preview app and attempts keyboard checks and native view renders in `.build/previews`. Its scenarios cover list and search views, a narrow window, dual panes, the inspector, renaming, and dark-mode icons, but a run may stop before completing them. In particular, legacy-seeded sessions can restore paused views that do not satisfy its initial selection checks. Any renders produced are not desktop screenshots or a substitute for full interactive UI validation.
 
 ### Branch-specific validation
 

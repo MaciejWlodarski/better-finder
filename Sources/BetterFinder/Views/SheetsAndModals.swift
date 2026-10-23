@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Darwin
 
 struct QuickSearchRequest: Sendable {
     let query: String
@@ -534,13 +535,50 @@ public struct FolderCompareEntry: Identifiable, Sendable {
 }
 
 /// Deliberately shallow comparison: common directories are UNKNOWN, never identical.
-/// This UI copies selected top-level files; it is not a recursive mirror/synchronizer.
+/// This UI copies selected top-level items; it is not a recursive mirror/synchronizer.
 enum FolderComparison {
-    static func compare(left: URL, right: URL, includeHidden: Bool, token: AnalysisRequestToken) -> (entries: [FolderCompareEntry], diagnostic: String?) {
-        let leftRead = BulkCrawler.readDirectoryResult(at: left.path, includeHidden: includeHidden, isCancelled: { token.isCancelled })
-        let rightRead = BulkCrawler.readDirectoryResult(at: right.path, includeHidden: includeHidden, isCancelled: { token.isCancelled })
+    // Combined retained listing budget, not a per-side allowance. Maps and rows are
+    // bounded by this same input count. Exactly-at-budget listings remain complete.
+    static let retainedEntryLimit = 60_000
+
+    private struct LinkSnapshot: Equatable {
+        let device: Int64
+        let inode: UInt64
+        let size: Int64
+        let modifiedSeconds: Int64
+        let modifiedNanoseconds: Int64
+        let changedSeconds: Int64
+        let changedNanoseconds: Int64
+
+        init(at url: URL) throws {
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else { throw DuplicateSafetyError.unreadable }
+            guard (info.st_mode & S_IFMT) == S_IFLNK else { throw DuplicateSafetyError.changed }
+            device = Int64(info.st_dev)
+            inode = UInt64(info.st_ino)
+            size = Int64(info.st_size)
+            modifiedSeconds = Int64(info.st_mtimespec.tv_sec)
+            modifiedNanoseconds = Int64(info.st_mtimespec.tv_nsec)
+            changedSeconds = Int64(info.st_ctimespec.tv_sec)
+            changedNanoseconds = Int64(info.st_ctimespec.tv_nsec)
+        }
+    }
+
+    static func compare(
+        left: URL, right: URL, includeHidden: Bool, token: AnalysisRequestToken,
+        maxRetainedEntries: Int = retainedEntryLimit,
+        betweenSides: (URL, URL) throws -> Void = { _, _ in }
+    ) -> (entries: [FolderCompareEntry], diagnostic: String?) {
+        let budget = max(0, maxRetainedEntries)
+        let leftRead = BulkCrawler.readDirectoryResult(at: left.path, includeHidden: includeHidden,
+            maxEntries: budget, isCancelled: { token.isCancelled })
+        guard leftRead.isComplete else {
+            return ([], "Porównanie niepełne: błąd odczytu lub limit \(budget) elementów. Kopiowanie wyłączone.")
+        }
+        let rightRead = BulkCrawler.readDirectoryResult(at: right.path, includeHidden: includeHidden,
+            maxEntries: budget - leftRead.entries.count, isCancelled: { token.isCancelled })
         guard leftRead.isComplete && rightRead.isComplete else {
-            return ([], "Nie można w pełni odczytać obu katalogów. Kopiowanie wyłączone.")
+            return ([], "Porównanie niepełne: błąd odczytu lub limit \(budget) elementów. Kopiowanie wyłączone.")
         }
         let leftMap = Dictionary(uniqueKeysWithValues: leftRead.entries.map { ($0.name, $0.toFileItem(loadTags: false)) })
         let rightMap = Dictionary(uniqueKeysWithValues: rightRead.entries.map { ($0.name, $0.toFileItem(loadTags: false)) })
@@ -557,12 +595,25 @@ enum FolderComparison {
                 else {
                     do {
                         if l.isSymlink {
+                            let leftSnapshot = try LinkSnapshot(at: l.url)
+                            let rightSnapshot = try LinkSnapshot(at: r.url)
                             let leftTarget = try FileManager.default.destinationOfSymbolicLink(atPath: l.path)
+                            try betweenSides(l.url, r.url)
+                            if token.isCancelled { throw DuplicateSafetyError.cancelled }
                             let rightTarget = try FileManager.default.destinationOfSymbolicLink(atPath: r.path)
-                            status = leftTarget == rightTarget && l.modificationDate == r.modificationDate ? .identical : .modified
+                            guard try LinkSnapshot(at: l.url) == leftSnapshot,
+                                  try LinkSnapshot(at: r.url) == rightSnapshot else { throw DuplicateSafetyError.changed }
+                            status = leftTarget == rightTarget
+                                && leftSnapshot.modifiedSeconds == rightSnapshot.modifiedSeconds
+                                && leftSnapshot.modifiedNanoseconds == rightSnapshot.modifiedNanoseconds ? .identical : .modified
                         } else {
                             let lh = try DuplicateFileSafety.hash(at: l.url, isCancelled: { token.isCancelled })
+                            try betweenSides(l.url, r.url)
                             let rh = try DuplicateFileSafety.hash(at: r.url, isCancelled: { token.isCancelled })
+                            // Recheck the pair after BOTH reads, closing the left-side
+                            // stale-hash window. This is not an atomic filesystem snapshot.
+                            guard try DuplicateFileSafety.snapshot(at: l.url) == lh.snapshot,
+                                  try DuplicateFileSafety.snapshot(at: r.url) == rh.snapshot else { throw DuplicateSafetyError.changed }
                             status = lh.hash == rh.hash && lh.snapshot.size == rh.snapshot.size
                                 && lh.snapshot.modifiedSeconds == rh.snapshot.modifiedSeconds
                                 && lh.snapshot.modifiedNanoseconds == rh.snapshot.modifiedNanoseconds ? .identical : .modified
@@ -626,7 +677,8 @@ private struct FolderComparisonContentView: View {
 
     @ViewState private var entries: [FolderCompareEntry] = []
     @ViewState private var hideIdentical: Bool = true
-    @ViewState private var compareTask: Task<Void, Never>?
+    @ViewState private var compareTask: AnalysisWorkRequest?
+    @ViewState private var compareWorkState: AnalysisWorkRequest.State = .finished
     @ViewState private var compareToken: AnalysisRequestToken?
     @ViewState private var isComparing = false
     @ViewState private var compareDiagnostic: String?
@@ -700,7 +752,7 @@ private struct FolderComparisonContentView: View {
 
             Divider()
 
-            Text(compareDiagnostic ?? (isComparing ? "Porównywanie treści plików…" : "Porównanie treści i czasu plików, bez rekurencji. Wspólne podfoldery i konflikty typów wymagają osobnego porównania. Kopiowanie nie usuwa pozycji docelowych."))
+            Text(compareDiagnostic ?? (isComparing ? (compareWorkState == .queued ? "Porównanie w kolejce…" : "Porównywanie treści plików…") : "Porównanie treści i czasu plików, bez rekurencji. Wspólne podfoldery i konflikty typów wymagają osobnego porównania. Kopiowanie nie usuwa pozycji docelowych."))
                 .font(FinderUI.detailFont)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -751,6 +803,20 @@ private struct FolderComparisonContentView: View {
             }
 
             HStack {
+                if isComparing {
+                    Button("Anuluj porównanie") {
+                        compareToken?.cancel()
+                        compareTask?.cancel()
+                        isComparing = false
+                        comparedContext = nil
+                        compareDiagnostic = "Anulowano. Trwający odczyt systemowy może jeszcze kończyć pracę."
+                    }
+                } else if compareDiagnostic != nil {
+                    Button("Ponów porównanie") { computeDiff() }
+                }
+                Spacer()
+            }
+            HStack {
                 Text("Kopiuj różnice:")
                     .font(FinderUI.detailFont)
                 Button("Lewy → Prawy") { copyDifferences(leftToRight: true) }
@@ -800,8 +866,8 @@ private struct FolderComparisonContentView: View {
 
     private func computeDiff() {
         cancelOwnedConflict()
+        // Coalesce in place rather than removing/rejoining the FIFO on refresh.
         compareToken?.cancel()
-        compareTask?.cancel()
         let context = comparisonContext
         let left = leftPane.currentURL
         let right = rightPane.currentURL
@@ -812,17 +878,28 @@ private struct FolderComparisonContentView: View {
         compareDiagnostic = nil
         comparedContext = nil
         isComparing = true
-        compareTask = Task.detached(priority: .userInitiated) {
-            let result = FolderComparison.compare(left: left, right: right, includeHidden: includeHidden, token: token)
-            await MainActor.run {
+        let input = AnalysisComparisonInput(left: left, right: right, includeHidden: includeHidden)
+        compareTask = AnalysisWorkAdapters.startComparison(input, token: token, service: .shared,
+            stateChanged: { state in
+                guard self.compareToken === token, context == self.comparisonContext else { return }
+                self.compareWorkState = state
+                if state == .deferred {
+                    token.cancel()
+                    self.isComparing = false
+                    self.compareDiagnostic = "Odroczono: analiza jest zajęta. Ponów porównanie. Kopiowanie wyłączone."
+                } else if state == .cancelled {
+                    self.isComparing = false
+                    self.comparedContext = nil
+                    self.compareDiagnostic = "Anulowano porównanie. Kopiowanie wyłączone."
+                }
+            }, completion: { result in
                 guard token.canPublish(active: self.compareToken, rootPath: self.leftPane.currentURL.path),
                       context == self.comparisonContext else { return }
                 self.entries = result.entries
                 self.compareDiagnostic = result.diagnostic
                 self.comparedContext = context
                 self.isComparing = false
-            }
-        }
+            })
     }
 
     private func copyDifferences(leftToRight: Bool) {
@@ -962,6 +1039,8 @@ public struct FSearchSettingsSheetView: View {
     @ViewState private var conflictPolicy: FileConflictPolicy = FileOperationsManager.shared.defaultConflictPolicy
     @ViewState private var newRootPath: String = ""
     @ViewState private var rootPathError: String?
+    @ViewState private var repairIndexSettings = false
+    @ViewState private var indexSettingsError: String?
 
     public init(appState: AppState) {
         self.appState = appState
@@ -1000,6 +1079,13 @@ public struct FSearchSettingsSheetView: View {
             }
             Divider()
 
+            if let notice = FSearchIndex.shared.indexingPreferencesNotice {
+                Text(notice).font(FinderUI.detailFont).foregroundStyle(.orange)
+                Toggle("Napraw: zastąp ustawienia poniższymi i zachowaj kopię oryginału", isOn: $repairIndexSettings)
+            }
+            if let indexSettingsError {
+                Text(indexSettingsError).font(FinderUI.detailFont).foregroundStyle(.red)
+            }
             // Indexed Roots
             VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
                 Text("Indeksowane katalogi")
@@ -1113,13 +1199,16 @@ public struct FSearchSettingsSheetView: View {
                             .map { $0.trimmingCharacters(in: .whitespaces) }
                             .filter { !$0.isEmpty }
                     )
-                    FSearchIndex.shared.skippedDirectoryNames = parsedSkip
-                    FSearchIndex.shared.skipHeavyDevDirs = skipHeavyDirs
-                    FSearchIndex.shared.usePersistentMMapCache = useMMapCache
-                    fileOps.defaultConflictPolicy = conflictPolicy
-                    appState.isIndexing = true
-                    FSearchIndex.shared.startIndexing(roots: roots)
-                    appState.showSettingsSheet = false
+                    do {
+                        try FSearchIndex.shared.saveConfigurationAndRebuild(IndexingConfiguration(
+                            roots: roots, skippedDirectoryNames: parsedSkip,
+                            skipHeavyDevDirs: skipHeavyDirs, usePersistentMMapCache: useMMapCache),
+                            explicitlyRepair: repairIndexSettings)
+                        fileOps.defaultConflictPolicy = conflictPolicy
+                        appState.showSettingsSheet = false
+                    } catch {
+                        indexSettingsError = "Nie zapisano ustawień indeksu. Sprawdź wartości lub jawnie potwierdź naprawę."
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
             }

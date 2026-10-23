@@ -23,7 +23,77 @@ public struct FSearchResultBundle: Sendable {
 
 /// High-performance fsearch-compatible search & indexing engine with mmap persistence, trigram Bloom filters & FSEvents
 public final class FSearchIndex: @unchecked Sendable {
-    public static let shared = FSearchIndex()
+    public static let shared: FSearchIndex = {
+        #if BETTERFINDER_TESTING
+        return FSearchIndex()
+        #else
+        return FSearchIndex(preferences: IndexingPreferences(defaults: UserDefaults.standard))
+        #endif
+    }()
+    private var preferences: IndexingPreferences?
+    private var configurationBlocked = false
+    private var preferencesNeedRepair = false
+    public var indexingPreferencesNotice: String? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard preferencesNeedRepair else { return nil }
+        return configurationBlocked
+            ? "Nie można odczytać ustawień indeksu. Automatyczne indeksowanie i zapis są wstrzymane. Napraw jawnie ustawienia poniżej; oryginał zostanie zachowany."
+            : "Nie można odczytać zapisanych ustawień indeksu. Zachowano bieżącą konfigurację. Napraw jawnie ustawienia poniżej; oryginał zostanie zachowany."
+    }
+    public convenience init(preferences: IndexingPreferences, defaultConfiguration: IndexingConfiguration? = nil,
+                            enableMonitoring: Bool = true) {
+        self.init(roots: [], enableMonitoring: enableMonitoring)
+        self.preferences = preferences
+        switch preferences.load(defaultConfiguration: defaultConfiguration ?? Self.applicationDefaultConfiguration()) {
+        case .configuration(let configuration): applyConfiguration(configuration)
+        case .blocked: configurationBlocked = true; preferencesNeedRepair = true; applyConfiguration(.disabled)
+        }
+    }
+    private static func applicationDefaultConfiguration() -> IndexingConfiguration {
+        #if BETTERFINDER_TESTING
+        return .disabled
+        #else
+        let home = NSHomeDirectory()
+        return IndexingConfiguration(roots: ["\(home)/Desktop", "\(home)/Documents", "\(home)/Downloads",
+            "\(home)/dev", "\(home)/Projects", "\(home)/Developer", "/Applications"].filter { FileManager.default.fileExists(atPath: $0) },
+            skippedDirectoryNames: BulkCrawler.defaultSkippedDirectoryNames,
+            skipHeavyDevDirs: true, usePersistentMMapCache: true)
+        #endif
+    }
+    private func applyConfiguration(_ configuration: IndexingConfiguration) {
+        _configuredRoots = configuration.roots
+        _skippedDirectoryNames = configuration.skippedDirectoryNames
+        _skipHeavyDevDirs = configuration.skipHeavyDevDirs
+        _usePersistentMMapCache = configuration.usePersistentMMapCache
+    }
+    public func saveConfigurationAndRebuild(_ configuration: IndexingConfiguration,
+                                            explicitlyRepair: Bool = false) throws {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard configuration.isValid else { throw IndexingPreferences.SaveError.invalidConfiguration }
+        do {
+            try preferences?.save(configuration, explicitlyRepair: explicitlyRepair)
+        } catch IndexingPreferences.SaveError.repairRequired {
+            preferencesNeedRepair = true
+            throw IndexingPreferences.SaveError.repairRequired
+        }
+        applyConfiguration(configuration)
+        configurationBlocked = false
+        preferencesNeedRepair = false
+        startIndexing()
+    }
+    private var lifecycleRevision: UInt64 = 0
+    private var indexingGeneration: UInt64 = 0
+    private var _onIndexingLifecycle: (@Sendable (IndexingLifecycleEvent) -> Void)?
+    public var onIndexingLifecycle: (@Sendable (IndexingLifecycleEvent) -> Void)? {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _onIndexingLifecycle }
+        set { stateLock.lock(); defer { stateLock.unlock() }; _onIndexingLifecycle = newValue; publishLifecycle() }
+    }
+    // Called while holding stateLock; callbacks must not synchronously wait on UI work.
+    private func publishLifecycle() {
+        lifecycleRevision &+= 1
+        _onIndexingLifecycle?(IndexingLifecycleEvent(revision: lifecycleRevision,
+            generation: indexingGeneration, isIndexing: _isIndexing))
+    }
 
     private var entries: [IndexedFileEntry] = []
     private var dirToIndices: [String: [Int]] = [:]
@@ -60,6 +130,8 @@ public final class FSearchIndex: @unchecked Sendable {
     var refreshReadHookForTesting: (@Sendable (String) -> Void)?
     var crawlProgressHookForTesting: (@Sendable (Int) -> Void)?
     var beforeCrawlLockHookForTesting: (@Sendable () -> Void)?
+    var crawlRootsHookForTesting: (@Sendable ([String]) -> Void)?
+    var afterCacheAuthorizationHookForTesting: (@Sendable () -> Void)?
     var beforeCacheWriteHookForTesting: (@Sendable () -> Void)?
     var pendingRefreshPathCountForTesting: Int {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -230,22 +302,31 @@ public final class FSearchIndex: @unchecked Sendable {
     /// waits for updateLock, then reconciles changes that arrived during the crawl.
     public func startIndexing(roots: [String]? = nil) {
         stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !configurationBlocked else { publishLifecycle(); return }
         if let roots = roots { _configuredRoots = roots }
-        guard !_isIndexing else { pendingReindex = true; stateLock.unlock(); return }
+        indexingGeneration &+= 1
+        if _isIndexing { pendingReindex = true; publishLifecycle(); return }
         _isIndexing = true
+        publishLifecycle()
+        launchCrawlLocked()
+    }
+
+    /// Reserves the next pass before releasing stateLock; no false idle gap.
+    private func launchCrawlLocked() {
         let targetRoots = _configuredRoots
         let skipHeavy = _skipHeavyDevDirs
         let skippedSet = _skippedDirectoryNames
         let persist = _usePersistentMMapCache
         let configuration = cacheConfigurationData()
-        stateLock.unlock()
-        let watcherStarted = startFSEvents(watching: targetRoots)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             #if BETTERFINDER_TESTING
             self.beforeCrawlLockHookForTesting?()
             #endif
             self.updateLock.lock()
+            // Watcher ownership is serialized with crawl publication, never while holding stateLock.
+            let watcherStarted = self.startFSEvents(watching: targetRoots)
             // Capture explicit scopes only after obtaining the publication lock:
             // a queued refresh may have registered and committed one while this
             // full crawl was waiting to start. Install one combined snapshot.
@@ -266,6 +347,9 @@ public final class FSearchIndex: @unchecked Sendable {
                 self.loadedFromMMapCache = true
                 self.onIndexUpdated?(cached.count, 0)
             }
+            #if BETTERFINDER_TESTING
+            self.crawlRootsHookForTesting?(crawlRoots)
+            #endif
             let result = BulkCrawler.crawlTreeResult(roots: crawlRoots, skipHeavyDevDirs: skipHeavy,
                 customSkippedDirs: skippedSet, maxEntries: 500_000, progress: { count in
                     #if BETTERFINDER_TESTING
@@ -291,11 +375,15 @@ public final class FSearchIndex: @unchecked Sendable {
             self.stateLock.lock()
             let repeatCrawl = self.pendingReindex || configurationChanged
             self.pendingReindex = false
-            self._isIndexing = false
-            self.stateLock.unlock()
             self.updateLock.unlock()
+            if repeatCrawl {
+                self.launchCrawlLocked()
+            } else {
+                self._isIndexing = false
+                self.publishLifecycle()
+            }
+            self.stateLock.unlock()
             self.onIndexUpdated?(self.indexedCount, ms)
-            if repeatCrawl { self.startIndexing() }
         }
     }
 
@@ -309,6 +397,15 @@ public final class FSearchIndex: @unchecked Sendable {
         // The label belongs to the crawl that produced these entries. Settings
         // may change after the earlier freshness check, even during encoding.
         let data = encodeIndexCache(list, configuration: configuration)
+        stateLock.lock()
+        let mayWrite = _usePersistentMMapCache && !configurationBlocked
+        stateLock.unlock()
+        guard mayWrite else { return }
+        #if BETTERFINDER_TESTING
+        afterCacheAuthorizationHookForTesting?()
+        #endif
+        // No state/UI lock across filesystem IO. An already admitted write may
+        // finish after Save turns caching off; no subsequent write is admitted.
         try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
         _ = chmod(path, 0o600)
     }

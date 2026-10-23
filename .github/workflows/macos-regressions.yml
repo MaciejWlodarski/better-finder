@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      run_shutdown_probe:
+        description: Run the separately approved synthetic shutdown diagnostic
+        type: boolean
+        required: false
+        default: false
 permissions:
   contents: read
 jobs:
@@ -26,6 +32,122 @@ jobs:
         with:
           name: native-view-renders-${{ github.run_id }}-${{ github.run_attempt }}
           path: .build/previews-ci-artifact/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+  terminal_shutdown_probe:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_shutdown_probe }}
+    needs: macos
+    runs-on: macos-14
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run bounded synthetic shutdown diagnostic
+        id: shutdown_probe
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, sys
+          try:
+              root = pathlib.Path.cwd().resolve()
+              head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], timeout=5, stderr=subprocess.DEVNULL).decode().strip()
+              assert re.fullmatch('[0-9a-f]{40}', head) and head == os.environ['GITHUB_SHA']
+              names = subprocess.check_output(['git', 'ls-files', '-z'], timeout=5, stderr=subprocess.DEVNULL).decode().split('\0')
+              files = []
+              for name in sorted(filter(None, names)):
+                  path = root / name
+                  assert path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(root)
+                  files.append({'path': name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+              target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'bf-shutdown-manifest.json'
+              target.write_text(json.dumps({'schema': 2, 'file_count': len(files), 'files': files}, sort_keys=True) + '\n')
+          except Exception:
+              sys.exit('Shutdown probe: INCONCLUSIVE; stage=manifest')
+          PY
+          status=0
+          python3 scripts/run_terminal_shutdown_probe.py --approved-ephemeral-runner --manifest "$RUNNER_TEMP/bf-shutdown-manifest.json" > "$RUNNER_TEMP/bf-shutdown-result.json" 2>/dev/null || status=$?
+          python3 - "$status" <<'PY'
+          import hashlib, json, math, os, pathlib, re, sys
+          MAX_BYTES = 16384
+          STAGES = {'preflight','build-c','build-swift','sign','helper-controls','cancel-controls',
+                    'quit-cases','identity','startup','shutdown','protocol','cleanup','complete'}
+
+          def validate(data, manifest_bytes, commit):
+              assert set(data) == {'schema','result','configuration','transform_sha256','source_manifest_sha256',
+                                   'darwin_release','architecture','swift_version','clang_version','cases'}
+              assert data['schema'] == 2 and data['result'] == 'COMPLETE'
+              assert data['configuration'] == 'restoration-disabled-single-process'
+              assert re.fullmatch('[0-9a-f]{64}', data['transform_sha256'])
+              assert data['source_manifest_sha256'] == hashlib.sha256(manifest_bytes).hexdigest()
+              assert data['architecture'] in {'arm64','x86_64'}
+              for key in ('darwin_release','swift_version','clang_version'):
+                  assert re.fullmatch(r'[0-9]+(?:\.[0-9]+){0,3}', data[key]) and len(data[key]) <= 32
+              expected = ['helper-' + mode + '-' + action for mode in ('default','resistant')
+                          for action in ('cleanup','eof','deadline')]
+              expected += ['cancel-default','cancel-resistant','quit-default','quit-resistant']
+              assert len(data['cases']) == 10
+              for case, name in zip(data['cases'], expected):
+                  assert case['case'] == name and case['cleanup'] == 'verified'
+                  if name.startswith('helper-'):
+                      assert set(case) == {'case','result','cleanup'} and case['result'] == 'CONTROL_PASS'
+                      continue
+                  assert set(case) == {'case','result','cleanup','normal_exit','restoration_enabled',
+                                       'persistence_tested','post_exit_response','quit_to_exit_observation_ms',
+                                       'challenge_roundtrip_ms'}
+                  assert case['normal_exit'] is True and case['restoration_enabled'] is False
+                  assert case['persistence_tested'] is False and type(case['post_exit_response']) is bool
+                  elapsed = case['quit_to_exit_observation_ms']
+                  assert type(elapsed) in (int,float) and math.isfinite(elapsed) and 0 <= elapsed <= 5000
+                  if name.startswith('cancel-'):
+                      assert case['result'] == 'CONTROL_PASS' and not case['post_exit_response']
+                  else:
+                      assert case['result'] == ('CONFIRMED' if case['post_exit_response'] else 'INCONCLUSIVE')
+                  duration = case['challenge_roundtrip_ms']
+                  if case['post_exit_response']:
+                      assert type(duration) in (int,float) and math.isfinite(duration) and 0 <= duration <= 1000
+                  else:
+                      assert duration is None
+              assert re.fullmatch('[0-9a-f]{40}', commit)
+              return {'reviewed_commit': commit, 'probe': data}
+
+          def main():
+              status = int(sys.argv[1])
+              root = pathlib.Path(os.environ['RUNNER_TEMP'])
+              try:
+                  path = root / 'bf-shutdown-result.json'
+                  assert path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= MAX_BYTES
+                  data = json.loads(path.read_bytes())
+                  if status:
+                      result = data.get('result')
+                      stage = data.get('stage')
+                      assert set(data) == {'schema','result','clean_success','stage'} and data['schema'] == 2
+                      assert result in {'INCONCLUSIVE','SAFETY_FAILURE'} and data['clean_success'] is False
+                      assert stage in STAGES
+                      print('Shutdown probe: ' + result + '; stage=' + stage)
+                      return 1
+                  manifest = (root / 'bf-shutdown-manifest.json').read_bytes()
+                  output = validate(data, manifest, os.environ['GITHUB_SHA'])
+                  payload = (json.dumps(output, sort_keys=True, allow_nan=False) + '\n').encode()
+                  assert len(payload) <= MAX_BYTES
+                  dest = pathlib.Path('.build/shutdown-probe-artifact')
+                  assert not dest.exists()
+                  dest.mkdir(parents=True)
+                  (dest / 'result.json').write_bytes(payload)
+                  print('Shutdown probe completed with verified cleanup; fixed JSON staged.')
+                  return 0
+              except Exception:
+                  print('Shutdown probe: INCONCLUSIVE; stage=unavailable')
+                  return 1
+
+          if __name__ == '__main__':
+              sys.exit(main())
+          PY
+      - name: Upload fixed shutdown diagnostic JSON
+        if: success() && steps.shutdown_probe.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-shutdown-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .build/shutdown-probe-artifact/result.json
           if-no-files-found: error
           retention-days: 1
           compression-level: 0

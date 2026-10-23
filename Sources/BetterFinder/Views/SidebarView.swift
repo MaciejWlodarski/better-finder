@@ -57,7 +57,13 @@ public struct SidebarView: View {
 
                     VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
                         sidebarSectionHeader("Dyski i woluminy")
-                        if appState.mountedVolumes.isEmpty {
+                        if let notice = appState.volumeInventory.notice {
+                            Text(notice)
+                                .font(FinderUI.detailFont)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, FinderUI.rowSpacing)
+                        }
+                        if appState.volumeInventory.canShowEmpty {
                             Text("Brak dostępnych woluminów")
                                 .font(FinderUI.detailFont)
                                 .foregroundStyle(.secondary)
@@ -91,11 +97,17 @@ public struct SidebarView: View {
                 sidebarActionButton(icon: "plus", label: "Przypnij bieżący folder") {
                     appState.addBookmark(for: activeTab.currentURL)
                 }
-                .disabled(appState.customBookmarks.contains { $0.url.path == activeTab.currentURL.path })
+                .disabled(appState.pinnedFolderNotice != nil || appState.customBookmarks.contains { $0.url.path == activeTab.currentURL.path })
             }
 
             VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
-                if appState.customBookmarks.isEmpty {
+                if let notice = appState.pinnedFolderNotice {
+                    Text(notice)
+                        .font(FinderUI.detailFont)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, FinderUI.rowSpacing)
+                }
+                if appState.customBookmarks.isEmpty && appState.pinnedFolderNotice == nil {
                     Button {
                         appState.addBookmark(for: activeTab.currentURL)
                     } label: {
@@ -445,7 +457,6 @@ public struct SidebarView: View {
                     appState.showSettingsSheet = true
                 }
                 sidebarActionButton(icon: "arrow.clockwise", label: "Przebuduj indeks wyszukiwania") {
-                    appState.isIndexing = true
                     FSearchIndex.shared.startIndexing()
                 }
                 .disabled(appState.isIndexing)

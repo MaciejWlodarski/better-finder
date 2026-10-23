@@ -8,12 +8,89 @@ public struct PathBreadcrumbSegment: Identifiable {
     public let isRoot: Bool
 }
 
+/// Retained layout regression contract for the previous breadcrumb renderer.
+/// The visible address field now uses native NSTextField scrolling; these metrics
+/// are not evidence of the new field's native focus or layout correctness.
+struct BreadcrumbLayoutMetrics {
+    let currentWidth: CGFloat
+    let ancestorWidth: CGFloat
+    let spacing: CGFloat
+
+    static func finiteWidth(_ proposedWidth: CGFloat?) -> CGFloat {
+        guard let width = proposedWidth, width.isFinite else { return 280 }
+        return max(0, width)
+    }
+
+    init(availableWidth: CGFloat, idealCurrentWidth: CGFloat, hasAncestors: Bool) {
+        let width = Self.finiteWidth(availableWidth)
+        spacing = hasAncestors ? min(2, width) : 0
+        let usable = max(0, width - spacing)
+        currentWidth = min(Self.finiteWidth(idealCurrentWidth), 280, hasAncestors ? usable * 0.6 : usable)
+        ancestorWidth = hasAncestors ? max(0, usable - currentWidth) : 0
+    }
+}
+
+#if BETTERFINDER_TESTING
+/// Screenshot-only presentation. This does not exercise editing, keyboard routing,
+/// validation or native focus; interaction tests must leave the environment empty.
+struct FolderAddressVisualFixture: Sendable {
+    let draft: String
+    var validationMessage: String? = nil
+    var isFocused: Bool = true
+}
+
+private struct FolderAddressVisualFixturesKey: EnvironmentKey {
+    static let defaultValue: [UUID: FolderAddressVisualFixture] = [:]
+}
+
+extension EnvironmentValues {
+    var folderAddressVisualFixtures: [UUID: FolderAddressVisualFixture] {
+        get { self[FolderAddressVisualFixturesKey.self] }
+        set { self[FolderAddressVisualFixturesKey.self] = newValue }
+    }
+}
+#endif
+
 public struct PathBreadcrumbBar: View {
     @ObservedObject var appState: AppState
     @ObservedObject var pane: PaneTabState
     @ViewState private var editablePathText: String = ""
     @ViewState private var pathValidationMessage: String? = nil
-    @FocusState private var isPathFieldFocused: Bool
+    @ViewState private var isPathFieldFocused = false
+
+    #if BETTERFINDER_TESTING
+    @Environment(\.folderAddressVisualFixtures) private var visualFixtures
+    private var visualFixture: FolderAddressVisualFixture? { visualFixtures[pane.id] }
+    #endif
+
+    private var isVisualFixture: Bool {
+        #if BETTERFINDER_TESTING
+        return visualFixture != nil
+        #else
+        return false
+        #endif
+    }
+
+    private var displayedText: Binding<String> {
+        #if BETTERFINDER_TESTING
+        if let visualFixture { return .constant(visualFixture.draft) }
+        #endif
+        return $editablePathText
+    }
+
+    private var displayedValidationMessage: String? {
+        #if BETTERFINDER_TESTING
+        if let visualFixture { return visualFixture.validationMessage }
+        #endif
+        return pathValidationMessage
+    }
+
+    private var displayedFocus: Bool {
+        #if BETTERFINDER_TESTING
+        if let visualFixture { return visualFixture.isFocused }
+        #endif
+        return isPathFieldFocused
+    }
 
     public init(appState: AppState, pane: PaneTabState) {
         self.appState = appState
@@ -39,113 +116,48 @@ public struct PathBreadcrumbBar: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                if pane.isEditingPathBar {
-                    pathEditor
-                } else {
-                    breadcrumbTrail
-                        .frame(maxWidth: .infinity)
-
-                    HStack(spacing: 2) {
-                        pathActionButton(icon: "pencil", label: "Edytuj ścieżkę", help: "Przejdź do folderu (⌘L)") {
-                            beginEditing()
-                        }
-                        pathActionButton(icon: "doc.on.doc", label: "Kopiuj ścieżkę bieżącego folderu", help: pane.currentURL.path) {
-                            FileOperationsManager.shared.copyPathString(pane.currentURL.path)
-                        }
-                        folderActionsMenu
-                    }
-                    .fixedSize()
+                pathEditor
+                pathActionButton(icon: "doc.on.doc", label: "Kopiuj ścieżkę bieżącego folderu", help: pane.currentURL.path) {
+                    activatePane()
+                    FileOperationsManager.shared.copyPathString(pane.currentURL.path)
                 }
+                .accessibilityIdentifier("folder.address.copy")
+                folderActionsMenu
             }
 
-            if pane.isEditingPathBar, let pathValidationMessage {
-                Text(pathValidationMessage)
+            if pane.isEditingPathBar || isVisualFixture, let message = displayedValidationMessage {
+                Label(message, systemImage: "exclamationmark.circle")
                     .foregroundStyle(.red)
+                    .font(FinderUI.captionFont)
+                    .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 8)
             }
         }
-        .font(.system(size: 13))
-        .padding(.horizontal, 10)
+        .font(FinderUI.bodyFont)
+        .padding(.horizontal, FinderUI.chromeInset)
         .padding(.vertical, 6)
         .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .bottom) {
             Divider()
         }
-        .onChange(of: pane.isEditingPathBar) { _, isEditing in
-            if !isEditing {
-                pathValidationMessage = nil
-                isPathFieldFocused = false
-            }
+        .allowsHitTesting(!isVisualFixture)
+        .onAppear { editablePathText = pane.currentURL.path }
+        .onChange(of: pane.isEditingPathBar) { _, editing in
+            if !editing { resetEditor() }
         }
-    }
-
-    private var breadcrumbTrail: some View {
-        ScrollViewReader { scrollProxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 2) {
-                    ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
-                        if index > 0 {
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(.tertiary)
-                                .accessibilityHidden(true)
-                        }
-                        breadcrumbButton(segment)
-                            .id(segment.id)
-                    }
-                }
-            }
-            .defaultScrollAnchor(.trailing)
-            .onAppear {
-                scrollProxy.scrollTo(pane.currentURL.path, anchor: .trailing)
-            }
-            .onChange(of: pane.currentURL) { _, url in
-                scrollProxy.scrollTo(url.path, anchor: .trailing)
-            }
-            .help(pane.currentURL.path)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                beginEditing()
-            }
+        .onChange(of: pane.pathEditRequest) { _, _ in
+            activatePane()
+            editablePathText = pane.currentURL.path
+            pathValidationMessage = nil
         }
-        .frame(height: 28)
-    }
-
-    private func breadcrumbButton(_ segment: PathBreadcrumbSegment) -> some View {
-        let isCurrent = segment.url.path == pane.currentURL.path
-
-        return Button {
-            navigate(to: segment.url)
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: segment.isRoot ? "internaldrive" : "folder")
-                    .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary)
-                    .accessibilityHidden(true)
-                Text(segment.name)
-                    .font(.system(size: 13, weight: isCurrent ? .semibold : .regular))
-                    .foregroundStyle(isCurrent ? Color.primary : Color.secondary)
-                    .lineLimit(1)
-                    .fixedSize()
-            }
-            .padding(.horizontal, 6)
-            .frame(minHeight: 28)
-            .background {
-                if isCurrent {
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Color(nsColor: .controlBackgroundColor))
-                }
-            }
-            .contentShape(Rectangle())
+        .onChange(of: pane.currentURL) { _, _ in
+            // A newer navigation wins over the old draft, even when another
+            // control initiated it. Ordinary listing refreshes do not erase text.
+            cancelEditing()
         }
-        .buttonStyle(.plain)
-        .help(segment.url.path)
-        .accessibilityLabel(segment.name)
-        .accessibilityValue(isCurrent ? "Bieżący folder" : segment.url.path)
-        .accessibilityHint("Otwiera folder. Menu kontekstowe zawiera działania dla tego folderu.")
-        .accessibilityAddTraits(isCurrent ? .isSelected : [])
-        .contextMenu {
-            folderContextActions(for: segment.url)
+        .onChange(of: appState.activePaneSide) { _, _ in
+            if appState.isDualPane && appState.activeTab.id != pane.id { cancelEditing() }
         }
     }
 
@@ -155,50 +167,48 @@ public struct PathBreadcrumbBar: View {
                 .foregroundStyle(Color.accentColor)
                 .accessibilityHidden(true)
 
-            TextField("Ścieżka folderu, np. ~/Documents", text: $editablePathText)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13))
-                .focused($isPathFieldFocused)
-                .accessibilityLabel("Ścieżka folderu")
-                .accessibilityHint(pathValidationMessage ?? "Return otwiera folder, Escape anuluje. Możesz użyć ~ lub ścieżki względnej.")
-                .help("Wpisz ścieżkę bezwzględną, ścieżkę względem bieżącego folderu lub użyj ~ dla folderu domowego.")
-                .onSubmit {
-                    submitPath()
-                }
-                .onExitCommand {
-                    cancelEditing()
-                }
-                .onChange(of: editablePathText) { _, _ in
-                    pathValidationMessage = nil
-                }
+            FolderAddressTextField(
+                text: displayedText,
+                isEditing: !isVisualFixture && pane.isEditingPathBar,
+                focusRequest: pane.pathEditRequest,
+                mayFocus: { !isVisualFixture && pane.isEditingPathBar && appState.activeTab.id == pane.id },
+                beginEditing: {
+                    activatePane()
+                    pane.isEditingPathBar = true
+                    isPathFieldFocused = true
+                },
+                endEditing: { isPathFieldFocused = false },
+                changed: { pathValidationMessage = nil },
+                submit: submitPath,
+                cancel: cancelEditing
+            )
+            .frame(minWidth: 40, maxWidth: .infinity, minHeight: 24)
+            .help("Kliknij, aby edytować lub skopiować ścieżkę (⌘L). Return otwiera folder, Escape anuluje. Obsługuje ~ i adresy file:///.")
 
-            Button("Idź") {
-                submitPath()
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            .help("Otwórz wpisany folder (Return)")
-
-            pathActionButton(icon: "xmark", label: "Anuluj edycję ścieżki", help: "Anuluj (Escape)") {
-                cancelEditing()
+            if pane.isEditingPathBar || isVisualFixture {
+                pathActionButton(icon: "arrow.right", label: "Otwórz wpisany folder", help: "Otwórz folder (Return)", action: submitPath)
+                    .accessibilityIdentifier("folder.address.go")
+                pathActionButton(icon: "xmark", label: "Anuluj edycję ścieżki", help: "Anuluj (Escape)", action: cancelEditing)
+                    .accessibilityIdentifier("folder.address.cancel")
             }
         }
-        .padding(.horizontal, 8)
-        .frame(minHeight: 30)
-        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 5))
+        .padding(.horizontal, 10)
+        .frame(minHeight: 32)
+        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
         .overlay {
-            RoundedRectangle(cornerRadius: 5)
-                .strokeBorder(pathValidationMessage == nil ? Color.accentColor : Color.red, lineWidth: 1)
-        }
-        .onAppear {
-            editablePathText = pane.currentURL.path
-            pathValidationMessage = nil
-            isPathFieldFocused = true
+            RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
+                .strokeBorder(displayedValidationMessage != nil ? Color.red : (displayedFocus ? Color.accentColor : Color.secondary.opacity(0.25)), lineWidth: 1)
         }
     }
 
     private var folderActionsMenu: some View {
         Menu {
+            Section("Foldery nadrzędne") {
+                ForEach(Array(segments.dropLast().reversed())) { segment in
+                    Button(segment.isRoot ? segment.name : segment.url.path) { navigate(to: segment.url) }
+                }
+            }
+            Divider()
             folderContextActions(for: pane.currentURL)
 
             if !pane.selectedItems.isEmpty {
@@ -225,7 +235,7 @@ public struct PathBreadcrumbBar: View {
             }
         } label: {
             Image(systemName: "ellipsis.circle")
-                .frame(width: 28, height: 28)
+                .frame(width: FinderUI.iconButtonSize, height: FinderUI.iconButtonSize)
                 .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
@@ -267,7 +277,7 @@ public struct PathBreadcrumbBar: View {
         Button {
             appState.addBookmark(for: url)
         } label: {
-            Label("Przypnij folder do paska bocznego", systemImage: "pin")
+            Label("Dodaj folder do Ulubionych", systemImage: "star")
         }
         .disabled(appState.customBookmarks.contains { $0.url.path == url.path })
     }
@@ -276,7 +286,7 @@ public struct PathBreadcrumbBar: View {
         Button(action: action) {
             Image(systemName: icon)
                 .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
+                .frame(width: FinderUI.iconButtonSize, height: FinderUI.iconButtonSize)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.borderless)
@@ -284,43 +294,37 @@ public struct PathBreadcrumbBar: View {
         .accessibilityLabel(label)
     }
 
-    private func beginEditing() {
+    private func resetEditor() {
         editablePathText = pane.currentURL.path
-        pathValidationMessage = nil
-        pane.isEditingPathBar = true
-    }
-
-    private func cancelEditing() {
-        pane.isEditingPathBar = false
         isPathFieldFocused = false
         pathValidationMessage = nil
     }
 
+    private func cancelEditing() {
+        pane.isEditingPathBar = false
+        resetEditor()
+    }
+
     private func submitPath() {
-        let expandedPath = (editablePathText as NSString).expandingTildeInPath
-        guard !expandedPath.isEmpty else {
-            pathValidationMessage = "Wpisz ścieżkę folderu."
-            isPathFieldFocused = true
-            return
+        activatePane()
+        do {
+            let target = try FolderAddress.resolve(editablePathText, relativeTo: pane.currentURL,
+                                                   home: FileManager.default.homeDirectoryForCurrentUser)
+            // Do not preflight fileExists here. Navigation validates and commits
+            // once; failure must retain the draft as well as the pane snapshot.
+            guard pane.navigate(to: target, clearSearch: true) else {
+                pathValidationMessage = pane.navigationDiagnostic ?? "Nie udało się otworzyć folderu."
+                return
+            }
+            cancelEditing()
+        } catch {
+            pathValidationMessage = error.localizedDescription
         }
-
-        let baseURL = URL(fileURLWithPath: pane.currentURL.path, isDirectory: true)
-        let targetURL = URL(fileURLWithPath: expandedPath, isDirectory: true, relativeTo: baseURL).standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: targetURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            pathValidationMessage = "Nie znaleziono folderu pod podaną ścieżką."
-            isPathFieldFocused = true
-            return
-        }
-
-        navigate(to: targetURL)
-        cancelEditing()
     }
 
     private func navigate(to url: URL) {
-        pane.searchQuery = ""
-        pane.activeFilterPills = []
-        pane.navigate(to: url)
+        activatePane()
+        if pane.navigate(to: url, clearSearch: true) { cancelEditing() }
     }
 
     private func activatePane() {

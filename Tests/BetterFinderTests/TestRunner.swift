@@ -1,7 +1,8 @@
 import Foundation
 
-struct RegressionFailure: Error, CustomStringConvertible {
+struct RegressionFailure: LocalizedError, CustomStringConvertible {
     let description: String
+    var errorDescription: String? { description }
 }
 
 func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath, line: UInt = #line) throws {
@@ -11,6 +12,14 @@ func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath
 @main struct TestRunner {
     @MainActor static func main() async {
         do {
+            try CommandColdStartRegressionTests().runBeforeApplicationInitialization()
+            try await FolderSizeLifecycleRegressionTests().runAll()
+            let analysisWorkCount = try await AnalysisWorkLifecycleRegressionTests.runAll()
+            let analysisAdapterCount = try await AnalysisWorkAdapterRegressionTests.runAll()
+            print("PASS \(analysisWorkCount + analysisAdapterCount) bounded analysis worker and production adapter regressions")
+            let duplicateCleanupCount = try await DuplicateCleanupLifecycleRegressionTests.runAll()
+            print("PASS \(duplicateCleanupCount) asynchronous duplicate cleanup regressions")
+            try await DirectoryNavigationRegressionTests().runAll()
             let tests = NavigationTests()
             try await tests.testDirectoryShowsFilesBeforeTagMetadataCompletes()
             print("PASS directory listing precedes asynchronous tag metadata")
@@ -30,11 +39,57 @@ func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath
             print("PASS scope invalidation respects path boundaries")
             try tests.testNewTabIncludesInheritedHiddenFiles()
             print("PASS new tabs inherit visible hidden files")
+            try await FileDropLifecycleRegressionTests().runAll()
             try await tests.testDropLoadsAllFileProvidersAsOneDeduplicatedBatch()
             print("PASS drop collects every URL before starting a batch")
             try await tests.testSearchCommitPublishesUpdatedMetadataAndRevision()
             print("PASS same-path search updates publish fresh metadata to the inspector")
-            print("11 regression checks passed")
+            try await tests.testNavigationCannotSelectOldSearchResults()
+            try tests.testViewModeSwitchRemovesInvisibleOutlineSelection()
+            try tests.testVisibleExpandedAndAncestorColumnChangesInvalidate()
+            try tests.testAnalysisSelectionIsBoundedToModeAndRoot()
+            try await ThumbnailLifecycleRegressionTests().runAll()
+            try await tests.testThumbnailInvalidationRejectsLateGeneration()
+            try await tests.testFolderSizesExposePartialAndCountDeepFiles()
+            try await tests.testExternalChangeInvalidatesFolderSizeWithoutVisiblePane()
+            try tests.testColumnSortUsesPaneRulesAndUnknownSizesSortLast()
+            try tests.testInvalidSearchClearsActionTargetsAndShowsDiagnostic()
+            try await SearchQuerySafetyRegressionTests.runAll()
+            try SearchMatchingPrecisionRegressionTests.runAll()
+            try IndexingPreferencesLifecycleRegressionTests.runAll()
+            try await SearchIndexRegressionTests.runAll()
+            print("Search/index regression suite passed")
+            try PinnedFolderRegressionTests.runAll()
+            try SidebarFavoritesRegressionTests.runAll()
+            try await VolumeRefreshRegressionTests.runAll()
+            try await SavedSearchRegressionTests().runAll()
+            try await SessionRestorationRegressionTests().runAll()
+            try await QuickLookOwnershipRegressionTests().runAll()
+            try FolderAddressRegressionTests.runAll()
+            try GUIPresentationRegressionTests().runAll()
+            try AnalysisViewBindingRegressionTests().runAll()
+            try AnalysisRequestSafetyRegressionTests().runAll()
+            let comparisonSnapshots = ComparisonSnapshotRegressionTests()
+            try comparisonSnapshots.testLeftFileMutationBetweenHashesIsUnreadable()
+            try comparisonSnapshots.testLeftFileReplacementBetweenHashesIsUnreadable()
+            try comparisonSnapshots.testLinkReplacementBetweenSidesIsUnreadable()
+            try comparisonSnapshots.testComparisonEntryBudgetExactBoundary()
+            try comparisonSnapshots.testComparisonEntryBudgetOverflowDisablesCopy()
+            print("PASS comparison pair snapshots and retained-entry boundaries")
+            try await DiskAnalysisRegressionTests().runAll()
+            try TerminalPresentationRegressionTests().runAll()
+            try TerminalDrawerLayoutRegressionTests.runAll()
+            try await DirectoryReconciliationRegressionTests.runAll()
+            try await TerminalWorkspaceRegressionTests().runAll()
+            try await TerminalMetadataRefreshRegressionTests().runAll()
+            try await TerminalApplicationLifecycleRegressionTests().runAll()
+            print("PASS application-owned terminal quit lifecycle regressions")
+            print("Disk analysis/terminal regression suite passed")
+            let previewChecks = try await InspectorPreviewRegressionTests.runAll()
+            print("\(previewChecks) inspector preview checks passed")
+            let fileOperationChecks = try await FileOperationSafetyTests.runAll()
+            print("\(fileOperationChecks) file-operation safety checks passed")
+            print("20 navigation/cache regression checks passed")
         } catch {
             fputs("FAIL: \(error)\n", stderr)
             exit(1)

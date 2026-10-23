@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import AppKit
 import QuickLookUI
 
@@ -8,57 +9,127 @@ public enum PaneSide: String, Sendable {
 }
 
 public struct SidebarLocationItem: Identifiable, Hashable {
-    public var id: String { url.path }
+    public var id: String { bookmarkPath ?? url.path }
+    public var bookmarkPath: String? = nil
     public let title: String
     public let iconName: String
     public let url: URL
     public let isCustomBookmark: Bool
 }
 
-public struct SavedSmartFolderItem: Identifiable, Codable, Hashable {
-    public let id: String
-    public let title: String
-    public let query: String
-}
-
-public struct VolumeInfoItem: Identifiable {
-    public var id: String { url.path }
-    public let name: String
-    public let url: URL
-    public let totalBytes: Int64
-    public let freeBytes: Int64
-    public let isRemovable: Bool
-
-    public var usedFraction: Double {
-        guard totalBytes > 0 else { return 0 }
-        return Double(totalBytes - freeBytes) / Double(totalBytes)
-    }
-}
-
 @MainActor
 public final class AppState: ObservableObject {
     public static let shared = AppState()
 
-    @Published public var tabs: [PaneTabState] = []
-    @Published public var activeTabId: UUID
+    // A test executable must never restore or write the user's real preferences,
+    // enumerate their home, or automatically start the indexer.
+    private static let preferences: UserDefaults = {
+        #if BETTERFINDER_TESTING
+        guard let suite = UserDefaults(suiteName: "com.betterfinder.tests.\(UUID().uuidString)") else {
+            fatalError("Could not create isolated test preferences")
+        }
+        return suite
+        #else
+        return UserDefaults.standard
+        #endif
+    }()
+
+    private static var homeDirectoryURL: URL {
+        #if BETTERFINDER_TESTING
+        guard let root = ProcessInfo.processInfo.environment["BETTERFINDER_TEST_ROOT"],
+              root.hasPrefix("/"), FileManager.default.fileExists(atPath: root) else {
+            fatalError("BETTERFINDER_TEST_ROOT must identify an isolated test directory")
+        }
+        return URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL
+        #else
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        #endif
+    }
+
+    /// Exact special sidebar location; test builds use the isolated fixture home.
+    var systemTrashURL: URL { Self.homeDirectoryURL.appendingPathComponent(".Trash", isDirectory: true) }
+
+    let terminalWorkspace = TerminalWorkspace()
+
+    @Published public var tabs: [PaneTabState] = [] {
+        didSet { observeSessionPanes(); synchronizeQuickLookOwnership() }
+    }
+    @Published public var activeTabId: UUID {
+        didSet {
+            if oldValue != activeTabId { tabs.first { $0.id == oldValue }?.cancelSessionRestoration() }
+            synchronizeQuickLookOwnership()
+        }
+    }
 
     // Dual-pane mode
     @Published public var isDualPane: Bool = false {
-        didSet { UserDefaults.standard.set(isDualPane, forKey: "bf.isDualPane") }
+        didSet {
+            Self.preferences.set(isDualPane, forKey: "bf.isDualPane")
+            if !isDualPane { rightPane.cancelPendingSavedSearches() }
+            synchronizeQuickLookOwnership()
+        }
     }
-    @Published public var rightPane: PaneTabState
-    @Published public var activePaneSide: PaneSide = .left
+    @Published public var rightPane: PaneTabState {
+        didSet { observeSessionPanes(); synchronizeQuickLookOwnership() }
+    }
+    @Published public var activePaneSide: PaneSide = .left {
+        didSet {
+            if oldValue != activePaneSide {
+                (oldValue == .left ? leftTab : rightPane).cancelSessionRestoration()
+            }
+            synchronizeQuickLookOwnership()
+        }
+    }
+    @Published public private(set) var restoreSessionEnabled = true
+    @Published public private(set) var sessionPersistenceNotice: String?
+    private let sessionStore: FinderSessionStore
+    private var sessionObservers: [AnyCancellable] = []
+    private var appSessionObserver: AnyCancellable?
+    private var sessionSaveTask: Task<Void, Never>?
+    private var sessionObservationReady = false
+
+    private func observeSessionPanes() {
+        guard sessionObservationReady else { return }
+        sessionObservers = (tabs + [rightPane]).map { pane in
+            pane.objectWillChange.sink { [weak self] _ in self?.scheduleSessionSave() }
+        }
+        scheduleSessionSave()
+    }
+
+    private func scheduleSessionSave() {
+        guard sessionObservationReady, restoreSessionEnabled else { return }
+        sessionSaveTask?.cancel()
+        sessionSaveTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !Task.isCancelled else { return }
+            self?.flushSessionState()
+        }
+    }
+
+    public func setSessionRestorationEnabled(_ enabled: Bool) {
+        sessionSaveTask?.cancel()
+        sessionStore.setEnabled(enabled)
+        restoreSessionEnabled = enabled
+        if enabled { flushSessionState() }
+    }
+
+    public func clearSavedSession() {
+        sessionSaveTask?.cancel()
+        sessionStore.clearAndDisable()
+        restoreSessionEnabled = false
+        sessionPersistenceNotice = nil
+    }
 
     // UI Panels & Modals
     @Published public var showSidebar: Bool = true {
-        didSet { UserDefaults.standard.set(showSidebar, forKey: "bf.showSidebar") }
+        didSet { Self.preferences.set(showSidebar, forKey: "bf.showSidebar") }
     }
     @Published public private(set) var recentlyClosedTabs: [PaneTabState] = []
     @Published public var showInspector: Bool = false {
-        didSet { UserDefaults.standard.set(showInspector, forKey: "bf.showInspector") }
+        didSet { Self.preferences.set(showInspector, forKey: "bf.showInspector") }
     }
     @Published public var iconGridSize: Double = 64.0 {
-        didSet { UserDefaults.standard.set(iconGridSize, forKey: "bf.iconGridSize") }
+        didSet { Self.preferences.set(iconGridSize, forKey: "bf.iconGridSize") }
     }
     @Published public var showTerminalDrawer: Bool = false
     @Published public var showQuickFSearchModal: Bool = false
@@ -76,9 +147,22 @@ public final class AppState: ObservableObject {
 
     // Sidebar Locations & Smart Folders
     @Published public var favorites: [SidebarLocationItem] = []
-    @Published public var customBookmarks: [SidebarLocationItem] = []
+    public var customBookmarks: [SidebarLocationItem] { favorites }
     @Published public var savedSmartFolders: [SavedSmartFolderItem] = []
-    @Published public var mountedVolumes: [VolumeInfoItem] = []
+    private var savedSearchArchive: SavedSearchArchive? = SavedSearchArchive()
+    private var savedSearchLaunchSerials: [UUID: UInt64] = [:]
+    @Published public private(set) var volumeInventory = VolumeInventoryState()
+    public var mountedVolumes: [VolumeInfoItem] { volumeInventory.items }
+    public var localMountedVolumes: [VolumeInfoItem] { VolumeSidebarGroups.build(from: mountedVolumes).localVolumes }
+    public var networkServerGroups: [NetworkVolumeGroup] { VolumeSidebarGroups.build(from: mountedVolumes).networkServers }
+    private var volumeService: VolumeRefreshService?
+    private lazy var sidebarFavoritesStore = SidebarFavoritesStore(
+        defaults: Self.initialSidebarFavorites,
+        read: { Self.preferences.object(forKey: SidebarFavoritesStore.key) },
+        readLegacy: { Self.preferences.object(forKey: PinnedFolderStore.key) },
+        write: { Self.preferences.set($0, forKey: SidebarFavoritesStore.key) })
+    @Published public private(set) var pinnedFolderNotice: String?
+
 
     public var activeTab: PaneTabState {
         if isDualPane && activePaneSide == .right {
@@ -92,40 +176,36 @@ public final class AppState: ObservableObject {
     }
 
     private init() {
-        let defaults = UserDefaults.standard
-        let homeURL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-        let devLabPath = "\(NSHomeDirectory())/dev"
+        let defaults = Self.preferences
+        let store = FinderSessionStore(defaults: defaults)
+        self.sessionStore = store
+        let homeURL = Self.homeDirectoryURL
+        let devLabPath = homeURL.appendingPathComponent("dev").path
         let defaultStartURL = FileManager.default.fileExists(atPath: devLabPath)
             ? URL(fileURLWithPath: devLabPath, isDirectory: true)
             : homeURL
 
-        // Restore persisted tabs or create default
-        var restoredTabs: [PaneTabState] = []
-        if let savedPaths = defaults.stringArray(forKey: "bf.openTabPaths") {
-            for p in savedPaths where FileManager.default.fileExists(atPath: p) {
-                restoredTabs.append(PaneTabState(initialURL: URL(fileURLWithPath: p, isDirectory: true)))
-            }
-        }
-        if restoredTabs.isEmpty {
-            restoredTabs = [PaneTabState(initialURL: defaultStartURL)]
-        }
-
-        let secondPane = PaneTabState(initialURL: homeURL)
+        let restored = store.load(defaultRightPath: homeURL.path)
+        let snapshot = restored.snapshot
+        let restoredTabs = snapshot?.tabs.map { $0.makePausedPane() }
+            ?? [PaneTabState(initialURL: defaultStartURL)]
         self.tabs = restoredTabs
-        self.activeTabId = restoredTabs[0].id
-        self.rightPane = secondPane
+        self.activeTabId = restoredTabs[snapshot?.activeIndex ?? 0].id
+        self.rightPane = snapshot?.right.makePausedPane() ?? PaneTabState(initialURL: homeURL)
+        self.restoreSessionEnabled = store.isEnabled
+        self.sessionPersistenceNotice = restored.notice
+        if let snapshot {
+            self.isDualPane = snapshot.dualPane
+            self.activePaneSide = snapshot.activeSide == "right" ? .right : .left
+        }
 
         if defaults.object(forKey: "bf.showSidebar") != nil {
             self.showSidebar = defaults.bool(forKey: "bf.showSidebar")
         }
-        let restoredActiveIndex = defaults.integer(forKey: "bf.activeTabIndex")
-        if restoredTabs.indices.contains(restoredActiveIndex) {
-            self.activeTabId = restoredTabs[restoredActiveIndex].id
-        }
         if defaults.object(forKey: "bf.showInspector") != nil {
             self.showInspector = defaults.bool(forKey: "bf.showInspector")
         }
-        if defaults.object(forKey: "bf.isDualPane") != nil {
+        if snapshot == nil, defaults.object(forKey: "bf.isDualPane") != nil {
             self.isDualPane = defaults.bool(forKey: "bf.isDualPane")
         }
         let savedIconSize = defaults.double(forKey: "bf.iconGridSize")
@@ -133,18 +213,33 @@ public final class AppState: ObservableObject {
             self.iconGridSize = savedIconSize
         }
 
+        if isDualPane { rightPane.retainInitialLocation() }
+
         setupSidebarLocations()
         loadPersistedBookmarksAndSmartFolders()
-        refreshMountedVolumes()
+        #if !BETTERFINDER_TESTING
+        let volumes = VolumeRefreshService.production()
+        volumeService = volumes
+        volumes.start { [weak self] result in self?.volumeInventory.apply(result) }
+        #endif
         setupIndexCallbacks()
+        sessionObservationReady = true
+        observeSessionPanes()
+        appSessionObserver = objectWillChange.sink { [weak self] _ in self?.scheduleSessionSave() }
     }
 
+    private var indexLifecycle = IndexingLifecycleState()
     private func setupIndexCallbacks() {
+        FSearchIndex.shared.onIndexingLifecycle = { event in
+            Task { @MainActor in
+                self.indexLifecycle.apply(event)
+                self.isIndexing = self.indexLifecycle.isIndexing
+            }
+        }
         FSearchIndex.shared.onIndexUpdated = { count, durationMs in
             Task { @MainActor in
                 self.indexedFileCount = count
                 self.indexBuildDurationMs = durationMs
-                self.isIndexing = false
                 for tab in self.tabs + [self.rightPane] where !tab.searchQuery.isEmpty {
                     tab.triggerSearch()
                 }
@@ -152,153 +247,201 @@ public final class AppState: ObservableObject {
         }
         FSearchIndex.shared.onDirectoryChangedOnDisk = { changedDirs in
             Task { @MainActor in
-                for tab in self.tabs + [self.rightPane] where tab.isAffectedByDirectoryChanges(changedDirs) {
-                    tab.refresh()
-                }
+                self.handleDirectoryChanges(changedDirs)
             }
         }
+        #if !BETTERFINDER_TESTING
         FSearchIndex.shared.startIndexing()
+        #else
+        isIndexing = false
+        #endif
     }
 
-    public func setupSidebarLocations() {
-        let home = NSHomeDirectory()
-        let iCloudPath = "\(home)/Library/Mobile Documents/com~apple~CloudDocs"
-        let trashPath = "\(home)/.Trash"
+    public func handleDirectoryChanges(_ changedDirs: Set<String>) {
+        // Invalidate shared caches even when no current pane displays the folder.
+        for path in changedDirs {
+            FolderSizeCache.shared.invalidate(containing: path)
+            FileIconCache.shared.invalidate(containing: path)
+        }
+        for tab in tabs + [rightPane] where tab.isAffectedByDirectoryChanges(changedDirs) {
+            tab.reloadDirectory(invalidateCaches: false)
+        }
+    }
 
+    /// Shell commands can change tags/permissions without changing indexed
+    /// size/mtime. Refresh their consumers independently of index differences.
+    func reconcileTerminalCommand(at path: String) {
+        FSearchIndex.shared.enqueueDirectoryRefresh(path)
+        FileIconCache.shared.invalidate(containing: path)
+        FolderSizeCache.shared.revalidate(containing: path)
+        for tab in tabs + [rightPane] where tab.isAffectedByDirectoryChanges([path]) {
+            tab.reloadDirectory(invalidateCaches: false)
+        }
+    }
+
+    private static var initialSidebarFavorites: [SidebarFavoritesStore.Entry] {
+        let home = Self.homeDirectoryURL.path
+        // Pure initial configuration: never probe disks/cloud roots while restoring the sidebar.
         var candidates: [(String, String, String)] = [
             ("Dom", "house.fill", home),
             ("Biurko", "menubar.dock.rectangle", "\(home)/Desktop"),
             ("Dokumenty", "doc.fill", "\(home)/Documents"),
-            ("Pobrane", "arrow.down.circle.fill", "\(home)/Downloads")
-        ]
-        if FileManager.default.fileExists(atPath: iCloudPath) {
-            candidates.append(("iCloud Drive", "icloud.fill", iCloudPath))
-        }
-        candidates.append(contentsOf: [
+            ("Pobrane", "arrow.down.circle.fill", "\(home)/Downloads"),
+            ("iCloud Drive", "icloud.fill", "\(home)/Library/Mobile Documents/com~apple~CloudDocs"),
             ("Projekty", "hammer.fill", "\(home)/dev"),
-            ("Aplikacje", "app.badge.fill", "/Applications"),
-            ("Kosz", "trash.fill", trashPath)
-        ])
-
-        var favs: [SidebarLocationItem] = []
-        for (title, icon, path) in candidates {
-            if FileManager.default.fileExists(atPath: path) {
-                favs.append(SidebarLocationItem(
-                    title: title,
-                    iconName: icon,
-                    url: URL(fileURLWithPath: path, isDirectory: true),
-                    isCustomBookmark: false
-                ))
-            }
-        }
-        self.favorites = favs
+            ("Kosz", "trash.fill", "\(home)/.Trash")
+        ]
+        #if !BETTERFINDER_TESTING
+        candidates.append(("Aplikacje", "app.badge.fill", "/Applications"))
+        #endif
+        return candidates.map { SidebarFavoritesStore.Entry(path: $0.2, title: $0.0, iconName: $0.1) }
     }
+
+    public func setupSidebarLocations() { updatePinnedFolderRows() }
 
     // MARK: - UserDefaults Persistence for Bookmarks, Smart Folders & Tabs
 
     private func loadPersistedBookmarksAndSmartFolders() {
-        let defaults = UserDefaults.standard
-        if let paths = defaults.stringArray(forKey: "bf.customBookmarks") {
-            customBookmarks = paths.compactMap { path in
-                var isDir: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return nil }
-                let url = URL(fileURLWithPath: path, isDirectory: true)
-                return SidebarLocationItem(title: url.lastPathComponent, iconName: "bookmark.fill", url: url, isCustomBookmark: true)
-            }
-        }
-        if let data = defaults.data(forKey: "bf.savedSmartFolders"),
-           let decoded = try? JSONDecoder().decode([SavedSmartFolderItem].self, from: data) {
-            savedSmartFolders = decoded
+        let defaults = Self.preferences
+        updatePinnedFolderRows()
+        if let data = defaults.data(forKey: "bf.savedSmartFolders") {
+            savedSearchArchive = try? SavedSearchArchive(data: data)
+            savedSmartFolders = savedSearchArchive?.items ?? []
         }
     }
 
-    public func persistTabsState() {
-        let paths = tabs.map { $0.currentURL.path }
-        UserDefaults.standard.set(paths, forKey: "bf.openTabPaths")
-        UserDefaults.standard.set(tabs.firstIndex(where: { $0.id == activeTabId }) ?? 0, forKey: "bf.activeTabIndex")
+    public func persistTabsState() { scheduleSessionSave() }
+
+    /// Flush synchronously at normal termination; snapshots never include runtime actions.
+    public func flushSessionState() {
+        guard sessionObservationReady, restoreSessionEnabled else { return }
+        let snapshot = FinderSessionSnapshot(tabs: tabs.map { FinderPaneSession(pane: $0) },
+            right: FinderPaneSession(pane: rightPane),
+            activeIndex: tabs.firstIndex { $0.id == activeTabId } ?? 0,
+            dualPane: isDualPane, activeSide: activePaneSide.rawValue)
+        if sessionStore.save(snapshot) {
+            if sessionPersistenceNotice != nil { sessionPersistenceNotice = nil }
+        } else if sessionPersistenceNotice == nil {
+            sessionPersistenceNotice = "Nie zapisano sesji. Poprzedni zapis został zachowany."
+        }
+    }
+
+    #if BETTERFINDER_TESTING
+    var hasPersistedSessionForTesting: Bool { Self.preferences.object(forKey: FinderSessionStore.dataKey) != nil }
+    #endif
+
+    private func updatePinnedFolderRows() {
+        favorites = sidebarFavoritesStore.items.map { entry in
+            SidebarLocationItem(bookmarkPath: entry.path, title: entry.title, iconName: entry.iconName,
+                url: URL(fileURLWithPath: entry.path, isDirectory: true), isCustomBookmark: true)
+        }
+        pinnedFolderNotice = sidebarFavoritesStore.notice
+    }
+
+    private func finishFavoritesMutation(_ succeeded: Bool) {
+        if !succeeded {
+            FileOperationsManager.shared.lastStatusMessage = "Nie potwierdzono zapisu zmiany ulubionych."
+        }
+        updatePinnedFolderRows()
     }
 
     public func addBookmark(for url: URL) {
+        guard sidebarFavoritesStore.notice == nil else { updatePinnedFolderRows(); return }
+        guard url.isFileURL, PinnedFolderStore.validPath(url.path) else { return }
+        // Only a new, explicitly requested target is probed; restored favorites never are.
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { return }
-        guard !customBookmarks.contains(where: { $0.url.path == url.path }) else { return }
-        customBookmarks.append(SidebarLocationItem(
-            title: url.lastPathComponent,
-            iconName: "bookmark.fill",
-            url: url,
-            isCustomBookmark: true
-        ))
-        UserDefaults.standard.set(customBookmarks.map { $0.url.path }, forKey: "bf.customBookmarks")
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+            FileOperationsManager.shared.lastStatusMessage = "Nie dodano ulubionego: folder jest niedostępny."
+            return
+        }
+        finishFavoritesMutation(sidebarFavoritesStore.add(url.path))
     }
 
     public func removeBookmark(_ item: SidebarLocationItem) {
-        customBookmarks.removeAll { $0.id == item.id }
-        UserDefaults.standard.set(customBookmarks.map { $0.url.path }, forKey: "bf.customBookmarks")
+        finishFavoritesMutation(sidebarFavoritesStore.remove(item.id))
     }
 
-    public func saveSmartFolder(query: String, title: String? = nil) {
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        guard !savedSmartFolders.contains(where: { $0.query == trimmed }) else { return }
-        let item = SavedSmartFolderItem(
-            id: UUID().uuidString,
-            title: title ?? trimmed,
-            query: trimmed
-        )
-        savedSmartFolders.append(item)
-        if let data = try? JSONEncoder().encode(savedSmartFolders) {
-            UserDefaults.standard.set(data, forKey: "bf.savedSmartFolders")
+    public func moveFavorite(_ item: SidebarLocationItem, by offset: Int) {
+        finishFavoritesMutation(sidebarFavoritesStore.move(item.id, by: offset))
+    }
+
+    public func moveFavorite(id: String, beforeID: String?) {
+        finishFavoritesMutation(sidebarFavoritesStore.move(id, before: beforeID))
+    }
+
+    public func renameFavorite(_ item: SidebarLocationItem, title: String) {
+        finishFavoritesMutation(sidebarFavoritesStore.rename(item.id, title: title))
+    }
+
+    public func isCurrentSearchSaved(in pane: PaneTabState) -> Bool {
+        let candidate = SavedSmartFolderItem.capture(from: pane)
+        return savedSmartFolders.contains { $0.hasSameSearch(as: candidate) }
+    }
+
+    public func saveSmartFolder(from pane: PaneTabState, title: String? = nil) {
+        let item = SavedSmartFolderItem.capture(from: pane, title: title)
+        guard !item.query.isEmpty else { return }
+        guard !savedSmartFolders.contains(where: { $0.hasSameSearch(as: item) }) else { return }
+        guard persistSmartFolders(savedSmartFolders + [item]) else { return }
+        FileOperationsManager.shared.lastStatusMessage = "Zapisano inteligentny folder: \(item.title)"
+    }
+
+    public func openSmartFolder(_ item: SavedSmartFolderItem) {
+        let pane = activeTab
+        pane.cancelPendingSavedSearches()
+        let serial = (savedSearchLaunchSerials[pane.id] ?? 0) &+ 1
+        savedSearchLaunchSerials[pane.id] = serial
+        let context = pane.savedSearchActivationContext
+        Task { @MainActor in
+            guard self.savedSearchLaunchSerials[pane.id] == serial,
+                  pane.savedSearchActivationContext == context else { return }
+            do {
+                guard try await pane.applySavedSearch(item, shouldApply: { [weak self, weak pane] in
+                    guard let self, let pane else { return false }
+                    return self.savedSearchLaunchSerials[pane.id] == serial &&
+                        (self.tabs.contains { $0.id == pane.id } || (self.isDualPane && self.rightPane.id == pane.id))
+                }) else { return }
+                guard self.activeTab.id == pane.id else { return }
+                FileOperationsManager.shared.lastStatusMessage = "Wyszukiwanie: \(item.title) · \(item.scopeDescription)"
+            } catch {
+                guard self.activeTab.id == pane.id else { return }
+                FileOperationsManager.shared.lastStatusMessage = error.localizedDescription
+            }
         }
-        FileOperationsManager.shared.lastStatusMessage = "Zapisano Smart Folder: \(item.title)"
     }
 
     public func removeSmartFolder(_ item: SavedSmartFolderItem) {
-        savedSmartFolders.removeAll { $0.id == item.id }
-        if let data = try? JSONEncoder().encode(savedSmartFolders) {
-            UserDefaults.standard.set(data, forKey: "bf.savedSmartFolders")
+        _ = persistSmartFolders(savedSmartFolders.filter { $0.id != item.id }, removingID: item.id)
+    }
+
+    private func persistSmartFolders(_ items: [SavedSmartFolderItem], removingID: String? = nil) -> Bool {
+        guard let archive = savedSearchArchive,
+              let data = try? archive.encoded(replacingItems: items, removingID: removingID) else {
+            FileOperationsManager.shared.lastStatusMessage = "Nie zapisano zmiany: dane inteligentnych folderów są uszkodzone lub nieobsługiwane. Oryginalny zapis pozostał nietknięty."
+            return false
         }
+        Self.preferences.set(data, forKey: "bf.savedSmartFolders")
+        savedSmartFolders = items
+        savedSearchArchive = try? SavedSearchArchive(data: data)
+        return true
     }
 
     // MARK: - Volumes & Eject (`⏏`)
 
-    public func refreshMountedVolumes() {
-        let keys: [URLResourceKey] = [
-            .volumeNameKey,
-            .volumeTotalCapacityKey,
-            .volumeAvailableCapacityForImportantUsageKey,
-            .volumeIsRemovableKey,
-            .volumeIsEjectableKey,
-            .volumeIsInternalKey
-        ]
-        guard let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) else {
-            return
-        }
-        var vols: [VolumeInfoItem] = []
-        for url in urls {
-            if let vals = try? url.resourceValues(forKeys: Set(keys)) {
-                let name = vals.volumeName ?? url.lastPathComponent
-                let total = Int64(vals.volumeTotalCapacity ?? 0)
-                let avail = vals.volumeAvailableCapacityForImportantUsage ?? 0
-                let isRemovable = (vals.volumeIsRemovable == true) ||
-                                  (vals.volumeIsEjectable == true) ||
-                                  (vals.volumeIsInternal == false && url.path != "/")
-                vols.append(VolumeInfoItem(
-                    name: name,
-                    url: url,
-                    totalBytes: total,
-                    freeBytes: avail,
-                    isRemovable: isRemovable
-                ))
-            }
-        }
-        self.mountedVolumes = vols
+    #if BETTERFINDER_TESTING
+    func installVolumeFixturesForTesting(_ volumes: [VolumeInfoItem]) {
+        volumeInventory.apply(.success(VolumeSnapshot(items: volumes)))
     }
+    #endif
+
+    public func refreshMountedVolumes() { volumeService?.requestRefresh() }
 
     public func ejectVolume(_ vol: VolumeInfoItem) {
         do {
-            try NSWorkspace.shared.unmountAndEjectDevice(at: vol.url)
+            try VolumeEjectAction.perform(vol.url,
+                eject: { try NSWorkspace.shared.unmountAndEjectDevice(at: $0) },
+                refresh: refreshMountedVolumes)
             FileOperationsManager.shared.lastStatusMessage = "Wysunięto wolumin \(vol.name)"
-            refreshMountedVolumes()
         } catch {
             FileOperationsManager.shared.lastStatusMessage = "Nie można wysunąć \(vol.name): \(error.localizedDescription)"
         }
@@ -316,7 +459,9 @@ public final class AppState: ObservableObject {
         newTab.foldersOnTop = activeTab.foldersOnTop
         newTab.searchScope = activeTab.searchScope
         newTab.fuzzyEnabled = activeTab.fuzzyEnabled
-        newTab.refresh()
+        // Apply inherited display preferences without discarding shared analysis.
+        newTab.reloadDirectory(invalidateCaches: false)
+        FSearchIndex.shared.ensureDirectoryIndexed(newTab.currentURL.path)
         tabs.append(newTab)
         activeTabId = newTab.id
         activePaneSide = .left
@@ -326,6 +471,8 @@ public final class AppState: ObservableObject {
     public func closeTab(_ id: UUID) {
         guard tabs.count > 1 else { return }
         if let idx = tabs.firstIndex(where: { $0.id == id }) {
+            tabs[idx].cancelPendingSavedSearches()
+            savedSearchLaunchSerials.removeValue(forKey: id)
             recentlyClosedTabs.append(tabs[idx])
             if recentlyClosedTabs.count > 10 { recentlyClosedTabs.removeFirst() }
             tabs.remove(at: idx)
@@ -366,7 +513,7 @@ public final class AppState: ObservableObject {
 
     public func toggleDualPane() {
         if !isDualPane {
-            rightPane.navigate(to: leftTab.currentURL, recordHistory: false)
+            rightPane.initializeLocationIfNeeded(matching: leftTab.currentURL)
             isDualPane = true
         } else {
             isDualPane = false
@@ -374,50 +521,143 @@ public final class AppState: ObservableObject {
         }
     }
 
+    /// A preview remains bound to its initiating pane. Explicit context changes
+    /// close it; background updates must never choose a new owner implicitly.
+    private func synchronizeQuickLookOwnership() {
+        let visibleOwner: UUID?
+        if isDualPane && activePaneSide == .right {
+            visibleOwner = rightPane.id
+        } else {
+            visibleOwner = tabs.first(where: { $0.id == activeTabId })?.id ?? tabs.first?.id
+        }
+        QuickLookCoordinator.shared.retainOwner(visibleOwner)
+    }
+
     public func toggleQuickLook() {
-        let selected = activeTab.selectedItems
+        let pane = activeTab
+        let selected = pane.selectedItems
         guard !selected.isEmpty else { return }
-        QuickLookCoordinator.shared.preview(urls: selected.map(\.url))
+        QuickLookCoordinator.shared.preview(ownerID: pane.id, urls: selected.map(\.url))
     }
 }
 
-/// Native macOS QuickLook (`QLPreviewPanel`) bridge
+/// Value-only ownership state shared by the native bridge and focused tests.
+/// URLs may change only through an explicit preview or an update by this owner.
+struct QuickLookPreviewSession {
+    private(set) var ownerID: UUID?
+    private(set) var urls: [URL] = []
+
+    mutating func open(ownerID: UUID, urls: [URL]) {
+        guard !urls.isEmpty else { close(); return }
+        self.ownerID = ownerID
+        self.urls = urls
+    }
+
+    @discardableResult
+    mutating func update(ownerID: UUID, urls: [URL]) -> Bool {
+        guard self.ownerID == ownerID else { return false }
+        if urls.isEmpty { close() } else { self.urls = urls }
+        return true
+    }
+
+    mutating func close() { ownerID = nil; urls = [] }
+}
+
+@MainActor
+protocol QuickLookPanelDriving: AnyObject {
+    var isVisible: Bool { get }
+    func show(coordinator: QuickLookCoordinator) -> Bool
+    func reload()
+    func hide()
+}
+
+/// Only this adapter touches QLPreviewPanel. Ownership transitions can be tested
+/// with an inert driver without presenting a native window or loading file data.
+@MainActor
+private final class NativeQuickLookPanelDriver: QuickLookPanelDriving {
+    var isVisible: Bool {
+        QLPreviewPanel.sharedPreviewPanelExists() && (QLPreviewPanel.shared()?.isVisible == true)
+    }
+    func show(coordinator: QuickLookCoordinator) -> Bool {
+        guard let panel = QLPreviewPanel.shared() else { return false }
+        panel.dataSource = coordinator
+        panel.delegate = coordinator
+        panel.makeKeyAndOrderFront(nil)
+        panel.reloadData()
+        return true
+    }
+    func reload() {
+        guard QLPreviewPanel.sharedPreviewPanelExists(), let panel = QLPreviewPanel.shared() else { return }
+        panel.reloadData()
+    }
+    func hide() {
+        guard QLPreviewPanel.sharedPreviewPanelExists(), let panel = QLPreviewPanel.shared() else { return }
+        panel.orderOut(nil)
+    }
+}
+
+/// Native macOS QuickLook (`QLPreviewPanel`) bridge with explicit pane ownership.
 @MainActor
 public final class QuickLookCoordinator: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    #if BETTERFINDER_TESTING
+    public static var shared = QuickLookCoordinator()
+    #else
     public static let shared = QuickLookCoordinator()
-    private var previewURLs: [URL] = []
+    #endif
+    private let panelDriver: any QuickLookPanelDriving
+    private(set) var session = QuickLookPreviewSession()
 
-    public func preview(urls: [URL]) {
-        self.previewURLs = urls
-        guard let panel = QLPreviewPanel.shared() else { return }
-        panel.dataSource = self
-        panel.delegate = self
-        if panel.isVisible {
-            panel.reloadData()
-            panel.orderOut(nil)
-        } else {
-            panel.makeKeyAndOrderFront(nil)
-            panel.reloadData()
+    override init() {
+        panelDriver = NativeQuickLookPanelDriver()
+        super.init()
+    }
+    init(panelDriver: any QuickLookPanelDriving) {
+        self.panelDriver = panelDriver
+        super.init()
+    }
+
+    public func preview(ownerID: UUID, urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        if !panelDriver.isVisible { session.close() }
+        if session.ownerID == ownerID {
+            close()
+            return
+        }
+        // A new explicit preview may transfer a visible session to another pane;
+        // background selection reconciliation cannot do so.
+        session.open(ownerID: ownerID, urls: urls)
+        if panelDriver.isVisible {
+            panelDriver.reload()
+        } else if !panelDriver.show(coordinator: self) {
+            session.close()
         }
     }
 
-    public func updateIfVisible(urls: [URL]) {
-        guard QLPreviewPanel.sharedPreviewPanelExists(),
-              let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
-        self.previewURLs = urls
-        panel.reloadData()
+    public func updateIfVisible(ownerID: UUID, urls: [URL]) {
+        guard panelDriver.isVisible else { session.close(); return }
+        guard session.update(ownerID: ownerID, urls: urls) else { return }
+        if session.ownerID == nil { panelDriver.hide() } else { panelDriver.reload() }
+    }
+
+    /// Switching context or removing/hiding the owner closes instead of rebinding.
+    public func retainOwner(_ visibleOwner: UUID?) {
+        guard let owner = session.ownerID, owner != visibleOwner else { return }
+        close()
+    }
+
+    private func close() {
+        session.close()
+        panelDriver.hide()
     }
 
     nonisolated public func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        MainActor.assumeIsolated {
-            previewURLs.count
-        }
+        MainActor.assumeIsolated { session.urls.count }
     }
 
     nonisolated public func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
         MainActor.assumeIsolated {
-            guard index >= 0 && index < previewURLs.count else { return nil }
-            return previewURLs[index] as NSURL
+            guard index >= 0 && index < session.urls.count else { return nil }
+            return session.urls[index] as NSURL
         }
     }
 }

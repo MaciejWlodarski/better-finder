@@ -147,7 +147,7 @@ struct NavigationTests {
                          NSItemProvider(object: b as NSURL), NSItemProvider(object: a as NSURL)]
         try expect(FileDropLoader.accepts(providers))
         try expect(!FileDropLoader.accepts([NSItemProvider(object: "text" as NSString)]))
-        let urls = await FileDropLoader.urls(from: providers)
+        let urls = try await FileDropLoader.urls(from: providers)
         try expect(urls == [a, b])
     }
 

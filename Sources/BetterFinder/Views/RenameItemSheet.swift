@@ -16,23 +16,36 @@ struct RenameItemSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: FinderUI.sectionSpacing) {
             HStack(spacing: 12) {
                 Image(nsImage: FileIconCache.shared.icon(for: item))
                     .resizable().frame(width: 40, height: 40)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Zmień nazwę").font(.headline)
-                    Text(item.name).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                    Text("Zmień nazwę").font(FinderUI.titleFont)
+                    Text(item.name)
+                        .font(FinderUI.detailFont)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(item.name)
                 }
             }
-            TextField("Nazwa", text: $draft)
-                .textFieldStyle(.roundedBorder)
-                .focused($isNameFocused)
-                .onSubmit(rename)
-                .onChange(of: draft) { _, _ in errorMessage = nil }
+            VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
+                Text("Nowa nazwa")
+                    .font(FinderUI.detailFont)
+                TextField("Nazwa", text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Nowa nazwa")
+                    .focused($isNameFocused)
+                    .onSubmit(rename)
+                    .onChange(of: draft) { _, _ in errorMessage = nil }
+            }
             if let errorMessage {
                 Label(errorMessage, systemImage: "exclamationmark.circle")
-                    .font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                    .font(FinderUI.detailFont)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
                 Spacer()
@@ -42,8 +55,10 @@ struct RenameItemSheet: View {
                     .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft == item.name)
             }
         }
-        .padding(24)
-        .frame(width: 390)
+        .font(FinderUI.bodyFont)
+        .controlSize(.regular)
+        .padding(FinderUI.sheetPadding)
+        .frame(width: 420)
         .onAppear { isNameFocused = true }
     }
 
@@ -57,6 +72,7 @@ struct RenameItemSheet: View {
             dismiss()
         } else {
             errorMessage = FileOperationsManager.shared.lastStatusMessage ?? "Nie udało się zmienić nazwy."
+            isNameFocused = true
         }
     }
 }

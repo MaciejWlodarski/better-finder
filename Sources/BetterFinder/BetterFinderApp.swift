@@ -17,7 +17,7 @@ struct BetterFinderApp: App {
         .commands {
             // App Settings (Cmd+,)
             CommandGroup(replacing: .appSettings) {
-                Button("Ustawienia BetterFinder & fsearch...") {
+                Button("Ustawienia…") {
                     appState.showSettingsSheet = true
                 }
                 .keyboardShortcut(",", modifiers: [.command])
@@ -34,12 +34,12 @@ struct BetterFinderApp: App {
                     .keyboardShortcut("t", modifiers: [.command, .shift])
                     .disabled(appState.recentlyClosedTabs.isEmpty)
 
-                Button("Nowy folder...") {
+                Button("Nowy folder…") {
                     appState.showNewFolderSheet = true
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
 
-                Button("Nowy plik z szablonu...") {
+                Button("Nowy plik…") {
                     appState.showNewFileSheet = true
                 }
                 .keyboardShortcut("n", modifiers: [.command, .option])
@@ -52,7 +52,7 @@ struct BetterFinderApp: App {
                     } else if appState.tabs.count > 1 {
                         appState.closeTab(appState.activeTabId)
                     } else {
-                        NSApp.keyWindow?.performClose(nil)
+                        NSApp?.keyWindow?.performClose(nil)
                     }
                 }
                 .keyboardShortcut("w", modifiers: [.command])
@@ -61,14 +61,14 @@ struct BetterFinderApp: App {
             // Undo / Redo File Operations
             CommandGroup(replacing: .undoRedo) {
                 Button(fileOps.undoLabel) {
-                    if isEditingText { NSApp.keyWindow?.firstResponder?.undoManager?.undo() }
+                    if isEditingText { NSApp?.keyWindow?.firstResponder?.undoManager?.undo() }
                     else { fileOps.undoLastOperation() }
                 }
                 .keyboardShortcut("z", modifiers: [.command])
                 .disabled(!isEditingText && (!fileOps.canUndo || fileOps.isBusy))
 
                 Button(fileOps.redoLabel) {
-                    if isEditingText { NSApp.keyWindow?.firstResponder?.undoManager?.redo() }
+                    if isEditingText { NSApp?.keyWindow?.firstResponder?.undoManager?.redo() }
                     else { fileOps.redoLastOperation() }
                 }
                 .keyboardShortcut("z", modifiers: [.command, .shift])
@@ -79,7 +79,7 @@ struct BetterFinderApp: App {
             CommandGroup(replacing: .pasteboard) {
                 Divider()
 
-                Button("Wytnij pliki (Cut)") {
+                Button("Wytnij pliki") {
                     if !routeTextAction(#selector(NSText.cut(_:))), canUseFileCommands { fileOps.cutItems(appState.activeTab.selectedItems) }
                 }
                 .keyboardShortcut("x", modifiers: [.command])
@@ -116,7 +116,7 @@ struct BetterFinderApp: App {
 
                 Button("Duplikuj zaznaczone") {
                     guard canUseFileCommands else { return }
-                    _ = fileOps.duplicateItems(appState.activeTab.selectedItems)
+                    fileOps.duplicateItems(appState.activeTab.selectedItems)
                     appState.activeTab.reloadDirectory()
                 }
                 .keyboardShortcut("d", modifiers: [.command])
@@ -134,12 +134,12 @@ struct BetterFinderApp: App {
 
             // fsearch & Navigation Menu
             CommandMenu("Przejdź") {
-                Button("Szukaj na pasku fsearch") {
+                Button("Szukaj plików i folderów") {
                     appState.focusSearchFieldTrigger += 1
                 }
                 .keyboardShortcut("f", modifiers: [.command])
 
-                Button("Błyskawiczne okno Spotlight fsearch...") {
+                Button("Szybkie wyszukiwanie…") {
                     appState.showQuickFSearchModal.toggle()
                 }
                 .keyboardShortcut("p", modifiers: [.command])
@@ -147,11 +147,11 @@ struct BetterFinderApp: App {
                 Divider()
 
                 Button("Edytuj pasek ścieżki") {
-                    appState.activeTab.isEditingPathBar.toggle()
+                    appState.activeTab.requestPathEditing()
                 }
                 .keyboardShortcut("l", modifiers: [.command])
 
-                Button("Idź do folderu…") { appState.activeTab.isEditingPathBar = true }
+                Button("Idź do folderu…") { appState.activeTab.requestPathEditing() }
                     .keyboardShortcut("g", modifiers: [.command, .shift])
                 Button("Folder domowy") {
                     appState.activeTab.navigate(to: FileManager.default.homeDirectoryForCurrentUser)
@@ -191,8 +191,7 @@ struct BetterFinderApp: App {
 
                 Divider()
 
-                Button("Przebuduj indeks RAM/mmap fsearch") {
-                    appState.isIndexing = true
+                Button("Przebuduj indeks plików") {
                     FSearchIndex.shared.startIndexing()
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
@@ -213,24 +212,24 @@ struct BetterFinderApp: App {
                 }
                 .keyboardShortcut("2", modifiers: [.command])
 
-                Button("Widok kolumn (Miller Columns)") {
+                Button("Widok kolumn") {
                     appState.activeTab.viewMode = .columns
                 }
                 .keyboardShortcut("3", modifiers: [.command])
 
-                Button("Widok WizTree Treemap & Analizator dysku") {
+                Button("Mapa dysku") {
                     appState.activeTab.viewMode = .wiztree
                 }
                 .keyboardShortcut("4", modifiers: [.command])
 
                 Divider()
 
-                Button("Przełącz widok dwupanelowy (Dual-Pane)") {
+                Button("Przełącz widok dwupanelowy") {
                     appState.toggleDualPane()
                 }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
 
-                Button("Wbudowany dolny panel Terminala") {
+                Button("Pokaż/ukryj terminal") {
                     appState.showTerminalDrawer.toggle()
                 }
                 .keyboardShortcut("`", modifiers: [.control])
@@ -241,12 +240,12 @@ struct BetterFinderApp: App {
                 }
                 .keyboardShortcut(".", modifiers: [.command, .shift])
 
-                Button("Pokaż/ukryj Inspektora") {
+                Button("Pokaż/ukryj inspektor") {
                     appState.showInspector.toggle()
                 }
                 .keyboardShortcut("i", modifiers: [.command])
 
-                Button("Quick Look (Podgląd)") {
+                Button("Szybki podgląd (Quick Look)") {
                     appState.toggleQuickLook()
                 }
                 .keyboardShortcut("y", modifiers: [.command])
@@ -262,38 +261,30 @@ struct BetterFinderApp: App {
         }
     }
 
-    private var canUseFileCommands: Bool {
-        guard let window = NSApp.keyWindow else { return false }
-        return !isEditingText && !(window is NSPanel) && window.attachedSheet == nil && window.sheetParent == nil
-    }
+    private var canUseFileCommands: Bool { FinderCommandRouting.canUseFileCommands }
 
-    private var isEditingText: Bool {
-        NSApp.keyWindow?.firstResponder is NSTextView || NSApp.keyWindow?.firstResponder is NSTextField
-    }
+    private var isEditingText: Bool { FinderCommandRouting.isEditingText }
 
     private func routeTextAction(_ action: Selector) -> Bool {
-        guard isEditingText, let responder = NSApp.keyWindow?.firstResponder else { return false }
-        _ = NSApp.sendAction(action, to: responder, from: nil)
-        return true
+        FinderCommandRouting.routeTextAction(action)
     }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var keyMonitor: Any?
+    private var quitFailureAlert: NSAlert?
+    #if BETTERFINDER_TESTING
+    /// Direct-delegate integration harness: captures reply without terminating its process.
+    var terminationReplyForTesting: ((Bool) -> Void)?
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            if let responder = NSApp.keyWindow?.firstResponder,
-               responder is NSTextView || responder is NSTextField {
-                return event
-            }
-
-            guard let window = event.window, !(window is NSPanel), window.sheetParent == nil,
-                  window.attachedSheet == nil else { return event }
+            guard FinderCommandRouting.shouldRouteFileKeyEvent(event) else { return event }
             let appState = AppState.shared
             if appState.showQuickFSearchModal || appState.showNewFileSheet ||
                appState.showNewFolderSheet || appState.showCompareSheet ||
@@ -347,8 +338,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        dismissQuitFailure(nil)
+        #if BETTERFINDER_TESTING
+        let capturedReplyForTesting = terminationReplyForTesting
+        #endif
+        let decision = TerminalApplicationLifecycle.shared.beginTermination { [weak self, weak sender] completed in
+            #if BETTERFINDER_TESTING
+            if let capture = capturedReplyForTesting {
+                capture(completed)
+                return
+            }
+            #endif
+            // AppKit remains responsive while the owned workers cancel and reap.
+            sender?.reply(toApplicationShouldTerminate: completed)
+            if !completed { self?.showQuitFailure() }
+        }
+        switch decision {
+        case .now: return .terminateNow
+        case .later: return .terminateLater
+        }
+    }
+
+    private func showQuitFailure() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Nie można jeszcze zamknąć aplikacji"
+        alert.informativeText = "Nie potwierdzono zakończenia wszystkich poleceń terminala w ciągu 5 sekund. Anulowano zamykanie aplikacji. Przerywanie poleceń trwa nadal; możesz ponownie wybrać Zakończ. Wymuszenie zamknięcia nie gwarantuje zakończenia procesów."
+        let button = alert.addButton(withTitle: "OK")
+        button.target = self
+        button.action = #selector(dismissQuitFailure(_:))
+        quitFailureAlert = alert
+        // A modeless alert also works when no document window remains. Never block
+        // the main actor: worker completions must still release their leases.
+        alert.window.center()
+        alert.window.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func dismissQuitFailure(_ sender: Any?) {
+        quitFailureAlert?.window.close()
+        quitFailureAlert = nil
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
-        AppState.shared.persistTabsState()
+        AppState.shared.flushSessionState()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     }
 }

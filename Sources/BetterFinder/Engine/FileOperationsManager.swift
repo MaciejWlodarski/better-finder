@@ -1,6 +1,5 @@
 import Foundation
 import AppKit
-import CryptoKit
 import Darwin
 
 public enum NewFileTemplate: String, CaseIterable, Identifiable {
@@ -46,12 +45,13 @@ public enum FileConflictPolicy: String, CaseIterable, Identifiable {
 }
 
 public struct PendingTransferConflict: Identifiable {
-    public let id = UUID()
+    public let id: UUID
     public let sourceURLs: [URL]
     public let destinationDirectory: URL
     public let conflictingNames: [String]
     public let isMove: Bool
     public let copyAcrossVolumes: Bool
+    public let completion: (@MainActor ([URL]) -> Void)?
 }
 
 public struct TransferProgressInfo {
@@ -75,38 +75,130 @@ public struct TransferProgressInfo {
     }
 }
 
+public struct GitStatusSnapshot: Sendable {
+    /// Inspection deliberately never executes conversion helpers. With configured
+    /// filters (including LFS), raw bytes can look modified even when trusted Git's
+    /// filtered comparison would be clean. Submodule contents are not inspected.
+    public let usesRawContentComparison: Bool
+    public let repositoryRoot: String
+    public let statuses: [String: GitFileStatus]
+}
+
 public struct UndoableFileOperation {
     public enum Kind {
-        case moved(pairs: [(from: URL, to: URL)])
-        case copied(created: [URL])
-        case created(url: URL)
-        case trashed(pairs: [(original: URL, trashed: URL)])
         case actions([FileHistoryAction])
     }
+    /// Both stacks retain this identity while a transaction is only partly applied.
+    public let transactionID: UUID
     public let label: String
     public let kind: Kind
+
+    public init(label: String, kind: Kind, transactionID: UUID = UUID()) {
+        self.transactionID = transactionID
+        self.label = label
+        self.kind = kind
+    }
 }
 
 /// Actions describe the next direction to execute, so replacement undo and redo keep
 /// both the incoming item and the displaced original, including after a partial failure.
-public enum FileHistoryAction {
-    case move(from: URL, to: URL)
-    case trash(URL)
+/// No-follow identity of the directory entry, not the data its symlink points
+/// at. Content, size, mtime and permissions deliberately do not define identity:
+/// legitimate edits to the same object must not invalidate its history.
+struct FileEntryIdentity: Equatable, Sendable {
+    let device: Int64
+    let inode: UInt64
+    let type: UInt32
+    let generation: UInt32
+    let birthSeconds: Int64
+    let birthNanoseconds: Int64
+
+    static func read(_ url: URL) throws -> FileEntryIdentity {
+        var value = stat()
+        guard url.path.withCString({ lstat($0, &value) }) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard value.st_ino != 0 else {
+            throw FileOperationFailure(message: "Wolumin nie udostępnia wiarygodnej tożsamości elementu.")
+        }
+        return FileEntryIdentity(device: Int64(value.st_dev), inode: UInt64(value.st_ino),
+            type: UInt32(value.st_mode & S_IFMT), generation: UInt32(value.st_gen),
+            birthSeconds: Int64(value.st_birthtimespec.tv_sec),
+            birthNanoseconds: Int64(value.st_birthtimespec.tv_nsec))
+    }
+}
+
+public struct FileHistoryAction {
+    enum Operation {
+        case move(from: URL, to: URL)
+        case restore(from: URL, to: URL)
+        case trash(URL)
+    }
+    let operation: Operation
+    let identity: FileEntryIdentity?
+
+    private init(_ operation: Operation, source: URL, io: FileOperationIO) {
+        self.operation = operation
+        self.identity = try? io.identity(source)
+    }
+
+    // Capture at operation completion, NEVER when the user later presses Undo.
+    // Failed identity reads remain explicit unexecutable recovery records.
+    static func move(from: URL, to: URL, io: FileOperationIO = .live) -> Self {
+        Self(.move(from: from, to: to), source: from, io: io)
+    }
+    static func restore(from: URL, to: URL, io: FileOperationIO = .live) -> Self {
+        Self(.restore(from: from, to: to), source: from, io: io)
+    }
+    static func trash(_ url: URL, io: FileOperationIO = .live) -> Self {
+        Self(.trash(url), source: url, io: io)
+    }
+    var sourceURL: URL {
+        switch operation {
+        case .move(let from, _), .restore(let from, _): return from
+        case .trash(let url): return url
+        }
+    }
+    func validate(io: FileOperationIO) throws {
+        guard let identity, let current = try? io.identity(sourceURL), current == identity else {
+            throw FileOperationFailure(message: "Nie wykonano historii dla „\(sourceURL.lastPathComponent)”: obiekt zmienił się lub nie można potwierdzić jego tożsamości. Zachowano oczekującą operację.")
+        }
+    }
 }
 
 struct FileOperationIO {
+    var identity: (URL) throws -> FileEntryIdentity
+    var readPermissions: (URL) throws -> UInt16
+    var writePermissions: (URL, UInt16) throws -> Void
+    var resolveEntryPath: (URL) -> String
+    var resolveDirectoryPath: (URL) -> String
     var exists: (URL) -> Bool
     var createDirectory: (URL) throws -> Void
     var move: (URL, URL) throws -> Void
     var copy: (URL, URL) throws -> Void
+    var publishExclusive: (URL, URL) throws -> Void
     var trash: (URL) throws -> URL
     var removeEmptyDirectory: (URL) -> Void
 
     static let live = FileOperationIO(
+        identity: FileEntryIdentity.read,
+        readPermissions: { url in
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let mode = attributes[.posixPermissions] as? NSNumber else {
+                throw FileOperationFailure(message: "Nie można odczytać uprawnień elementu.")
+            }
+            return mode.uint16Value & 0o7777
+        },
+        writePermissions: { url, mode in
+            try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: mode)], ofItemAtPath: url.path)
+        },
+        resolveEntryPath: { FileTransferPaths.entryPath($0) },
+        resolveDirectoryPath: { $0.resolvingSymlinksInPath().standardizedFileURL.path },
         exists: { (try? FileManager.default.attributesOfItem(atPath: $0.path)) != nil },
         createDirectory: { try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: false) },
         move: { try FileManager.default.moveItem(at: $0, to: $1) },
         copy: { try FileManager.default.copyItem(at: $0, to: $1) },
+        publishExclusive: { try SafeArchivePublication.moveExclusive(from: $0, to: $1) },
         trash: { url in
             var result: NSURL?
             try FileManager.default.trashItem(at: url, resultingItemURL: &result)
@@ -122,17 +214,130 @@ struct FileOperationIO {
     )
 }
 
+struct PosixPermissionSnapshot: Sendable {
+    let identity: FileEntryIdentity
+    let mode: UInt16
+
+    static func read(_ url: URL, io: FileOperationIO = .live) throws -> Self {
+        let identity = try io.identity(url)
+        guard identity.type == UInt32(S_IFREG) || identity.type == UInt32(S_IFDIR) else {
+            throw FileOperationFailure(message: "Edytor nie zmienia uprawnień dowiązań ani specjalnych wpisów.")
+        }
+        let mode = try io.readPermissions(url)
+        guard try io.identity(url) == identity else {
+            throw FileOperationFailure(message: "Element zmienił się podczas odczytu uprawnień.")
+        }
+        return Self(identity: identity, mode: mode)
+    }
+}
+
+enum PosixPermissionChange: Sendable {
+    case bit(UInt16, enabled: Bool)
+    case ordinaryMode(UInt16)
+
+    func applying(to current: UInt16) throws -> UInt16 {
+        switch self {
+        case .bit(let bit, let enabled):
+            guard bit != 0, bit & (bit - 1) == 0, bit & ~0o777 == 0 else {
+                throw FileOperationFailure(message: "Nieprawidłowy bit uprawnień.")
+            }
+            return enabled ? current | bit : current & ~bit
+        case .ordinaryMode(let mode):
+            guard mode & ~0o777 == 0 else {
+                throw FileOperationFailure(message: "Preset może zmieniać tylko zwykłe bity uprawnień.")
+            }
+            return (current & ~0o777) | mode
+        }
+    }
+
+    static func format(_ mode: UInt16) -> String {
+        let chars: [Character] = [
+            mode & 0o400 != 0 ? "r" : "-", mode & 0o200 != 0 ? "w" : "-",
+            mode & 0o4000 != 0 ? (mode & 0o100 != 0 ? "s" : "S") : (mode & 0o100 != 0 ? "x" : "-"),
+            mode & 0o040 != 0 ? "r" : "-", mode & 0o020 != 0 ? "w" : "-",
+            mode & 0o2000 != 0 ? (mode & 0o010 != 0 ? "s" : "S") : (mode & 0o010 != 0 ? "x" : "-"),
+            mode & 0o004 != 0 ? "r" : "-", mode & 0o002 != 0 ? "w" : "-",
+            mode & 0o1000 != 0 ? (mode & 0o001 != 0 ? "t" : "T") : (mode & 0o001 != 0 ? "x" : "-")
+        ]
+        return String(format: "%@ (%04o)", String(chars), mode & 0o7777)
+    }
+}
+
 struct FileOperationFailure: LocalizedError {
     let message: String
     var recoveryActions: [FileHistoryAction] = []
     var errorDescription: String? { message }
 }
 
+/// Archive subprocesses only touch privately reserved staging paths. Final
+/// publication is one same-filesystem, no-replace rename, not a check-then-move.
+enum SafeArchivePublication {
+    static func stagingDirectory(in parent: URL) throws -> URL {
+        let staging = parent.appendingPathComponent(".betterfinder-archive-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        return staging
+    }
+
+    static func moveExclusive(from source: URL, to destination: URL) throws {
+        // Some network/filesystem implementations do not support exclusive
+        // rename. Do not fall back to a racy check followed by ordinary rename.
+        let parent = destination.deletingLastPathComponent()
+        let capabilities = try parent.resourceValues(forKeys: [.volumeSupportsExclusiveRenamingKey])
+        guard capabilities.volumeSupportsExclusiveRenaming == true else {
+            throw FileOperationFailure(message: "Ten wolumin nie obsługuje bezpiecznego publikowania bez zastępowania; zachowano dane tymczasowe.")
+        }
+        let result = source.path.withCString { from in
+            destination.path.withCString { to in
+                Darwin.renamex_np(from, to, UInt32(RENAME_EXCL))
+            }
+        }
+        guard result == 0 else {
+            let code = errno
+            if code == EEXIST || code == ENOTEMPTY {
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteFileExistsError)
+            }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+        }
+    }
+}
+
+/// Resolve traversed parent directories, but not the entry itself: copying a
+/// symbolic link copies the link, not the directory it happens to point at.
+/// These checks prevent stable aliases from bypassing containment checks. They
+/// are not filesystem locks against another process retargeting a link mid-copy.
+enum FileTransferPaths {
+    private static func contains(_ path: String, within ancestor: String) -> Bool {
+        path == ancestor || path.hasPrefix(ancestor == "/" ? "/" : ancestor + "/")
+    }
+
+    static func entryPath(_ url: URL) -> String {
+        url.deletingLastPathComponent().resolvingSymlinksInPath()
+            .appendingPathComponent(url.lastPathComponent).standardizedFileURL.path
+    }
+
+    static func destinationIsInsideSource(_ directory: URL, source: URL, io: FileOperationIO = .live) -> Bool {
+        let sourcePath = io.resolveEntryPath(source)
+        let destinationPath = io.resolveDirectoryPath(directory)
+        return contains(destinationPath, within: sourcePath)
+    }
+
+    static func sameEntry(_ lhs: URL, _ rhs: URL, io: FileOperationIO = .live) -> Bool {
+        io.resolveEntryPath(lhs) == io.resolveEntryPath(rhs)
+    }
+
+    static func sourceIsInsideTarget(_ source: URL, target: URL, io: FileOperationIO = .live) -> Bool {
+        let sourcePath = io.resolveEntryPath(source)
+        let targetPath = io.resolveEntryPath(target)
+        return contains(sourcePath, within: targetPath)
+    }
+}
+
 enum SafeFileReplacement {
     /// Fully prepare the incoming item before touching the destination. The staging
     /// directory is on the destination volume, so installation is a local move.
     static func replace(source: URL, target: URL, isMove: Bool, io: FileOperationIO = .live) throws -> [FileHistoryAction] {
-        guard !source.standardizedFileURL.path.hasPrefix(target.standardizedFileURL.path + "/") else {
+        guard !FileTransferPaths.sourceIsInsideTarget(source, target: target, io: io) else {
             throw FileOperationFailure(message: "Nie można zastąpić folderu zawierającego plik źródłowy.")
         }
         let stagingDirectory = target.deletingLastPathComponent()
@@ -140,35 +345,44 @@ enum SafeFileReplacement {
         let staged = stagingDirectory.appendingPathComponent(source.lastPathComponent)
         try io.createDirectory(stagingDirectory)
         var displaced: URL?
+        var restoreDisplaced: FileHistoryAction?
+        var restoreStaged: FileHistoryAction?
         do {
             if isMove {
                 try io.move(source, staged)
             } else {
                 try io.copy(source, staged)
             }
+            if isMove { restoreStaged = .move(from: staged, to: source, io: io) }
             let original = try io.trash(target)
             displaced = original
+            restoreDisplaced = .move(from: original, to: target, io: io)
             try io.move(staged, target)
             io.removeEmptyDirectory(stagingDirectory)
-            let undoIncoming: FileHistoryAction = isMove ? .move(from: target, to: source) : .trash(target)
-            return [undoIncoming, .move(from: original, to: target)]
+            let undoIncoming: FileHistoryAction = isMove ? .move(from: target, to: source, io: io) : .trash(target, io: io)
+            return [undoIncoming, restoreDisplaced!]
         } catch {
             var details = [error.localizedDescription]
             var recoveryActions: [FileHistoryAction] = []
             if let displaced {
                 do {
+                    try restoreDisplaced?.validate(io: io)
                     try io.move(displaced, target)
                 } catch {
                     details.append("Nie przywrócono oryginału; zachowano go w \(displaced.path): \(error.localizedDescription)")
-                    recoveryActions.append(.move(from: displaced, to: target))
+                    if let restoreDisplaced { recoveryActions.append(restoreDisplaced) }
                 }
             }
             if isMove && io.exists(staged) {
+                // A failed move may have left an owned partial entry in staging.
+                // Bind that recovery entry now; never store a bare deferred path.
+                let recovery = restoreStaged ?? .move(from: staged, to: source, io: io)
                 do {
+                    try recovery.validate(io: io)
                     try io.move(staged, source)
                 } catch {
                     details.append("Plik źródłowy zachowano w \(staged.path): \(error.localizedDescription)")
-                    recoveryActions.append(.move(from: staged, to: source))
+                    recoveryActions.append(recovery)
                 }
             }
             // Keep partial copies/moves for recovery; never remove an original as a fallback.
@@ -194,15 +408,22 @@ enum FileHistoryExecutor {
         var result = Result()
         for (index, action) in actions.enumerated() {
             do {
-                switch action {
+                try action.validate(io: io)
+                switch action.operation {
                 case .move(let from, let to):
                     try io.move(from, to)
-                    result.inverse.append(.move(from: to, to: from))
+                    result.inverse.append(.move(from: to, to: from, io: io))
+                    result.touchedDirectories.insert(from.deletingLastPathComponent().path)
+                    result.touchedDirectories.insert(to.deletingLastPathComponent().path)
+                case .restore(let from, let requested):
+                    let to = io.exists(requested) ? FileOperationsManager.uniqueURL(for: requested) : requested
+                    try io.move(from, to)
+                    result.inverse.append(.move(from: to, to: from, io: io))
                     result.touchedDirectories.insert(from.deletingLastPathComponent().path)
                     result.touchedDirectories.insert(to.deletingLastPathComponent().path)
                 case .trash(let url):
                     let trashed = try io.trash(url)
-                    result.inverse.append(.move(from: trashed, to: url))
+                    result.inverse.append(.move(from: trashed, to: url, io: io))
                     result.touchedDirectories.insert(url.deletingLastPathComponent().path)
                 }
                 result.completedCount += 1
@@ -264,25 +485,49 @@ public final class FileOperationsManager: ObservableObject {
 
     // Conflict Resolution & Transfer Progress
     @Published public var defaultConflictPolicy: FileConflictPolicy = .ask {
-        didSet { UserDefaults.standard.set(defaultConflictPolicy.rawValue, forKey: "bf.defaultConflictPolicy") }
+        didSet {
+            #if !BETTERFINDER_TESTING
+            UserDefaults.standard.set(defaultConflictPolicy.rawValue, forKey: "bf.defaultConflictPolicy")
+            #endif
+        }
     }
     @Published public var pendingConflict: PendingTransferConflict? = nil
-    @Published public var activeTransfer: TransferProgressInfo? = nil
+    @Published public private(set) var activeTransfer: TransferProgressInfo? = nil
 
     /// `NSPasteboard.changeCount` captured when this app last wrote files to the pasteboard.
     /// Used to detect whether the internal cut/copy clipboard is still current.
     private var clipboardChangeCount: Int = -1
     private var transferCancellation: TransferCancellationFlag?
+    private var preflightRequestID: UUID?
+    private static let duplicateCleanupQueue = DispatchQueue(label: "com.betterfinder.duplicate-cleanup", qos: .userInitiated)
+    @Published private(set) var activeDuplicateCleanupID: UUID?
+    private var duplicateCleanupCancellation: DuplicateCleanupCancellation?
+    private let duplicateCleanupIO: DuplicateCleanupIO
 
-    private init() {
+    private let fileIO: FileOperationIO
+    private let reloadVisiblePanes: @MainActor () -> Void
+    nonisolated private let enqueueDirectoryRefresh: @Sendable (String) -> Void
+
+    // Internal injection keeps regression tests on the actual manager path without
+    // touching the user's Trash, clipboard, or visible panes.
+    init(fileIO: FileOperationIO = .live,
+         duplicateCleanupIO: DuplicateCleanupIO = .live,
+         reloadVisiblePanes: @escaping @MainActor () -> Void = { AppState.shared.reloadVisiblePanes() },
+         enqueueDirectoryRefresh: @escaping @Sendable (String) -> Void = { FSearchIndex.shared.enqueueDirectoryRefresh($0) }) {
+        self.fileIO = fileIO
+        self.duplicateCleanupIO = duplicateCleanupIO
+        self.reloadVisiblePanes = reloadVisiblePanes
+        self.enqueueDirectoryRefresh = enqueueDirectoryRefresh
+        #if !BETTERFINDER_TESTING
         if let raw = UserDefaults.standard.string(forKey: "bf.defaultConflictPolicy"),
            let policy = FileConflictPolicy(rawValue: raw) {
             defaultConflictPolicy = policy
         }
+        #endif
     }
 
-    public var canUndo: Bool { !undoStack.isEmpty }
-    public var canRedo: Bool { !redoStack.isEmpty }
+    public var canUndo: Bool { !isBusy && !undoStack.isEmpty }
+    public var canRedo: Bool { !isBusy && !redoStack.isEmpty }
     public var isBusy: Bool { activeTransfer != nil }
 
     public var undoLabel: String {
@@ -318,56 +563,87 @@ public final class FileOperationsManager: ObservableObject {
         applyHistory(isUndo: false)
     }
 
-    private func applyHistory(isUndo: Bool) {
+    /// All file-mutating entry points share this gate, including context-menu and
+    /// inspector actions. MainActor checks and acquisition cannot interleave.
+    private func canStartMutation() -> Bool {
         guard !isBusy else {
             lastStatusMessage = "Poczekaj na zakończenie bieżącej operacji"
-            return
+            return false
         }
+        return true
+    }
+
+    private func beginMutation(title: String, currentFile: String = "", totalCount: Int = 1) -> Bool {
+        guard canStartMutation() else { return false }
+        activeTransfer = TransferProgressInfo(title: title, currentFile: currentFile,
+                                              completedCount: 0, totalCount: totalCount)
+        return true
+    }
+
+    private func applyHistory(isUndo: Bool) {
+        guard canStartMutation() else { return }
         guard let op = isUndo ? undoStack.popLast() : redoStack.popLast() else {
             lastStatusMessage = isUndo ? "Brak operacji do cofnięcia" : "Brak operacji do ponowienia"
             return
         }
-        let actions: [FileHistoryAction]
-        switch op.kind {
-        case .moved(let pairs):
-            actions = pairs.reversed().map { .move(from: $0.to, to: $0.from) }
-        case .copied(let created):
-            actions = created.reversed().map { .trash($0) }
-        case .created(let url):
-            actions = [.trash(url)]
-        case .trashed(let pairs):
-            actions = pairs.map {
-                let destination = FileOperationIO.live.exists($0.original) ? Self.uniqueURL(for: $0.original) : $0.original
-                return .move(from: $0.trashed, to: destination)
+        // Acquire before dispatch, not inside the worker: another mutation must
+        // never alter paths/history while this transaction is in flight.
+        activeTransfer = TransferProgressInfo(title: isUndo ? "Cofanie" : "Ponawianie",
+                                              currentFile: op.label, completedCount: 0, totalCount: 1)
+        let io = fileIO
+        Task.detached(priority: .userInitiated) { [self] in
+            let actions: [FileHistoryAction]
+            switch op.kind {
+            case .actions(let stored): actions = stored
             }
-        case .actions(let stored):
-            actions = stored
+            let result = FileHistoryExecutor.execute(actions, io: io)
+            for dir in result.touchedDirectories {
+                self.enqueueDirectoryRefresh(dir)
+            }
+            await MainActor.run {
+                if !result.pending.isEmpty {
+                    let pending = UndoableFileOperation(label: op.label, kind: .actions(result.pending), transactionID: op.transactionID)
+                    if isUndo { self.undoStack.append(pending) } else { self.redoStack.append(pending) }
+                }
+                if !result.inverse.isEmpty {
+                    // Retrying or reversing a partial transaction must reconnect
+                    // its completed prefix to the still-pending suffix.
+                    if isUndo {
+                        Self.appendHistoryInverse(result.inverse, for: op, to: &self.redoStack)
+                    } else {
+                        Self.appendHistoryInverse(result.inverse, for: op, to: &self.undoStack)
+                    }
+                }
+                let message: String
+                if let error = result.error {
+                    message = "Nie udało się \(isUndo ? "cofnąć" : "ponowić"): \(op.label) (\(result.completedCount) z \(actions.count) kroków): \(error)"
+                } else {
+                    message = "\(isUndo ? "Cofnięto" : "Ponowiono"): \(op.label)"
+                }
+                self.activeTransfer = nil
+                self.finishUndoRedo(touchedDirs: result.touchedDirectories, message: message)
+            }
         }
-        let result = FileHistoryExecutor.execute(actions)
-        if !result.pending.isEmpty {
-            let pending = UndoableFileOperation(label: op.label, kind: .actions(result.pending))
-            if isUndo { undoStack.append(pending) } else { redoStack.append(pending) }
+    }
+
+    private static func appendHistoryInverse(_ actions: [FileHistoryAction], for operation: UndoableFileOperation,
+                                             to stack: inout [UndoableFileOperation]) {
+        var combined = actions
+        if let prior = stack.last, prior.transactionID == operation.transactionID,
+           case .actions(let pending) = prior.kind {
+            stack.removeLast()
+            combined += pending
         }
-        if !result.inverse.isEmpty {
-            let inverse = UndoableFileOperation(label: op.label, kind: .actions(result.inverse))
-            if isUndo { redoStack.append(inverse) } else { undoStack.append(inverse) }
-        }
-        let message: String
-        if let error = result.error {
-            message = "Nie udało się \(isUndo ? "cofnąć" : "ponowić"): \(op.label) (\(result.completedCount) z \(actions.count) kroków): \(error)"
-        } else {
-            message = "\(isUndo ? "Cofnięto" : "Ponowiono"): \(op.label)"
-        }
-        finishUndoRedo(touchedDirs: result.touchedDirectories, message: message)
+        stack.append(UndoableFileOperation(label: operation.label, kind: .actions(combined),
+                                          transactionID: operation.transactionID))
     }
 
     private func finishUndoRedo(touchedDirs: Set<String>, message: String) {
         for dir in touchedDirs {
-            FSearchIndex.shared.refreshDirectoryInIndex(dir)
             FolderSizeCache.shared.invalidate(containing: dir)
         }
         lastStatusMessage = message
-        AppState.shared.reloadVisiblePanes()
+        reloadVisiblePanes()
     }
 
     // MARK: - Copy / Cut / Paste / Drop with Conflict Detection & Progress
@@ -426,6 +702,8 @@ public final class FileOperationsManager: ObservableObject {
     /// Drag & drop: moves within the same volume, copies across volumes (Finder semantics).
     /// Holding Option forces a copy.
     public func handleDropURLs(_ urls: [URL], into destinationDirectory: URL, copyInsteadOfMove: Bool = false) {
+        // Keep the UI-only cheap lexical filter. Alias resolution belongs to the
+        // background preflight, including for slow or disconnected volumes.
         let destPath = destinationDirectory.standardizedFileURL.path
         let validURLs = urls.filter {
             let p = $0.standardizedFileURL.path
@@ -441,69 +719,96 @@ public final class FileOperationsManager: ObservableObject {
         )
     }
 
-    /// Copies or moves files on a background task, reporting progress in `activeTransfer`.
-    /// - Parameter copyAcrossVolumes: when `true`, a move whose source lives on another volume becomes a copy.
+    /// Returns a stable request identity immediately; conflict discovery and all
+    /// filesystem preflight run off MainActor while the mutation gate is held.
+    @discardableResult
     public func performTransfer(
         sourceURLs: [URL],
         into destinationDirectory: URL,
         isMove: Bool,
         explicitPolicy: FileConflictPolicy? = nil,
         copyAcrossVolumes: Bool = false,
+        requestID: UUID = UUID(),
         completion: (@MainActor ([URL]) -> Void)? = nil
-    ) {
-        guard !isBusy else {
-            lastStatusMessage = "Poczekaj na zakończenie bieżącej operacji"
-            return
+    ) -> UUID? {
+        guard !sourceURLs.isEmpty, canStartMutation() else { return nil }
+        guard pendingConflict == nil else {
+            lastStatusMessage = "Najpierw rozstrzygnij oczekujący konflikt"
+            return nil
         }
-        let fm = FileManager.default
+        let io = fileIO
         let policy = explicitPolicy ?? defaultConflictPolicy
-        let destPath = destinationDirectory.standardizedFileURL.path
-
-        // Never copy/move a folder into itself or one of its own subfolders.
-        var validSources: [URL] = []
-        var rejectedNested = 0
-        for src in sourceURLs {
-            let srcPath = src.standardizedFileURL.path
-            if destPath == srcPath || destPath.hasPrefix(srcPath + "/") {
-                rejectedNested += 1
-                continue
-            }
-            validSources.append(src)
-        }
-        guard !validSources.isEmpty else {
-            if rejectedNested > 0 {
-                lastStatusMessage = "Nie można umieścić folderu wewnątrz samego siebie"
-            }
-            return
-        }
-
-        // Check for conflicts if policy == .ask
-        if policy == .ask {
-            var conflicts: [String] = []
-            for src in validSources {
-                let dst = destinationDirectory.appendingPathComponent(src.lastPathComponent)
-                if dst.standardizedFileURL.path != src.standardizedFileURL.path && fm.fileExists(atPath: dst.path) {
-                    conflicts.append(src.lastPathComponent)
-                }
-            }
-            if !conflicts.isEmpty {
-                pendingConflict = PendingTransferConflict(
-                    sourceURLs: validSources,
-                    destinationDirectory: destinationDirectory,
-                    conflictingNames: conflicts,
-                    isMove: isMove,
-                    copyAcrossVolumes: copyAcrossVolumes
-                )
-                return
-            }
-        }
-
-        let total = validSources.count
         let clipboardSnapshot = isMove && clipboardMode == .cut && NSPasteboard.general.changeCount == clipboardChangeCount
             ? CutClipboardSnapshot(changeCount: clipboardChangeCount) : nil
-        let title = isMove ? "Przenoszenie" : "Kopiowanie"
         let flag = TransferCancellationFlag()
+        preflightRequestID = requestID
         transferCancellation = flag
+        activeTransfer = TransferProgressInfo(title: "Sprawdzanie transferu", currentFile: "",
+                                              completedCount: 0, totalCount: sourceURLs.count, isCancellable: true)
+        Task.detached(priority: .userInitiated) { [self] in
+            var validSources: [URL] = []
+            var rejectedNested = 0
+            var conflicts: [String] = []
+            for source in sourceURLs {
+                if flag.isCancelled { break }
+                if FileTransferPaths.destinationIsInsideSource(destinationDirectory, source: source, io: io) {
+                    rejectedNested += 1
+                    continue
+                }
+                validSources.append(source)
+                if policy == .ask {
+                    let target = destinationDirectory.appendingPathComponent(source.lastPathComponent)
+                    if !FileTransferPaths.sameEntry(target, source, io: io) && io.exists(target) {
+                        conflicts.append(source.lastPathComponent)
+                    }
+                }
+            }
+            let preparedSources = validSources
+            let preparedConflicts = conflicts
+            let preparedRejected = rejectedNested
+            await MainActor.run {
+                guard self.preflightRequestID == requestID else { return }
+                self.preflightRequestID = nil
+                if flag.isCancelled || preparedSources.isEmpty {
+                    self.activeTransfer = nil
+                    self.transferCancellation = nil
+                    self.lastStatusMessage = flag.isCancelled
+                        ? "Anulowano przygotowanie transferu"
+                        : "Nie można umieścić folderu wewnątrz samego siebie"
+                } else if !preparedConflicts.isEmpty {
+                    self.pendingConflict = PendingTransferConflict(
+                        id: requestID, sourceURLs: preparedSources, destinationDirectory: destinationDirectory,
+                        conflictingNames: preparedConflicts, isMove: isMove,
+                        copyAcrossVolumes: copyAcrossVolumes, completion: completion)
+                    self.activeTransfer = nil
+                    self.transferCancellation = nil
+                } else {
+                    self.executePreparedTransfer(sourceURLs: preparedSources, into: destinationDirectory,
+                        isMove: isMove, policy: policy, copyAcrossVolumes: copyAcrossVolumes,
+                        rejectedNested: preparedRejected, clipboardSnapshot: clipboardSnapshot,
+                        flag: flag, completion: completion)
+                }
+            }
+        }
+        return requestID
+    }
+
+    /// Closing the initiating sheet may cancel its pending preflight/conflict,
+    /// but never another sheet's request or a transfer already writing files.
+    public func cancelPendingTransferRequest(_ requestID: UUID) {
+        if preflightRequestID == requestID { transferCancellation?.cancel() }
+        if pendingConflict?.id == requestID { pendingConflict = nil }
+    }
+
+    private func executePreparedTransfer(
+        sourceURLs validSources: [URL], into destinationDirectory: URL,
+        isMove: Bool, policy: FileConflictPolicy, copyAcrossVolumes: Bool,
+        rejectedNested: Int, clipboardSnapshot: CutClipboardSnapshot?,
+        flag: TransferCancellationFlag, completion: (@MainActor ([URL]) -> Void)?
+    ) {
+        let io = fileIO
+        let total = validSources.count
+        let title = isMove ? "Przenoszenie" : "Kopiowanie"
         activeTransfer = TransferProgressInfo(
             title: title,
             currentFile: validSources[0].lastPathComponent,
@@ -512,8 +817,7 @@ public final class FileOperationsManager: ObservableObject {
             isCancellable: total > 1
         )
 
-        Task.detached(priority: .userInitiated) {
-            let fm = FileManager.default
+        Task.detached(priority: .userInitiated) { [self] in
             var resultURLs: [URL] = []
             var copiedURLs: [URL] = []
             var movedPairs: [(from: URL, to: URL)] = []
@@ -536,16 +840,21 @@ public final class FileOperationsManager: ObservableObject {
                         totalCount: total,
                         isCancellable: total > 1
                     )
-                    await MainActor.run { FileOperationsManager.shared.activeTransfer = info }
+                    await MainActor.run { self.activeTransfer = info }
                 }
 
+                // Recheck after conflict-sheet delay and immediately before IO.
+                guard !FileTransferPaths.destinationIsInsideSource(destinationDirectory, source: src, io: io) else {
+                    errors.append("\(src.lastPathComponent): folder docelowy znajduje się wewnątrz źródła")
+                    continue
+                }
                 let doMove = isMove && (!copyAcrossVolumes || Self.isSameVolume(src, destinationDirectory))
                 var targetURL = destinationDirectory.appendingPathComponent(src.lastPathComponent)
                 var replacesExisting = false
-                if targetURL.standardizedFileURL.path == src.standardizedFileURL.path {
+                if FileTransferPaths.sameEntry(targetURL, src, io: io) {
                     if doMove { skipped += 1; continue }
                     targetURL = Self.uniqueURL(for: targetURL)
-                } else if FileOperationIO.live.exists(targetURL) {
+                } else if io.exists(targetURL) {
                     switch policy {
                     case .skip:
                         skipped += 1
@@ -561,13 +870,13 @@ public final class FileOperationsManager: ObservableObject {
                 do {
                     let itemUndo: [FileHistoryAction]
                     if replacesExisting {
-                        itemUndo = try SafeFileReplacement.replace(source: src, target: targetURL, isMove: doMove)
+                        itemUndo = try SafeFileReplacement.replace(source: src, target: targetURL, isMove: doMove, io: io)
                     } else if doMove {
-                        try fm.moveItem(at: src, to: targetURL)
-                        itemUndo = [.move(from: targetURL, to: src)]
+                        try io.move(src, targetURL)
+                        itemUndo = [.move(from: targetURL, to: src, io: io)]
                     } else {
-                        try fm.copyItem(at: src, to: targetURL)
-                        itemUndo = [.trash(targetURL)]
+                        try io.copy(src, targetURL)
+                        itemUndo = [.trash(targetURL, io: io)]
                     }
                     undoActions.append(contentsOf: itemUndo.reversed())
                     if doMove {
@@ -585,7 +894,7 @@ public final class FileOperationsManager: ObservableObject {
             }
 
             for dir in touchedDirs {
-                FSearchIndex.shared.refreshDirectoryInIndex(dir)
+                self.enqueueDirectoryRefresh(dir)
             }
 
             let wasCancelled = flag.isCancelled
@@ -598,7 +907,7 @@ public final class FileOperationsManager: ObservableObject {
             let finalTouched = touchedDirs
 
             await MainActor.run {
-                let manager = FileOperationsManager.shared
+                let manager = self
                 manager.activeTransfer = nil
                 manager.transferCancellation = nil
 
@@ -628,30 +937,37 @@ public final class FileOperationsManager: ObservableObject {
                 for dir in finalTouched {
                     FolderSizeCache.shared.invalidate(containing: dir)
                 }
-                AppState.shared.reloadVisiblePanes()
+                manager.reloadVisiblePanes()
                 completion?(finalResults)
             }
         }
     }
 
     public func cancelActiveTransfer() {
-        transferCancellation?.cancel()
+        if let id = activeDuplicateCleanupID {
+            cancelDuplicateCleanup(id)
+        } else {
+            transferCancellation?.cancel()
+        }
     }
 
     // MARK: - Create Folder / Create File
 
     @discardableResult
     public func createFolder(named name: String, in directory: URL) -> URL? {
+        guard beginMutation(title: "Tworzenie folderu") else { return nil }
+        defer { activeTransfer = nil }
         guard let safeName = Self.validatedFileName(name) else {
             lastStatusMessage = "Nieprawidłowa nazwa folderu"
             return nil
         }
         let fm = FileManager.default
-        let target = Self.uniqueURL(for: directory.appendingPathComponent(safeName))
         do {
-            try fm.createDirectory(at: target, withIntermediateDirectories: false)
-            pushUndo(UndoableFileOperation(label: "Utworzenie folderu \(target.lastPathComponent)", kind: .created(url: target)))
-            FSearchIndex.shared.refreshDirectoryInIndex(directory.path)
+            let target = try Self.createUniqueItem(at: directory.appendingPathComponent(safeName)) { target in
+                try fm.createDirectory(at: target, withIntermediateDirectories: false)
+            }
+            pushUndo(UndoableFileOperation(label: "Utworzenie folderu \(target.lastPathComponent)", kind: .actions([.trash(target, io: fileIO)])))
+            self.enqueueDirectoryRefresh(directory.path)
             lastStatusMessage = "Utworzono folder \(target.lastPathComponent)"
             return target
         } catch {
@@ -662,18 +978,23 @@ public final class FileOperationsManager: ObservableObject {
 
     @discardableResult
     public func createFile(named name: String, content: String = "", in directory: URL) -> URL? {
+        guard beginMutation(title: "Tworzenie pliku") else { return nil }
+        defer { activeTransfer = nil }
         guard let safeName = Self.validatedFileName(name) else {
             lastStatusMessage = "Nieprawidłowa nazwa pliku"
             return nil
         }
-        let target = Self.uniqueURL(for: directory.appendingPathComponent(safeName))
         do {
-            try content.write(to: target, atomically: true, encoding: .utf8)
+            let target = try Self.createUniqueItem(at: directory.appendingPathComponent(safeName)) { target in
+                // O_EXCL-style creation; an atomic replacement write could overwrite
+                // another process's file/symlink created after uniqueURL's check.
+                try Data(content.utf8).write(to: target, options: .withoutOverwriting)
+            }
             if safeName.hasSuffix(".sh") || content.hasPrefix("#!") {
                 try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target.path)
             }
-            pushUndo(UndoableFileOperation(label: "Utworzenie pliku \(target.lastPathComponent)", kind: .created(url: target)))
-            FSearchIndex.shared.refreshDirectoryInIndex(directory.path)
+            pushUndo(UndoableFileOperation(label: "Utworzenie pliku \(target.lastPathComponent)", kind: .actions([.trash(target, io: fileIO)])))
+            self.enqueueDirectoryRefresh(directory.path)
             lastStatusMessage = "Utworzono plik \(target.lastPathComponent)"
             return target
         } catch {
@@ -686,6 +1007,8 @@ public final class FileOperationsManager: ObservableObject {
 
     @discardableResult
     public func renameItem(_ item: FileItem, to newName: String) -> URL? {
+        guard beginMutation(title: "Zmiana nazwy") else { return nil }
+        defer { activeTransfer = nil }
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != item.name else { return nil }
         guard let safeName = Self.validatedFileName(trimmed) else {
@@ -694,14 +1017,14 @@ public final class FileOperationsManager: ObservableObject {
         }
         let dst = item.url.deletingLastPathComponent().appendingPathComponent(safeName)
         let isCaseOnlyChange = safeName.lowercased() == item.name.lowercased()
-        if !isCaseOnlyChange && FileManager.default.fileExists(atPath: dst.path) {
+        if !isCaseOnlyChange && fileIO.exists(dst) {
             lastStatusMessage = "Element o nazwie „\(safeName)” już istnieje"
             return nil
         }
         do {
             try FileManager.default.moveItem(at: item.url, to: dst)
-            pushUndo(UndoableFileOperation(label: "Zmiana nazwy \(item.name) → \(safeName)", kind: .moved(pairs: [(from: item.url, to: dst)])))
-            FSearchIndex.shared.refreshDirectoryInIndex(item.parentPath)
+            pushUndo(UndoableFileOperation(label: "Zmiana nazwy \(item.name) → \(safeName)", kind: .actions([.move(from: dst, to: item.url, io: fileIO)])))
+            self.enqueueDirectoryRefresh(item.parentPath)
             lastStatusMessage = "Zmieniono nazwę na \(safeName)"
             return dst
         } catch {
@@ -757,11 +1080,11 @@ public final class FileOperationsManager: ObservableObject {
                     lastError = error.localizedDescription
                 }
             }
-            FSearchIndex.shared.refreshDirectoryInIndex(trashPath)
+            self.enqueueDirectoryRefresh(trashPath)
             let removedURLs = removed
             let finalError = lastError
             await MainActor.run {
-                let manager = FileOperationsManager.shared
+                let manager = self
                 manager.activeTransfer = nil
                 // Undo entries pointing into the Trash are no longer restorable.
                 manager.undoStack.removeAll { Self.referencesRemovedItems($0.kind, removed: removedURLs) }
@@ -769,51 +1092,151 @@ public final class FileOperationsManager: ObservableObject {
                 manager.lastStatusMessage = finalError.map {
                     "Nie opróżniono całego Kosza (usunięto \(removedURLs.count) z \(items.count)): \($0)"
                 } ?? "Opróżniono Kosz (usunięto \(removedURLs.count) elem.)"
-                AppState.shared.reloadVisiblePanes()
+                manager.reloadVisiblePanes()
                 completion?()
             }
         }
     }
 
-    @discardableResult
-    public func duplicateItems(_ items: [FileItem]) -> [URL] {
-        let fm = FileManager.default
-        var created: [URL] = []
-        for item in items {
-            let dst = Self.uniqueURL(for: item.url, suffixWord: " copy")
-            if (try? fm.copyItem(at: item.url, to: dst)) != nil {
-                created.append(dst)
-                FSearchIndex.shared.refreshDirectoryInIndex(item.parentPath)
+    /// Duplicate can copy multi-gigabyte trees, so it owns the same mutation gate
+    /// as transfers and runs off MainActor. Completion reports only created items.
+    public func duplicateItems(_ items: [FileItem], completion: (@MainActor ([URL]) -> Void)? = nil) {
+        guard !items.isEmpty, beginMutation(title: "Duplikowanie", totalCount: items.count) else { return }
+        let io = fileIO
+        Task.detached(priority: .userInitiated) { [self] in
+            var created: [URL] = []
+            var undo: [FileHistoryAction] = []
+            var errors: [String] = []
+            var touched = Set<String>()
+            for (index, item) in items.enumerated() {
+                await MainActor.run {
+                    self.activeTransfer = TransferProgressInfo(title: "Duplikowanie", currentFile: item.name,
+                                                              completedCount: index, totalCount: items.count)
+                }
+                let destination = Self.uniqueURL(for: item.url, suffixWord: " copy")
+                do {
+                    try io.copy(item.url, destination)
+                    created.append(destination)
+                    undo.append(.trash(destination, io: io))
+                    touched.insert(item.parentPath)
+                } catch {
+                    errors.append("\(item.name): \(error.localizedDescription)")
+                }
+            }
+            for directory in touched { self.enqueueDirectoryRefresh(directory) }
+            let finalCreated = created
+            let finalUndo = Array(undo.reversed())
+            let finalErrors = errors
+            let finalTouched = touched
+            await MainActor.run {
+                if !finalCreated.isEmpty {
+                    self.pushUndo(UndoableFileOperation(label: "Duplikacja \(finalCreated.count) elem.", kind: .actions(finalUndo)))
+                }
+                for directory in finalTouched { FolderSizeCache.shared.invalidate(containing: directory) }
+                self.lastStatusMessage = finalErrors.isEmpty
+                    ? "Zduplikowano \(finalCreated.count) elem."
+                    : "Zduplikowano \(finalCreated.count) z \(items.count) elem.: " + finalErrors.joined(separator: "; ")
+                self.activeTransfer = nil
+                self.reloadVisiblePanes()
+                completion?(finalCreated)
             }
         }
-        if !created.isEmpty {
-            pushUndo(UndoableFileOperation(label: "Duplikacja \(created.count) elem.", kind: .copied(created: created)))
-        }
-        lastStatusMessage = "Zduplikowano \(created.count) elem."
-        return created
     }
 
-    public func moveToTrash(_ items: [FileItem]) {
-        guard !items.isEmpty else { return }
-        let fm = FileManager.default
-        var trashedPairs: [(original: URL, trashed: URL)] = []
-        var failures = 0
-        for item in items {
-            var resultingURL: NSURL? = nil
-            if (try? fm.trashItem(at: item.url, resultingItemURL: &resultingURL)) != nil {
-                if let trashed = resultingURL as URL? {
-                    trashedPairs.append((original: item.url, trashed: trashed))
+    /// Duplicate-only async mutation. Content verification and live-owner
+    /// admission happen before this call; the worker preserves the verified plan
+    /// and checks keeper/candidate snapshots immediately before each Trash.
+    /// Rejection does not queue a later destructive action.
+    @discardableResult
+    func startDuplicateCleanup(_ plan: DuplicateCleanupPlan, requestID: UUID,
+        completion: (@MainActor (DuplicateCleanupResult) -> Void)? = nil) -> Bool {
+        let total = plan.candidateCount
+        guard total > 0 else {
+            lastStatusMessage = "Brak nadmiarowych plików do przeniesienia."
+            return false
+        }
+        guard beginMutation(title: "Usuwanie duplikatów", totalCount: total) else { return false }
+        let cancellation = DuplicateCleanupCancellation()
+        duplicateCleanupCancellation = cancellation
+        activeDuplicateCleanupID = requestID
+        activeTransfer = TransferProgressInfo(title: "Usuwanie duplikatów", currentFile: "",
+            completedCount: 0, totalCount: total, isCancellable: true)
+        let io = DuplicateCleanupWorkerIO(cleanup: duplicateCleanupIO, history: fileIO)
+        let relay = DuplicateCleanupProgressRelay { [weak self] progress in
+            guard let self, self.activeDuplicateCleanupID == requestID, !cancellation.isCancelled else { return }
+            self.activeTransfer = TransferProgressInfo(title: "Usuwanie duplikatów", currentFile: progress.currentFile,
+                completedCount: progress.attempted, totalCount: progress.total, isCancellable: true)
+        }
+        Self.duplicateCleanupQueue.async { [self] in
+            let result = DuplicateCleanupExecutor.execute(plan, io: io, cancellation: cancellation,
+                progress: { relay.offer($0) })
+            for directory in result.touchedDirectories { self.enqueueDirectoryRefresh(directory) }
+            Task { @MainActor in
+                // Complete manager-owned history even after the initiating view
+                // disappears. The gate remains held through physical return and
+                // this single finalization; stale progress cannot affect a new job.
+                relay.close()
+                guard self.activeDuplicateCleanupID == requestID else { return }
+                if !result.undoActions.isEmpty {
+                    self.pushUndo(UndoableFileOperation(label: "Usuwanie duplikatów (\(result.undoActions.count) rekordów)",
+                        kind: .actions(result.undoActions)))
                 }
-                FSearchIndex.shared.refreshDirectoryInIndex(item.parentPath)
+                for directory in result.touchedDirectories { FolderSizeCache.shared.invalidate(containing: directory) }
+                self.lastStatusMessage = result.summary
+                self.reloadVisiblePanes()
+                self.activeDuplicateCleanupID = nil
+                self.duplicateCleanupCancellation = nil
+                self.activeTransfer = nil
+                completion?(result)
+            }
+        }
+        return true
+    }
+
+    /// Ownership prevents a disappearing old analysis pane from cancelling a
+    /// later transfer or another cleanup operation.
+    func cancelDuplicateCleanup(_ requestID: UUID) {
+        guard activeDuplicateCleanupID == requestID, let cancellation = duplicateCleanupCancellation,
+              !cancellation.isCancelled else { return }
+        cancellation.cancel()
+        if let progress = activeTransfer {
+            activeTransfer = TransferProgressInfo(title: "Anulowanie po bieżącej operacji…", currentFile: progress.currentFile,
+                completedCount: progress.completedCount, totalCount: progress.totalCount, isCancellable: false)
+        }
+    }
+
+    public func moveToTrash(_ items: [FileItem], validating: ((FileItem) throws -> Void)? = nil) {
+        guard !items.isEmpty, beginMutation(title: "Przenoszenie do Kosza", totalCount: items.count) else { return }
+        defer { activeTransfer = nil }
+        var trashedPairs: [(original: URL, trashed: URL)] = []
+        var undo: [FileHistoryAction] = []
+        var failures = 0
+        var validationError: String?
+        for item in items {
+            do {
+                // A stale duplicate scan must not be allowed to remove the last
+                // surviving or newly modified copy. Abort the batch on invalidation.
+                try validating?(item)
+            } catch {
+                validationError = error.localizedDescription
+                break
+            }
+            do {
+                let trashed = try fileIO.trash(item.url)
+                trashedPairs.append((original: item.url, trashed: trashed))
+                undo.append(.restore(from: trashed, to: item.url, io: fileIO))
+                self.enqueueDirectoryRefresh(item.parentPath)
                 FolderSizeCache.shared.invalidate(containing: item.parentPath)
-            } else {
+            } catch {
                 failures += 1
             }
         }
         if !trashedPairs.isEmpty {
-            pushUndo(UndoableFileOperation(label: "Kosz (\(trashedPairs.count) elem.)", kind: .trashed(pairs: trashedPairs)))
+            pushUndo(UndoableFileOperation(label: "Kosz (\(trashedPairs.count) elem.)", kind: .actions(undo)))
         }
-        if failures > 0 {
+        if let validationError {
+            lastStatusMessage = "Przerwano usuwanie: \(validationError) (przeniesiono \(trashedPairs.count) elem.)"
+        } else if failures > 0 {
             lastStatusMessage = "Nie udało się przenieść do Kosza \(failures) elem. (brak uprawnień?)"
         } else {
             lastStatusMessage = "Przeniesiono do Kosza: \(trashedPairs.count) elem. (Cmd+Z aby przywrócić)"
@@ -823,6 +1246,8 @@ public final class FileOperationsManager: ObservableObject {
     // MARK: - Native macOS Finder Color Tags
 
     public func toggleTag(_ color: FinderTagColor, for items: [FileItem]) {
+        guard beginMutation(title: "Zmiana tagów") else { return }
+        defer { activeTransfer = nil }
         guard !items.isEmpty else { return }
         // When tagging several items, either add the tag to all of them or (if all have it) remove it.
         do {
@@ -854,6 +1279,8 @@ public final class FileOperationsManager: ObservableObject {
     }
 
     public func clearTags(for items: [FileItem]) {
+        guard beginMutation(title: "Usuwanie tagów") else { return }
+        defer { activeTransfer = nil }
         guard !items.isEmpty else { return }
         var failures = 0
         var lastError: String?
@@ -892,52 +1319,83 @@ public final class FileOperationsManager: ObservableObject {
 
     // MARK: - Compress & One-Click Archive Extraction
 
-    public func compressItems(_ items: [FileItem], in directory: URL) {
-        guard !isBusy else {
-            lastStatusMessage = "Poczekaj na zakończenie bieżącej operacji"
-            return
+    /// Archive tools get a minimal environment. In particular ZIPOPT=-m must
+    /// never turn a non-destructive compression command into source deletion;
+    /// TAR_OPTIONS, UNZIP*, and shell startup variables are excluded as well.
+    nonisolated static func archiveProcessEnvironment(inherited: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        var environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        for key in ["TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"] {
+            if let value = inherited[key] { environment[key] = value }
         }
-        guard !items.isEmpty else { return }
+        return environment
+    }
+
+    public func compressItems(_ items: [FileItem], in directory: URL) {
+        guard !items.isEmpty, canStartMutation() else { return }
         let parents = Set(items.map { $0.url.deletingLastPathComponent().path })
-        // Items from search results may live in different folders – archive next to the first one.
         let workingDir = parents.count == 1 ? items[0].url.deletingLastPathComponent() : directory
         let archiveBaseName = items.count == 1 ? "\(items[0].url.deletingPathExtension().lastPathComponent).zip" : "Archiwum.zip"
-        let dstURL = Self.uniqueURL(for: workingDir.appendingPathComponent(archiveBaseName))
-        let names = parents.count == 1 ? items.map { $0.url.lastPathComponent } : items.map(\.path)
-
-        activeTransfer = TransferProgressInfo(title: "Kompresowanie", currentFile: dstURL.lastPathComponent, completedCount: 0, totalCount: 1)
-        Task.detached(priority: .userInitiated) {
-            let status = Self.runProcess("/usr/bin/zip", arguments: ["-r", "-q", "-y", dstURL.path] + names, in: workingDir)
-            FSearchIndex.shared.refreshDirectoryInIndex(workingDir.path)
-            await MainActor.run {
-                let manager = FileOperationsManager.shared
-                manager.activeTransfer = nil
-                if status == 0 {
-                    manager.pushUndo(UndoableFileOperation(label: "Utworzenie archiwum \(dstURL.lastPathComponent)", kind: .created(url: dstURL)))
-                    manager.lastStatusMessage = "Utworzono archiwum \(dstURL.lastPathComponent)"
-                } else {
-                    manager.lastStatusMessage = "Kompresja nie powiodła się (kod \(status))"
+        let requestedURL = workingDir.appendingPathComponent(archiveBaseName)
+        // A filename such as "-m" is always an operand, never ZIP's move option.
+        let names = parents.count == 1 ? items.map { "./" + $0.url.lastPathComponent } : items.map(\.path)
+        let io = fileIO
+        activeTransfer = TransferProgressInfo(title: "Kompresowanie", currentFile: requestedURL.lastPathComponent, completedCount: 0, totalCount: 1)
+        Task.detached(priority: .userInitiated) { [self] in
+            var staging: URL?
+            var published: URL?
+            var undo: [FileHistoryAction] = []
+            var failure: String?
+            do {
+                let root = try SafeArchivePublication.stagingDirectory(in: workingDir)
+                staging = root
+                let stagedURL = root.appendingPathComponent("archive.zip")
+                let status = Self.runProcess("/usr/bin/zip", arguments: ["-r", "-q", "-y", stagedURL.path] + names,
+                                             in: workingDir, environment: Self.archiveProcessEnvironment())
+                guard status == 0 else { throw FileOperationFailure(message: "Kompresja nie powiodła się (kod \(status))") }
+                published = try Self.createUniqueItem(at: requestedURL) { candidate in
+                    try io.publishExclusive(stagedURL, candidate)
                 }
-                AppState.shared.reloadVisiblePanes()
+                if let published { undo = [.trash(published, io: io)] }
+                io.removeEmptyDirectory(root)
+            } catch {
+                failure = error.localizedDescription
+                if let staging {
+                    // Only the owned empty directory may be removed. Partial data
+                    // stays discoverable and never becomes a whole-output undo entry.
+                    io.removeEmptyDirectory(staging)
+                    if io.exists(staging) { failure! += "; dane operacji zachowano w \(staging.path)" }
+                }
+            }
+            self.enqueueDirectoryRefresh(workingDir.path)
+            let finalURL = published
+            let finalUndo = undo
+            let finalError = failure
+            await MainActor.run {
+                if let finalURL {
+                    self.pushUndo(UndoableFileOperation(label: "Utworzenie archiwum \(finalURL.lastPathComponent)", kind: .actions(finalUndo)))
+                    self.lastStatusMessage = "Utworzono archiwum \(finalURL.lastPathComponent)"
+                } else {
+                    self.lastStatusMessage = finalError ?? "Kompresja nie powiodła się"
+                }
+                self.activeTransfer = nil
+                self.reloadVisiblePanes()
             }
         }
     }
 
     public func extractArchive(_ item: FileItem) {
-        guard !isBusy else {
-            lastStatusMessage = "Poczekaj na zakończenie bieżącej operacji"
-            return
-        }
+        guard canStartMutation() else { return }
         let parentDir = item.url.deletingLastPathComponent()
         let ext = item.fileExtension.lowercased()
         let lowerName = item.name.lowercased()
-
         if ext == "dmg" {
-            // Disk images are mounted, not extracted.
-            Task.detached(priority: .userInitiated) {
-                let status = Self.runProcess("/usr/bin/hdiutil", arguments: ["attach", item.path], in: parentDir)
+            activeTransfer = TransferProgressInfo(title: "Montowanie", currentFile: item.name, completedCount: 0, totalCount: 1)
+            Task.detached(priority: .userInitiated) { [self] in
+                let status = Self.runProcess("/usr/bin/hdiutil", arguments: ["attach", item.path], in: parentDir,
+                                             environment: Self.archiveProcessEnvironment())
                 await MainActor.run {
-                    FileOperationsManager.shared.lastStatusMessage = status == 0
+                    self.activeTransfer = nil
+                    self.lastStatusMessage = status == 0
                         ? "Zamontowano obraz \(item.name)"
                         : "Nie udało się zamontować \(item.name) (kod \(status))"
                     AppState.shared.refreshMountedVolumes()
@@ -945,86 +1403,130 @@ public final class FileOperationsManager: ObservableObject {
             }
             return
         }
-
         var baseFolder = item.url.deletingPathExtension().lastPathComponent
-        if baseFolder.lowercased().hasSuffix(".tar") {
-            baseFolder = String(baseFolder.dropLast(4))
-        }
-        let targetDir = Self.uniqueURL(for: parentDir.appendingPathComponent(baseFolder, isDirectory: true))
+        if baseFolder.lowercased().hasSuffix(".tar") { baseFolder = String(baseFolder.dropLast(4)) }
+        let requestedURL = parentDir.appendingPathComponent(baseFolder, isDirectory: true)
         let isTarball = ext == "tar" || ext == "tgz" || lowerName.hasSuffix(".tar.gz") ||
                         lowerName.hasSuffix(".tar.bz2") || lowerName.hasSuffix(".tar.xz")
-
+        let io = fileIO
         activeTransfer = TransferProgressInfo(title: "Rozpakowywanie", currentFile: item.name, completedCount: 0, totalCount: 1)
-
-        Task.detached(priority: .userInitiated) {
-            let fm = FileManager.default
-            try? fm.createDirectory(at: targetDir, withIntermediateDirectories: true)
-
-            let status: Int32
-            if isTarball {
-                status = Self.runProcess("/usr/bin/tar", arguments: ["-xf", item.path, "-C", targetDir.path], in: parentDir)
-            } else if ext == "gz" || ext == "bz2" || ext == "xz" {
-                // Single compressed file (not a tarball): decompress with libarchive's "raw" mode.
-                let outName = item.url.deletingPathExtension().lastPathComponent
-                status = Self.runProcess("/bin/sh", arguments: ["-c", "/usr/bin/tar -xOf \"$0\" > \"$1\"", item.path, targetDir.appendingPathComponent(outName).path], in: parentDir)
-            } else {
-                // zip, 7z (if supported by ditto/libarchive), etc.
-                status = Self.runProcess("/usr/bin/ditto", arguments: ["-x", "-k", item.path, targetDir.path], in: parentDir)
-            }
-
-            if status != 0, let contents = try? fm.contentsOfDirectory(atPath: targetDir.path), contents.isEmpty {
-                try? fm.removeItem(at: targetDir)
-            }
-            FSearchIndex.shared.refreshDirectoryInIndex(parentDir.path)
-
-            await MainActor.run {
-                let manager = FileOperationsManager.shared
-                manager.activeTransfer = nil
-                if status == 0 {
-                    manager.pushUndo(UndoableFileOperation(label: "Rozpakowanie \(item.name)", kind: .created(url: targetDir)))
-                    manager.lastStatusMessage = "Rozpakowano do: \(targetDir.lastPathComponent)"
+        Task.detached(priority: .userInitiated) { [self] in
+            var staging: URL?
+            var published: URL?
+            var undo: [FileHistoryAction] = []
+            var failure: String?
+            do {
+                let root = try SafeArchivePublication.stagingDirectory(in: parentDir)
+                staging = root
+                let stagedURL = root.appendingPathComponent("contents", isDirectory: true)
+                try FileManager.default.createDirectory(at: stagedURL, withIntermediateDirectories: false,
+                                                        attributes: [.posixPermissions: 0o700])
+                let environment = Self.archiveProcessEnvironment()
+                let status: Int32
+                if isTarball {
+                    status = Self.runProcess("/usr/bin/tar", arguments: ["-xf", item.path, "-C", stagedURL.path], in: parentDir, environment: environment)
+                } else if ext == "gz" || ext == "bz2" || ext == "xz" {
+                    let outName = item.url.deletingPathExtension().lastPathComponent
+                    status = try Self.decompressSingleFile(from: item.url,
+                                                           to: stagedURL.appendingPathComponent(outName))
                 } else {
-                    manager.lastStatusMessage = "Nie udało się rozpakować \(item.name) (kod \(status))"
+                    status = Self.runProcess("/usr/bin/ditto", arguments: ["-x", "-k", item.path, stagedURL.path], in: parentDir, environment: environment)
                 }
-                AppState.shared.reloadVisiblePanes()
+                guard status == 0 else { throw FileOperationFailure(message: "Nie udało się rozpakować \(item.name) (kod \(status))") }
+                published = try Self.createUniqueItem(at: requestedURL) { candidate in
+                    try io.publishExclusive(stagedURL, candidate)
+                }
+                if let published { undo = [.trash(published, io: io)] }
+                io.removeEmptyDirectory(root)
+            } catch {
+                failure = error.localizedDescription
+                if let staging {
+                    io.removeEmptyDirectory(staging.appendingPathComponent("contents", isDirectory: true))
+                    io.removeEmptyDirectory(staging)
+                    if io.exists(staging) { failure! += "; dane operacji zachowano w \(staging.path)" }
+                }
+            }
+            self.enqueueDirectoryRefresh(parentDir.path)
+            let finalURL = published
+            let finalUndo = undo
+            let finalError = failure
+            await MainActor.run {
+                if let finalURL {
+                    self.pushUndo(UndoableFileOperation(label: "Rozpakowanie \(item.name)", kind: .actions(finalUndo)))
+                    self.lastStatusMessage = "Rozpakowano do: \(finalURL.lastPathComponent)"
+                } else {
+                    self.lastStatusMessage = finalError ?? "Rozpakowanie nie powiodło się"
+                }
+                self.activeTransfer = nil
+                self.reloadVisiblePanes()
             }
         }
+    }
+
+    /// Apple's gzip supports gzip, bzip2 and xz streams. Unlike tar, it does
+    /// not require an archive container around the decompressed bytes. Stream
+    /// directly to an exclusively created file inside our private staging tree;
+    /// never interpolate filenames into a shell or modify the compressed input.
+    nonisolated static func decompressSingleFile(from source: URL, to output: URL) throws -> Int32 {
+        let descriptor = output.path.withCString {
+            Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        }
+        guard descriptor >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+        process.arguments = ["-d", "-c", "--", source.path]
+        process.currentDirectoryURL = source.deletingLastPathComponent()
+        process.environment = archiveProcessEnvironment()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = handle
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        try handle.close()
+        return process.terminationStatus
     }
 
     // MARK: - POSIX Permissions (chmod) & Checksums (SHA-256 / MD5)
 
+    /// The inspector changes only the requested ordinary bits. Read fresh mode
+    /// on the worker, never replay special bits from an old UI snapshot.
     @discardableResult
-    public func setPosixPermissions(_ mode: UInt16, for item: FileItem) -> Bool {
-        do {
-            try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: mode)], ofItemAtPath: item.path)
-            lastStatusMessage = String(format: "Zmieniono uprawnienia %@ na %03o", item.name, mode & 0o777)
-            return true
-        } catch {
-            lastStatusMessage = "Błąd chmod: \(error.localizedDescription)"
-            return false
-        }
-    }
-
-    /// Streams the file in 1 MB chunks so even multi-GB files can be hashed without loading them into RAM.
-    nonisolated public static func computeHashes(for url: URL) -> (sha256: String, md5: String)? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        var sha = SHA256()
-        var md5 = Insecure.MD5()
-        while true {
-            let chunk: Data
+    func updatePosixPermissions(_ change: PosixPermissionChange, for item: FileItem,
+                                expectedIdentity: FileEntryIdentity,
+                                completion: @escaping @MainActor (PosixPermissionSnapshot?, String?) -> Void) -> Bool {
+        guard beginMutation(title: "Zmiana uprawnień") else { return false }
+        let io = fileIO
+        Task.detached(priority: .userInitiated) { [self] in
+            var updated: PosixPermissionSnapshot?
+            var failure: String?
             do {
-                guard let data = try handle.read(upToCount: 1 << 20), !data.isEmpty else { break }
-                chunk = data
-            } catch {
-                return nil
+                let current = try PosixPermissionSnapshot.read(item.url, io: io)
+                guard current.identity == expectedIdentity else {
+                    throw FileOperationFailure(message: "Nie zmieniono uprawnień: pod ścieżką znajduje się inny obiekt.")
+                }
+                let requested = try change.applying(to: current.mode)
+                try io.writePermissions(item.url, requested)
+                let actual = try PosixPermissionSnapshot.read(item.url, io: io)
+                guard actual.identity == expectedIdentity else {
+                    throw FileOperationFailure(message: "Element zmienił się podczas zapisu uprawnień; odśwież inspektor.")
+                }
+                updated = actual
+            } catch { failure = error.localizedDescription }
+            let finalSnapshot = updated
+            let finalFailure = failure
+            await MainActor.run {
+                self.activeTransfer = nil
+                if let finalSnapshot {
+                    self.lastStatusMessage = "Zmieniono uprawnienia \(item.name): \(PosixPermissionChange.format(finalSnapshot.mode))"
+                } else { self.lastStatusMessage = finalFailure ?? "Nie zmieniono uprawnień." }
+                completion(finalSnapshot, finalFailure)
             }
-            sha.update(data: chunk)
-            md5.update(data: chunk)
         }
-        let shaHex = sha.finalize().map { String(format: "%02x", $0) }.joined()
-        let md5Hex = md5.finalize().map { String(format: "%02x", $0) }.joined()
-        return (shaHex, md5Hex)
+        return true
     }
 
     // MARK: - Developer & Power User Actions
@@ -1088,26 +1590,50 @@ public final class FileOperationsManager: ObservableObject {
     // MARK: - Git Status Detection
 
     nonisolated public static func fetchGitStatusMap(for directoryPath: String) -> [String: GitFileStatus] {
-        // 1. Cheap check whether we are inside a work tree at all.
+        guard let snapshot = fetchGitStatusSnapshot(for: directoryPath) else { return [:] }
+        FSearchIndex.shared.recordGitStatuses(snapshot.statuses, repositoryRoot: snapshot.repositoryRoot)
+        return snapshot.statuses
+    }
+
+    /// A successful empty snapshot clears stale statuses; nil means status was not
+    /// available and must not be confused with a clean repository.
+    nonisolated public static func fetchGitStatusSnapshot(for directoryPath: String) -> GitStatusSnapshot? {
+        // Browsing is read-only, not permission to execute a worktree's fsmonitor
+        // helper, hooks, or recursively inspect untrusted submodule configuration.
+        let safeOptions = ["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
         guard let rootData = runProcessCapturingOutput(
             "/usr/bin/git",
-            arguments: ["rev-parse", "--show-toplevel"],
+            arguments: safeOptions + ["rev-parse", "--show-toplevel"],
             in: URL(fileURLWithPath: directoryPath)
-        ) else { return [:] }
-        guard let gitRoot = String(data: rootData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !gitRoot.isEmpty else {
-            return [:]
-        }
+        ), var gitRoot = String(data: rootData, encoding: .utf8) else { return nil }
+        // Remove exactly Git's delimiter, not whitespace that belongs to a path.
+        if gitRoot.hasSuffix("\n") { gitRoot.removeLast() }
+        guard !gitRoot.isEmpty else { return nil }
+        // Git emits physical /private/var paths on macOS; Foundation's file
+        // URLs use the normalized /var namespace. Normalize once off-main so
+        // status keys match the directory crawler and successful-empty clears.
+        gitRoot = URL(fileURLWithPath: gitRoot).standardizedFileURL.resolvingSymlinksInPath().path
 
-        // 2. NUL-separated porcelain output: no quoting/escaping of non-ASCII (e.g. Polish) file names.
+        // Status may run clean/process filters from .gitattributes when comparing
+        // a tracked same-size edit. Enumerate keys without running Git plumbing,
+        // then override every configured driver. Never interpret config as shell.
+        guard let configurationKeys = runProcessCapturingOutput(
+            "/usr/bin/git",
+            arguments: safeOptions + ["config", "--includes", "--null", "--name-only", "--list"],
+            in: URL(fileURLWithPath: directoryPath)
+        ), let disabledFilters = disabledGitFilterOptions(configurationKeys: configurationKeys) else { return nil }
+
         guard let data = runProcessCapturingOutput(
             "/usr/bin/git",
-            arguments: ["-c", "core.quotepath=false", "status", "--porcelain=v1", "-z", "-uall"],
+            arguments: safeOptions + disabledFilters + ["-c", "core.quotepath=false", "status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=all"],
             in: URL(fileURLWithPath: directoryPath)
-        ), !data.isEmpty else {
-            return [:]
-        }
+        ) else { return nil }
 
+        return GitStatusSnapshot(usesRawContentComparison: !disabledFilters.isEmpty, repositoryRoot: gitRoot,
+                                 statuses: parseGitStatusRecords(data, repositoryRoot: gitRoot))
+    }
+
+    nonisolated static func parseGitStatusRecords(_ data: Data, repositoryRoot: String) -> [String: GitFileStatus] {
         var statusMap: [String: GitFileStatus] = [:]
         let records = data.split(separator: 0, omittingEmptySubsequences: true)
         var i = 0
@@ -1119,7 +1645,8 @@ public final class FileOperationsManager: ObservableObject {
             let y = record[1]
             let relPath = String(decoding: record[3...], as: UTF8.self)
             // Renames/copies are followed by an extra record holding the original path.
-            if x == UInt8(ascii: "R") || x == UInt8(ascii: "C") {
+            if x == UInt8(ascii: "R") || x == UInt8(ascii: "C") ||
+               y == UInt8(ascii: "R") || y == UInt8(ascii: "C") {
                 i += 1
             }
 
@@ -1135,10 +1662,30 @@ public final class FileOperationsManager: ObservableObject {
             } else {
                 status = .modified
             }
-            statusMap["\(gitRoot)/\(relPath)"] = status
+            statusMap[URL(fileURLWithPath: repositoryRoot).appendingPathComponent(relPath).path] = status
         }
-        FSearchIndex.shared.recordGitStatuses(statusMap)
         return statusMap
+    }
+
+    /// Git's NUL-delimited name-only output retains subsection spelling. A name
+    /// containing "=" cannot safely be passed through `-c key=value`; fail closed
+    /// rather than silently leave a potentially executable driver enabled.
+    nonisolated static func disabledGitFilterOptions(configurationKeys: Data) -> [String]? {
+        var drivers = Set<String>()
+        for record in configurationKeys.split(separator: 0, omittingEmptySubsequences: true) {
+            guard let key = String(data: Data(record), encoding: .utf8) else { return nil }
+            let lower = key.lowercased()
+            guard lower.hasPrefix("filter."),
+                  let suffix = [".clean", ".process", ".required"].first(where: { lower.hasSuffix($0) }) else { continue }
+            let driver = String(key.dropFirst("filter.".count).dropLast(suffix.count))
+            guard !driver.isEmpty, !driver.contains("="),
+                  !driver.contains("\n"), !driver.contains("\r") else { return nil }
+            drivers.insert(driver)
+        }
+        return drivers.sorted().flatMap { driver in
+            ["-c", "filter.\(driver).clean=", "-c", "filter.\(driver).process=",
+             "-c", "filter.\(driver).required=false"]
+        }
     }
 
     // MARK: - Helpers
@@ -1146,14 +1693,10 @@ public final class FileOperationsManager: ObservableObject {
     nonisolated private static func referencesRemovedItems(_ kind: UndoableFileOperation.Kind, removed: [URL]) -> Bool {
         let urls: [URL]
         switch kind {
-        case .moved(let pairs): urls = pairs.flatMap { [$0.from, $0.to] }
-        case .copied(let created): urls = created
-        case .created(let url): urls = [url]
-        case .trashed(let pairs): urls = pairs.flatMap { [$0.original, $0.trashed] }
         case .actions(let actions):
             urls = actions.flatMap { action -> [URL] in
-                switch action {
-                case .move(let from, let to): return [from, to]
+                switch action.operation {
+                case .move(let from, let to), .restore(let from, let to): return [from, to]
                 case .trash(let url): return [url]
                 }
             }
@@ -1172,8 +1715,7 @@ public final class FileOperationsManager: ObservableObject {
     }
 
     nonisolated public static func uniqueURL(for url: URL, suffixWord: String = "") -> URL {
-        let fm = FileManager.default
-        if suffixWord.isEmpty && !fm.fileExists(atPath: url.path) {
+        if suffixWord.isEmpty && !FileOperationIO.live.exists(url) {
             return url
         }
         let dir = url.deletingLastPathComponent()
@@ -1185,11 +1727,27 @@ public final class FileOperationsManager: ObservableObject {
             let suffix = counter == 1 && !suffixWord.isEmpty ? suffixWord : "\(suffixWord) \(counter)"
             let candidateName = ext.isEmpty ? "\(baseName)\(suffix)" : "\(baseName)\(suffix).\(ext)"
             let candidateURL = dir.appendingPathComponent(candidateName)
-            if !fm.fileExists(atPath: candidateURL.path) {
+            if !FileOperationIO.live.exists(candidateURL) {
                 return candidateURL
             }
             counter += 1
         }
+    }
+
+    /// The creator must fail rather than overwrite an occupied entry. A racing
+    /// creator is handled by picking a fresh name, with a bound against livelock.
+    nonisolated static func createUniqueItem(at requested: URL, create: (URL) throws -> Void) throws -> URL {
+        for _ in 0..<100 {
+            let candidate = uniqueURL(for: requested)
+            do {
+                try create(candidate)
+                return candidate
+            } catch {
+                let nsError = error as NSError
+                guard nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileWriteFileExistsError else { throw error }
+            }
+        }
+        throw FileOperationFailure(message: "Nie można wybrać wolnej nazwy pliku; spróbuj ponownie.")
     }
 
     /// Returns a trimmed, safe single path component or `nil` if the name is invalid.
@@ -1210,11 +1768,13 @@ public final class FileOperationsManager: ObservableObject {
     }
 
     @discardableResult
-    nonisolated static func runProcess(_ executable: String, arguments: [String], in directory: URL) -> Int32 {
+    nonisolated static func runProcess(_ executable: String, arguments: [String], in directory: URL,
+                                       environment: [String: String]? = nil) -> Int32 {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = arguments
         proc.currentDirectoryURL = directory
+        if let environment { proc.environment = environment }
         proc.standardInput = FileHandle.nullDevice
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
@@ -1227,8 +1787,12 @@ public final class FileOperationsManager: ObservableObject {
         return proc.terminationStatus
     }
 
-    /// Runs a process and returns its stdout if it exited with status 0.
-    nonisolated static func runProcessCapturingOutput(_ executable: String, arguments: [String], in directory: URL) -> Data? {
+    /// Bounded read-only inspection. Nonblocking reads keep both output volume and
+    /// elapsed time bounded even if a corrupt repository hangs Git or fills a pipe.
+    nonisolated static func runProcessCapturingOutput(_ executable: String, arguments: [String], in directory: URL,
+                                                       maxOutputBytes: Int = 8 * 1024 * 1024,
+                                                       timeout: TimeInterval = 10) -> Data? {
+        guard maxOutputBytes > 0, timeout.isFinite, timeout > 0 else { return nil }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = arguments
@@ -1242,8 +1806,47 @@ public final class FileOperationsManager: ObservableObject {
         } catch {
             return nil
         }
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-        proc.waitUntilExit()
-        return proc.terminationStatus == 0 ? data : nil
+        try? outPipe.fileHandleForWriting.close()
+        let reader = outPipe.fileHandleForReading
+        defer {
+            try? reader.close()
+            if proc.isRunning { _ = Darwin.kill(proc.processIdentifier, SIGKILL) }
+            proc.waitUntilExit()
+        }
+        let descriptor = reader.fileDescriptor
+        let existingFlags = fcntl(descriptor, F_GETFL)
+        guard existingFlags >= 0, fcntl(descriptor, F_SETFL, existingFlags | O_NONBLOCK) == 0 else { return nil }
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        var reachedEOF = false
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if !reachedEOF {
+                let count = buffer.withUnsafeMutableBytes { bytes in
+                    Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+                }
+                if count > 0 {
+                    guard count <= maxOutputBytes, data.count <= maxOutputBytes - count else { return nil }
+                    data.append(contentsOf: buffer.prefix(count))
+                    continue
+                }
+                if count == 0 {
+                    reachedEOF = true
+                } else if errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
+                    return nil
+                }
+            }
+            if reachedEOF && !proc.isRunning {
+                proc.waitUntilExit()
+                return proc.terminationStatus == 0 ? data : nil
+            }
+            if reachedEOF {
+                usleep(10_000)
+            } else {
+                var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN | POLLHUP), revents: 0)
+                _ = poll(&pollDescriptor, 1, 20)
+            }
+        }
+        return nil
     }
 }

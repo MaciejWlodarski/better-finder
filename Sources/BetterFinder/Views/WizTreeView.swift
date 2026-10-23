@@ -43,14 +43,51 @@ public struct DuplicateFileGroup: Identifiable, Sendable {
     }
 }
 
+/// Captured input identity, checked against the currently visible owner rather
+/// than an obsolete SwiftUI value's ObservedObject reference.
+struct AnalysisPublicationContext: Equatable, Sendable {
+    let paneID: UUID
+    let side: PaneSide
+    let rootPath: String
+    let revision: UInt64
+    let hidden: Bool
+    let mode: String
+
+    @MainActor init(pane: PaneTabState, side: PaneSide, mode: WizTreeSubMode) {
+        paneID = pane.id
+        self.side = side
+        rootPath = pane.currentURL.path
+        revision = pane.directoryRevision
+        hidden = pane.showHiddenFiles
+        self.mode = mode.rawValue
+    }
+
+    @MainActor func matches(appState: AppState, mode: WizTreeSubMode) -> Bool {
+        let live: PaneTabState?
+        switch side {
+        case .left: live = appState.tabs.first { $0.id == appState.activeTabId } ?? appState.tabs.first
+        case .right: live = appState.isDualPane ? appState.rightPane : nil
+        }
+        guard let live, live.viewMode == .wiztree, live.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return self == AnalysisPublicationContext(pane: live, side: side, mode: mode)
+    }
+}
+
 // A generation is cancelled on every root/mode change, refresh and disappearance.
 // The same predicate protects all publication paths, including empty results.
 final class AnalysisRequestToken: @unchecked Sendable {
     let id = UUID()
     let rootPath: String
+    let context: AnalysisPublicationContext?
     private let lock = NSLock()
     private var cancelled = false
-    init(rootPath: String) { self.rootPath = rootPath }
+    init(rootPath: String, context: AnalysisPublicationContext? = nil) {
+        self.rootPath = rootPath
+        self.context = context
+    }
+    @MainActor func canPublishAnalysis(active: AnalysisRequestToken?, appState: AppState, mode: WizTreeSubMode) -> Bool {
+        active === self && !isCancelled && context?.matches(appState: appState, mode: mode) == true
+    }
     func cancel() { lock.lock(); cancelled = true; lock.unlock() }
     var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
     func canPublish(active: AnalysisRequestToken?, rootPath: String) -> Bool {
@@ -61,6 +98,7 @@ final class AnalysisRequestToken: @unchecked Sendable {
 struct DuplicateFileSnapshot: Equatable, Sendable {
     let device: Int64
     let inode: UInt64
+    let generation: UInt32
     let size: Int64
     let modifiedSeconds: Int64
     let modifiedNanoseconds: Int64
@@ -71,6 +109,7 @@ struct DuplicateFileSnapshot: Equatable, Sendable {
         guard (info.st_mode & S_IFMT) == S_IFREG else { throw DuplicateSafetyError.changed }
         device = Int64(info.st_dev)
         inode = UInt64(info.st_ino)
+        generation = UInt32(info.st_gen)
         size = Int64(info.st_size)
         modifiedSeconds = Int64(info.st_mtimespec.tv_sec)
         modifiedNanoseconds = Int64(info.st_mtimespec.tv_nsec)
@@ -90,7 +129,14 @@ enum DuplicateSafetyError: LocalizedError {
     }
 }
 
-/// Full streaming SHA-256, with no size ceiling and no symlink/special-file reads.
+struct DuplicateHashHooks {
+    var beforeSnapshot: (() throws -> Void)? = nil
+    var beforeOpen: (() throws -> Void)? = nil
+    var afterChunk: ((Int) throws -> Void)? = nil
+    var readChunk: ((Int32, UnsafeMutableRawPointer, Int) -> Int)? = nil
+}
+
+/// Full streaming SHA-256 bounded to the captured size; no symlink/special-file reads.
 /// Snapshot checks detect replacement and writes during or after hashing. A filesystem
 /// can still change between the final check and a path-based Trash operation; this is
 /// not a transactional filesystem lock and does not claim to prevent hostile races.
@@ -101,8 +147,14 @@ enum DuplicateFileSafety {
         return try DuplicateFileSnapshot(info)
     }
 
-    static func hash(at url: URL, isCancelled: () -> Bool = { false }) throws -> (hash: String, snapshot: DuplicateFileSnapshot) {
+    static func hash(at url: URL, isCancelled: () -> Bool = { false },
+                     hooks: DuplicateHashHooks = DuplicateHashHooks()) throws -> (hash: String, snapshot: DuplicateFileSnapshot) {
+        if isCancelled() { throw DuplicateSafetyError.cancelled }
+        try hooks.beforeSnapshot?()
         let before = try snapshot(at: url)
+        guard before.size >= 0 else { throw DuplicateSafetyError.changed }
+        try hooks.beforeOpen?()
+        if isCancelled() { throw DuplicateSafetyError.cancelled }
         let fd = Darwin.open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
         guard fd >= 0 else { throw DuplicateSafetyError.unreadable }
         defer { Darwin.close(fd) }
@@ -110,18 +162,28 @@ enum DuplicateFileSafety {
         guard fstat(fd, &info) == 0, try DuplicateFileSnapshot(info) == before else { throw DuplicateSafetyError.changed }
         var digest = SHA256()
         var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
-        while true {
+        var remaining = before.size
+        var chunks = 0
+        while remaining > 0 {
             if isCancelled() { throw DuplicateSafetyError.cancelled }
-            let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress!, $0.count) }
+            let amount = Int(min(remaining, Int64(buffer.count)))
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                hooks.readChunk?(fd, bytes.baseAddress!, amount) ?? Darwin.read(fd, bytes.baseAddress!, amount)
+            }
             if count < 0 {
                 if errno == EINTR { continue }
                 throw DuplicateSafetyError.unreadable
             }
-            if count == 0 { break }
+            guard count > 0 else { throw DuplicateSafetyError.changed }
+            remaining -= Int64(count)
+            chunks += 1
+            try hooks.afterChunk?(chunks)
             digest.update(data: Data(buffer.prefix(count)))
         }
+        if isCancelled() { throw DuplicateSafetyError.cancelled }
         guard fstat(fd, &info) == 0, try DuplicateFileSnapshot(info) == before,
               try snapshot(at: url) == before else { throw DuplicateSafetyError.changed }
+        if isCancelled() { throw DuplicateSafetyError.cancelled }
         return (digest.finalize().map { String(format: "%02x", $0) }.joined(), before)
     }
 
@@ -442,7 +504,15 @@ public struct WizTreeAnalyzerView: View {
         self.selectionForegroundColor = selectionForegroundColor
     }
 
+    private var livePaneID: UUID? {
+        switch paneSide {
+        case .left: return (appState.tabs.first { $0.id == appState.activeTabId } ?? appState.tabs.first)?.id
+        case .right: return appState.isDualPane ? appState.rightPane.id : nil
+        }
+    }
+
     private func performPaneAction(_ action: () -> Void) {
+        guard livePaneID == pane.id else { return }
         FinderPaneActionRouting.perform(appState: appState, paneSide: paneSide, action: action)
     }
 
@@ -537,6 +607,12 @@ public struct WizTreeAnalyzerView: View {
         .onChange(of: subMode) { _, _ in
             performPaneAction { runActiveScan(for: pane.currentURL) }
         }
+        .onChange(of: livePaneID) { _, _ in
+            scanToken?.cancel()
+            scanTask?.cancel()
+            if livePaneID == pane.id { runActiveScan(for: pane.currentURL) }
+        }
+        .onChange(of: pane.id) { _, _ in runActiveScan(for: pane.currentURL) }
         .onChange(of: pane.currentURL.path) { _, _ in runActiveScan(for: pane.currentURL) }
         .onChange(of: pane.showHiddenFiles) { _, _ in runActiveScan(for: pane.currentURL) }
         .onChange(of: pane.directoryRevision) { _, _ in runActiveScan(for: pane.currentURL) }
@@ -1217,8 +1293,11 @@ public struct WizTreeAnalyzerView: View {
     private func runActiveScan(for rootURL: URL) {
         scanToken?.cancel()
         scanTask?.cancel()
-        let token = AnalysisRequestToken(rootPath: rootURL.path)
+        let context = AnalysisPublicationContext(pane: pane, side: paneSide, mode: subMode)
+        guard context.matches(appState: appState, mode: subMode), rootURL.path == context.rootPath else { return }
+        let token = AnalysisRequestToken(rootPath: rootURL.path, context: context)
         scanToken = token
+        isValidatingDuplicates = false
         isScanning = true
         scanIsComplete = false
         scanDiagnostic = nil
@@ -1281,7 +1360,7 @@ public struct WizTreeAnalyzerView: View {
             if !complete && messages.isEmpty { messages.append("Skan niepełny; suma jest dolnym oszacowaniem.") }
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
             await MainActor.run { [branches, groups, categoryMap, messages] in
-                guard token.canPublish(active: self.scanToken, rootPath: self.pane.currentURL.path) else { return }
+                guard token.canPublishAnalysis(active: self.scanToken, appState: self.appState, mode: self.subMode) else { return }
                 self.topBranches = branches.sorted { $0.size > $1.size }
                 self.largestFiles = Array(files.sorted { $0.size > $1.size }.prefix(150))
                 self.duplicateGroups = groups
@@ -1301,7 +1380,7 @@ public struct WizTreeAnalyzerView: View {
     }
 
     private func publishTreemapProjection(_ blocks: [TreemapPlacedBlock], token: AnalysisRequestToken?) {
-        guard let token, token.canPublish(active: scanToken, rootPath: pane.currentURL.path),
+        guard let token, token.canPublishAnalysis(active: scanToken, appState: appState, mode: subMode),
               !isScanning, subMode == .treemap else { return }
         // Ranked rows are visible in the scrollable list. Only rendered tiles, not
         // children hidden by geometry/max-block limits, join the keyboard projection.
@@ -1312,14 +1391,14 @@ public struct WizTreeAnalyzerView: View {
 
     private func trashAnalyzedItem(_ item: FileItem) {
         let root = pane.currentURL.path
-        guard let token = scanToken, token.canPublish(active: scanToken, rootPath: root), !isScanning,
+        guard let token = scanToken, token.canPublishAnalysis(active: scanToken, appState: appState, mode: subMode), !isScanning,
               item.path.hasPrefix(root == "/" ? "/" : root + "/") else { return }
         FileOperationsManager.shared.moveToTrash([item])
         runActiveScan(for: pane.currentURL)
     }
 
     private func trashDuplicates(_ groups: [DuplicateFileGroup], onlyPath: String? = nil) {
-        guard let token = scanToken, token.canPublish(active: scanToken, rootPath: pane.currentURL.path),
+        guard let token = scanToken, token.canPublishAnalysis(active: scanToken, appState: appState, mode: subMode),
               !isScanning, !isValidatingDuplicates else { return }
         isValidatingDuplicates = true
         duplicateActionError = nil
@@ -1328,8 +1407,8 @@ public struct WizTreeAnalyzerView: View {
                 // Validate all content before starting; final per-file checks run in the mutation path.
                 for group in groups { try DuplicateFileSafety.validate(group, isCancelled: { token.isCancelled }) }
                 await MainActor.run {
+                    guard token.canPublishAnalysis(active: self.scanToken, appState: self.appState, mode: self.subMode) else { return }
                     defer { self.isValidatingDuplicates = false }
-                    guard token.canPublish(active: self.scanToken, rootPath: self.pane.currentURL.path) else { return }
                     for group in groups {
                         let candidates = group.files.dropFirst().filter { onlyPath == nil || $0.path == onlyPath }
                         FileOperationsManager.shared.moveToTrash(Array(candidates), validating: { item in
@@ -1341,8 +1420,8 @@ public struct WizTreeAnalyzerView: View {
                 }
             } catch {
                 await MainActor.run {
+                    guard token.canPublishAnalysis(active: self.scanToken, appState: self.appState, mode: self.subMode) else { return }
                     self.isValidatingDuplicates = false
-                    guard token.canPublish(active: self.scanToken, rootPath: self.pane.currentURL.path) else { return }
                     self.duplicateActionError = error.localizedDescription
                     self.runActiveScan(for: self.pane.currentURL)
                 }

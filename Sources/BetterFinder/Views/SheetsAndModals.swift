@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Darwin
 
 struct QuickSearchRequest: Sendable {
     let query: String
@@ -534,13 +535,50 @@ public struct FolderCompareEntry: Identifiable, Sendable {
 }
 
 /// Deliberately shallow comparison: common directories are UNKNOWN, never identical.
-/// This UI copies selected top-level files; it is not a recursive mirror/synchronizer.
+/// This UI copies selected top-level items; it is not a recursive mirror/synchronizer.
 enum FolderComparison {
-    static func compare(left: URL, right: URL, includeHidden: Bool, token: AnalysisRequestToken) -> (entries: [FolderCompareEntry], diagnostic: String?) {
-        let leftRead = BulkCrawler.readDirectoryResult(at: left.path, includeHidden: includeHidden, isCancelled: { token.isCancelled })
-        let rightRead = BulkCrawler.readDirectoryResult(at: right.path, includeHidden: includeHidden, isCancelled: { token.isCancelled })
+    // Combined retained listing budget, not a per-side allowance. Maps and rows are
+    // bounded by this same input count. Exactly-at-budget listings remain complete.
+    static let retainedEntryLimit = 60_000
+
+    private struct LinkSnapshot: Equatable {
+        let device: Int64
+        let inode: UInt64
+        let size: Int64
+        let modifiedSeconds: Int64
+        let modifiedNanoseconds: Int64
+        let changedSeconds: Int64
+        let changedNanoseconds: Int64
+
+        init(at url: URL) throws {
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else { throw DuplicateSafetyError.unreadable }
+            guard (info.st_mode & S_IFMT) == S_IFLNK else { throw DuplicateSafetyError.changed }
+            device = Int64(info.st_dev)
+            inode = UInt64(info.st_ino)
+            size = Int64(info.st_size)
+            modifiedSeconds = Int64(info.st_mtimespec.tv_sec)
+            modifiedNanoseconds = Int64(info.st_mtimespec.tv_nsec)
+            changedSeconds = Int64(info.st_ctimespec.tv_sec)
+            changedNanoseconds = Int64(info.st_ctimespec.tv_nsec)
+        }
+    }
+
+    static func compare(
+        left: URL, right: URL, includeHidden: Bool, token: AnalysisRequestToken,
+        maxRetainedEntries: Int = retainedEntryLimit,
+        betweenSides: (URL, URL) throws -> Void = { _, _ in }
+    ) -> (entries: [FolderCompareEntry], diagnostic: String?) {
+        let budget = max(0, maxRetainedEntries)
+        let leftRead = BulkCrawler.readDirectoryResult(at: left.path, includeHidden: includeHidden,
+            maxEntries: budget, isCancelled: { token.isCancelled })
+        guard leftRead.isComplete else {
+            return ([], "Porównanie niepełne: błąd odczytu lub limit \(budget) elementów. Kopiowanie wyłączone.")
+        }
+        let rightRead = BulkCrawler.readDirectoryResult(at: right.path, includeHidden: includeHidden,
+            maxEntries: budget - leftRead.entries.count, isCancelled: { token.isCancelled })
         guard leftRead.isComplete && rightRead.isComplete else {
-            return ([], "Nie można w pełni odczytać obu katalogów. Kopiowanie wyłączone.")
+            return ([], "Porównanie niepełne: błąd odczytu lub limit \(budget) elementów. Kopiowanie wyłączone.")
         }
         let leftMap = Dictionary(uniqueKeysWithValues: leftRead.entries.map { ($0.name, $0.toFileItem(loadTags: false)) })
         let rightMap = Dictionary(uniqueKeysWithValues: rightRead.entries.map { ($0.name, $0.toFileItem(loadTags: false)) })
@@ -557,12 +595,25 @@ enum FolderComparison {
                 else {
                     do {
                         if l.isSymlink {
+                            let leftSnapshot = try LinkSnapshot(at: l.url)
+                            let rightSnapshot = try LinkSnapshot(at: r.url)
                             let leftTarget = try FileManager.default.destinationOfSymbolicLink(atPath: l.path)
+                            try betweenSides(l.url, r.url)
+                            if token.isCancelled { throw DuplicateSafetyError.cancelled }
                             let rightTarget = try FileManager.default.destinationOfSymbolicLink(atPath: r.path)
-                            status = leftTarget == rightTarget && l.modificationDate == r.modificationDate ? .identical : .modified
+                            guard try LinkSnapshot(at: l.url) == leftSnapshot,
+                                  try LinkSnapshot(at: r.url) == rightSnapshot else { throw DuplicateSafetyError.changed }
+                            status = leftTarget == rightTarget
+                                && leftSnapshot.modifiedSeconds == rightSnapshot.modifiedSeconds
+                                && leftSnapshot.modifiedNanoseconds == rightSnapshot.modifiedNanoseconds ? .identical : .modified
                         } else {
                             let lh = try DuplicateFileSafety.hash(at: l.url, isCancelled: { token.isCancelled })
+                            try betweenSides(l.url, r.url)
                             let rh = try DuplicateFileSafety.hash(at: r.url, isCancelled: { token.isCancelled })
+                            // Recheck the pair after BOTH reads, closing the left-side
+                            // stale-hash window. This is not an atomic filesystem snapshot.
+                            guard try DuplicateFileSafety.snapshot(at: l.url) == lh.snapshot,
+                                  try DuplicateFileSafety.snapshot(at: r.url) == rh.snapshot else { throw DuplicateSafetyError.changed }
                             status = lh.hash == rh.hash && lh.snapshot.size == rh.snapshot.size
                                 && lh.snapshot.modifiedSeconds == rh.snapshot.modifiedSeconds
                                 && lh.snapshot.modifiedNanoseconds == rh.snapshot.modifiedNanoseconds ? .identical : .modified

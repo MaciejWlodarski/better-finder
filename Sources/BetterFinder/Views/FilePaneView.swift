@@ -152,6 +152,7 @@ public struct FilePaneView: View {
                                 selectionBackgroundColor: selectionBackgroundColor,
                                 selectionForegroundColor: selectionForegroundColor
                             )
+                            .id(pane.id)
                         } else { listBrowserView }
                     }
 

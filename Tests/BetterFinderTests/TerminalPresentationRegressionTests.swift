@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 struct TerminalPresentationRegressionTests {
     private func expect(_ value: @autoclosure () -> Bool, _ message: String) throws {
@@ -104,6 +105,17 @@ struct TerminalPresentationRegressionTests {
         return "\(label)=\(String(reflecting: prefix))\(bytes.count > 2_048 ? " [diagnostic truncated]" : ""); utf8=[\(hex)\(bytes.count > 256 ? " …" : "")]"
     }
 
+    /// pwd -P uses the physical POSIX namespace. On macOS Foundation may
+    /// retain /var where realpath/pwd use /private/var. Do not normalize shell
+    /// output or strip arbitrary prefixes: require the exact physical path + LF.
+    private func physicalDirectoryOutput(_ directory: URL) throws -> String {
+        guard let physical = directory.path.withCString({ Darwin.realpath($0, nil) }) else {
+            throw RegressionFailure(description: "Fixture realpath failed: errno=\(errno)")
+        }
+        defer { free(physical) }
+        return String(cString: physical) + "\n"
+    }
+
     func testNativeZshFixtures() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("bf-terminal-presentation-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -128,15 +140,24 @@ struct TerminalPresentationRegressionTests {
             DispatchQueue.global().asyncAfter(deadline: .now() + 5) { session.cancel() }
             let result = try session.run(command: command + " && /bin/pwd -P", directory: root)
             try expect(!result.wasCancelled && result.status == 0, "zsh fixture failed")
+            let expectedOutput = try physicalDirectoryOutput(target)
+            // Same basename, different existing directory: a name-only or overly
+            // broad namespace comparison must not accept the wrong destination.
+            let sibling = root.appendingPathComponent("wrong-parent", isDirectory: true)
+                .appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+            let siblingOutput = try physicalDirectoryOutput(sibling)
+            try expect(expectedOutput != siblingOutput, "Physical oracle must distinguish same-name sibling directories")
             let evidence = [
                 "case=\(caseIndex)", fixtureDiagnostic("command", command),
                 fixtureDiagnostic("target", target.path),
                 fixtureDiagnostic("resolvedTarget", target.resolvingSymlinksInPath().path),
+                fixtureDiagnostic("expectedPhysicalOutput", expectedOutput),
                 fixtureDiagnostic("rawOutput", result.output),
                 "status=\(result.status) cancelled=\(result.wasCancelled) truncated=\(result.wasTruncated)"
             ].joined(separator: "; ")
-            try expect(result.output.trimmingCharacters(in: .newlines) == target.resolvingSymlinksInPath().path,
-                       "zsh and classifier disagree; " + evidence)
+            try expect(result.output == expectedOutput, "zsh and classifier disagree; " + evidence)
+            try expect(result.output != siblingOutput, "Physical oracle accepted a same-name sibling; " + evidence)
         }
         for command in ["cd 'Folder With Spaces' && printf compound", "cd 'Folder With Spaces'; printf compound", "cd 'Folder With Spaces'\nprintf compound"] {
             try expect(TerminalDirectoryCommand.target(for: command, directory: root) == nil, "Compound must reach zsh")
@@ -152,7 +173,11 @@ struct TerminalPresentationRegressionTests {
         let fresh = TerminalCommandSession()
         DispatchQueue.global().asyncAfter(deadline: .now() + 5) { fresh.cancel() }
         let cwd = try fresh.run(command: "/bin/pwd -P", directory: root)
-        try expect(cwd.output.trimmingCharacters(in: .newlines) == root.resolvingSymlinksInPath().path, "Compound cwd must not leak between runs")
+        let expectedRootOutput = try physicalDirectoryOutput(root)
+        try expect(cwd.status == 0 && !cwd.wasCancelled, "Fresh-run pwd failed")
+        try expect(cwd.output == expectedRootOutput,
+                   "Compound cwd must not leak between runs; " + fixtureDiagnostic("expectedPhysicalOutput", expectedRootOutput)
+                   + "; " + fixtureDiagnostic("rawOutput", cwd.output))
     }
 
     func runAll() throws {

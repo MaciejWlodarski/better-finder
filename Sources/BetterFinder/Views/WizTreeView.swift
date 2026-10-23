@@ -480,6 +480,7 @@ public struct WizTreeAnalyzerView: View {
     private let selectionBackgroundColor: Color
     private let selectionForegroundColor: Color
     @ObservedObject private var iconCache = FileIconCache.shared
+    @ObservedObject private var fileOps = FileOperationsManager.shared
 
     @ViewState private var subMode: WizTreeSubMode = .treemap
     @ViewState private var isScanning: Bool = false
@@ -494,6 +495,8 @@ public struct WizTreeAnalyzerView: View {
     @ViewState private var scanTask: AnalysisWorkRequest?
     @ViewState private var verificationTask: AnalysisWorkRequest?
     @ViewState private var verificationToken: AnalysisRequestToken?
+    @ViewState private var cleanupID: UUID?
+    @ViewState private var cleanupCancelRequested = false
     @ViewState private var scanWorkState: AnalysisWorkRequest.State = .finished
     @ViewState private var verificationWorkState: AnalysisWorkRequest.State = .finished
     @ViewState private var scanIsComplete = false
@@ -627,6 +630,7 @@ public struct WizTreeAnalyzerView: View {
             performPaneAction { runActiveScan(for: pane.currentURL) }
         }
         .onChange(of: livePaneID) { _, _ in
+            cancelCleanupForOwnerChange()
             scanToken?.cancel()
             scanTask?.cancel()
             verificationTask?.cancel()
@@ -638,6 +642,7 @@ public struct WizTreeAnalyzerView: View {
         .onChange(of: pane.showHiddenFiles) { _, _ in runActiveScan(for: pane.currentURL) }
         .onChange(of: pane.directoryRevision) { _, _ in runActiveScan(for: pane.currentURL) }
         .onDisappear {
+            cancelCleanupForOwnerChange()
             scanToken?.cancel()
             scanTask?.cancel()
             verificationTask?.cancel()
@@ -1236,6 +1241,8 @@ public struct WizTreeAnalyzerView: View {
     private var duplicateSummary: some View {
         let generation = scanToken
         let groups = duplicateGroups
+        let cleanupIsCancelling = cleanupCancelRequested || (cleanupID != nil
+            && fileOps.activeDuplicateCleanupID == cleanupID && fileOps.activeTransfer?.isCancellable == false)
         let totalWasted = groups.reduce(Int64(0)) { $0 + $1.wastedBytes }
         return VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
             Text("Grupy duplikatów: \(duplicateGroups.count) · Nadmiarowe dane logiczne: \(FormatHelpers.formatBytes(totalWasted))")
@@ -1245,9 +1252,30 @@ public struct WizTreeAnalyzerView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(isValidatingDuplicates || !scanIsComplete)
+            .disabled(isValidatingDuplicates || cleanupID != nil || fileOps.isBusy || !scanIsComplete)
             .help("Zachowaj pierwszy plik z każdej grupy i zweryfikuj pozostałe przed przeniesieniem do Kosza")
 
+            if cleanupID != nil {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(cleanupIsCancelling ? "Anulowanie po bieżącej operacji…" : "Przenoszenie duplikatów do Kosza…")
+                        .font(FinderUI.captionFont)
+                    Button("Anuluj dalsze kroki") {
+                        guard let id = cleanupID else { return }
+                        cleanupCancelRequested = true
+                        FileOperationsManager.shared.cancelDuplicateCleanup(id)
+                    }
+                    .disabled(cleanupIsCancelling)
+                }
+                Text("Bieżąca operacja systemowa może jeszcze trwać. Już przeniesione pliki nie są automatycznie przywracane.")
+                    .font(FinderUI.captionFont)
+                    .foregroundStyle(.secondary)
+            }
+            if cleanupID == nil && fileOps.isBusy {
+                Text("Poczekaj na zakończenie bieżącej operacji plikowej.")
+                    .font(FinderUI.captionFont)
+                    .foregroundStyle(.secondary)
+            }
             if !scanIsComplete {
                 Text("Usuwanie duplikatów jest wyłączone dla niepełnego skanu. Odśwież analizę i usuń przyczynę pominięć.")
                     .font(FinderUI.captionFont)
@@ -1311,7 +1339,7 @@ public struct WizTreeAnalyzerView: View {
                 Button("Przenieś do Kosza", role: .destructive) {
                     performPaneAction { trashDuplicates([group], generation: generation, onlyPath: file.path) }
                 }
-                .disabled(isValidatingDuplicates || !scanIsComplete)
+                .disabled(isValidatingDuplicates || cleanupID != nil || fileOps.isBusy || !scanIsComplete)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .accessibilityLabel("Przenieś do Kosza: \(file.name)")
@@ -1333,6 +1361,7 @@ public struct WizTreeAnalyzerView: View {
     // MARK: - Generation-bound, bounded scans
 
     private func runActiveScan(for rootURL: URL) {
+        cancelCleanupForOwnerChange()
         // Invalidate publication immediately, but let submit replace an admitted
         // pending request in place so repeated refreshes keep their FIFO slot.
         scanToken?.cancel()
@@ -1395,6 +1424,7 @@ public struct WizTreeAnalyzerView: View {
     }
 
     private func cancelScan() {
+        cancelCleanupForOwnerChange()
         scanToken?.cancel()
         scanTask?.cancel()
         verificationTask?.cancel()
@@ -1403,6 +1433,12 @@ public struct WizTreeAnalyzerView: View {
         scanIsComplete = false
         scanDiagnostic = "Anulowano skan. Trwający odczyt systemowy może jeszcze kończyć pracę."
         pane.clearAnalysisSelection()
+    }
+
+    private func cancelCleanupForOwnerChange() {
+        DuplicateCleanupHandoff.cancelOwned(cleanupID, manager: fileOps)
+        cleanupID = nil
+        cleanupCancelRequested = false
     }
 
     private func cancelVerification() {
@@ -1442,7 +1478,7 @@ public struct WizTreeAnalyzerView: View {
 
     private func trashDuplicates(_ groups: [DuplicateFileGroup], generation: AnalysisRequestToken?, onlyPath: String? = nil) {
         guard let token = generation, canUseRenderedResult(generation, requiresComplete: true),
-              !isValidatingDuplicates else { return }
+              !isValidatingDuplicates, cleanupID == nil else { return }
         isValidatingDuplicates = true
         duplicateActionError = nil
         let verification = AnalysisRequestToken(rootPath: token.rootPath)
@@ -1467,14 +1503,28 @@ public struct WizTreeAnalyzerView: View {
                 self.isValidatingDuplicates = false
                 switch result {
                 case .verified:
-                    for group in groups {
-                        let candidates = group.files.dropFirst().filter { onlyPath == nil || $0.path == onlyPath }
-                        FileOperationsManager.shared.moveToTrash(Array(candidates), validating: { item in
-                            guard !token.isCancelled, !verification.isCancelled else { throw DuplicateSafetyError.cancelled }
-                            try DuplicateFileSafety.validateBeforeTrash(item, in: group)
+                    // Last live-owner/complete-result check before handing the
+                    // immutable verified selection to the manager-owned batch.
+                    guard self.canUseRenderedResult(token, requiresComplete: true) else { return }
+                    let id = UUID()
+                    self.cleanupID = id
+                    self.cleanupCancelRequested = false
+                    let accepted = DuplicateCleanupHandoff.start(verified: result,
+                        plan: DuplicateCleanupPlan(groups: groups, onlyPath: onlyPath),
+                        scanToken: token, requestID: id, appState: self.appState, manager: self.fileOps,
+                        current: {
+                            DuplicateCleanupViewState(scanToken: self.scanToken,
+                                resultReady: !self.isScanning && self.scanWorkState == .finished,
+                                isComplete: self.scanIsComplete, mode: self.subMode, cleanupID: self.cleanupID)
+                        }, didFinish: { mayRescan in
+                            self.cleanupID = nil
+                            self.cleanupCancelRequested = false
+                            if mayRescan { self.runActiveScan(for: self.pane.currentURL) }
                         })
+                    if !accepted {
+                        self.cleanupID = nil
+                        self.duplicateActionError = FileOperationsManager.shared.lastStatusMessage ?? "Nie rozpoczęto usuwania duplikatów."
                     }
-                    self.runActiveScan(for: self.pane.currentURL)
                 case .failed(let message):
                     self.duplicateActionError = message
                 }

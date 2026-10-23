@@ -17,6 +17,8 @@ func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath
             let analysisWorkCount = try await AnalysisWorkLifecycleRegressionTests.runAll()
             let analysisAdapterCount = try await AnalysisWorkAdapterRegressionTests.runAll()
             print("PASS \(analysisWorkCount + analysisAdapterCount) bounded analysis worker and production adapter regressions")
+            let duplicateCleanupCount = try await DuplicateCleanupLifecycleRegressionTests.runAll()
+            print("PASS \(duplicateCleanupCount) asynchronous duplicate cleanup regressions")
             try await DirectoryNavigationRegressionTests().runAll()
             let tests = NavigationTests()
             try await tests.testDirectoryShowsFilesBeforeTagMetadataCompletes()

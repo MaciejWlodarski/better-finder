@@ -138,7 +138,7 @@ struct TerminalApplicationLifecycleRegressionTests {
     // default run loop when testing the production delivery mechanism.
     private func pumpDefaultRunLoop() {
         precondition(Thread.isMainThread)
-        _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false)
+        _ = CFRunLoopRunInMode(.defaultMode, 0.001, false)
     }
 
     private func testNestedModalDelivery() async throws {
@@ -152,7 +152,7 @@ struct TerminalApplicationLifecycleRegressionTests {
                     RunLoop.main.add(timer, forMode: .modalPanel)
                     defer { timer.invalidate() }
                     while !condition() && DispatchTime.now().uptimeNanoseconds < limit {
-                        _ = CFRunLoopRunInMode(RunLoop.Mode.modalPanel.rawValue as CFString, 0.01, false)
+                        _ = CFRunLoopRunInMode(CFRunLoopMode(rawValue: RunLoop.Mode.modalPanel.rawValue as CFString), 0.01, false)
                     }
                 }
                 var legacyDispatch = false

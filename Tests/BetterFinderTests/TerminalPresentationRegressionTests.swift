@@ -95,6 +95,15 @@ struct TerminalPresentationRegressionTests {
         try checkBounds(command)
     }
 
+    /// Fixture-only evidence: bounded UTF-8 prefixes, escaped by String(reflecting:),
+    /// retain whitespace/backslashes without dumping arbitrary session output.
+    private func fixtureDiagnostic(_ label: String, _ value: String) -> String {
+        let bytes = Array(value.utf8.prefix(2_049))
+        let prefix = String(decoding: bytes.prefix(2_048), as: UTF8.self)
+        let hex = bytes.prefix(256).map { String(format: "%02x", $0) }.joined(separator: " ")
+        return "\(label)=\(String(reflecting: prefix))\(bytes.count > 2_048 ? " [diagnostic truncated]" : ""); utf8=[\(hex)\(bytes.count > 256 ? " …" : "")]"
+    }
+
     func testNativeZshFixtures() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("bf-terminal-presentation-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -109,7 +118,8 @@ struct TerminalPresentationRegressionTests {
             ("it's", #"cd 'it'\''s'"#),
             ("-folder", "cd -- -folder")
         ]
-        for (name, command) in examples {
+        for (caseIndex, example) in examples.enumerated() {
+            let (name, command) = example
             let target = root.appendingPathComponent(name, isDirectory: true)
             try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
             let classified = TerminalDirectoryCommand.target(for: command, directory: root)
@@ -118,7 +128,15 @@ struct TerminalPresentationRegressionTests {
             DispatchQueue.global().asyncAfter(deadline: .now() + 5) { session.cancel() }
             let result = try session.run(command: command + " && /bin/pwd -P", directory: root)
             try expect(!result.wasCancelled && result.status == 0, "zsh fixture failed")
-            try expect(result.output.trimmingCharacters(in: .newlines) == target.resolvingSymlinksInPath().path, "zsh and classifier disagree")
+            let evidence = [
+                "case=\(caseIndex)", fixtureDiagnostic("command", command),
+                fixtureDiagnostic("target", target.path),
+                fixtureDiagnostic("resolvedTarget", target.resolvingSymlinksInPath().path),
+                fixtureDiagnostic("rawOutput", result.output),
+                "status=\(result.status) cancelled=\(result.wasCancelled) truncated=\(result.wasTruncated)"
+            ].joined(separator: "; ")
+            try expect(result.output.trimmingCharacters(in: .newlines) == target.resolvingSymlinksInPath().path,
+                       "zsh and classifier disagree; " + evidence)
         }
         for command in ["cd 'Folder With Spaces' && printf compound", "cd 'Folder With Spaces'; printf compound", "cd 'Folder With Spaces'\nprintf compound"] {
             try expect(TerminalDirectoryCommand.target(for: command, directory: root) == nil, "Compound must reach zsh")

@@ -38,7 +38,7 @@ struct GUIPresentationRegressionTests {
         print("PASS status summary follows production analysis/list selection and pending search")
         try testPaneActionRouting(root: root, files: files)
         try testQuickSearchSelection()
-        try testBreadcrumbRevealRequest()
+        try testBreadcrumbLayoutMetrics()
     }
     @MainActor private func testPaneActionRouting(root: URL, files: [FileItem]) throws {
         // The same synchronous routing helper is invoked by mouse and AX view
@@ -106,22 +106,39 @@ struct GUIPresentationRegressionTests {
         print("PASS production quick-search selection boundaries for the visible result list")
     }
 
-    private func testBreadcrumbRevealRequest() throws {
-        let initial = BreadcrumbRevealRequest(path: "/tmp/Pracownia", viewportWidth: 800)
-        try expect(initial.maximumSegmentWidth == 280)
-        try expect(initial == BreadcrumbRevealRequest(path: initial.path, viewportWidth: 800))
-        // Narrowing, widening, and navigation all invalidate the reveal task.
-        try expect(initial != BreadcrumbRevealRequest(path: initial.path, viewportWidth: 500))
-        try expect(initial != BreadcrumbRevealRequest(path: initial.path, viewportWidth: 1000))
-        try expect(initial != BreadcrumbRevealRequest(path: "/tmp/Projekty", viewportWidth: 800))
+    private func testBreadcrumbLayoutMetrics() throws {
+        try expect(BreadcrumbLayoutMetrics.finiteWidth(nil) == 280)
+        try expect(BreadcrumbLayoutMetrics.finiteWidth(.infinity) == 280)
+        try expect(BreadcrumbLayoutMetrics.finiteWidth(.nan) == 280)
+        try expect(BreadcrumbLayoutMetrics.finiteWidth(-10) == 0)
+        let unbounded = BreadcrumbLayoutMetrics(availableWidth: .infinity, idealCurrentWidth: .nan, hasAncestors: true)
+        try expect(unbounded.currentWidth.isFinite && unbounded.ancestorWidth.isFinite)
+        let regular = BreadcrumbLayoutMetrics(availableWidth: 800, idealCurrentWidth: 100, hasAncestors: true)
+        try expect(regular.currentWidth == 100)
+        try expect(regular.ancestorWidth == 698)
+        try expect(regular.spacing == 2)
+        let long = BreadcrumbLayoutMetrics(availableWidth: 800, idealCurrentWidth: 2000, hasAncestors: true)
+        try expect(long.currentWidth == 280)
+        let compact = BreadcrumbLayoutMetrics(availableWidth: 200, idealCurrentWidth: 2000, hasAncestors: true)
+        try expect(abs(compact.currentWidth - 118.8) < 0.001)
+        try expect(abs(compact.ancestorWidth - 79.2) < 0.001)
+        let root = BreadcrumbLayoutMetrics(availableWidth: 200, idealCurrentWidth: 2000, hasAncestors: false)
+        try expect(root.currentWidth == 200)
+        try expect(root.ancestorWidth == 0 && root.spacing == 0)
         for width in [CGFloat(0), 1, 40, 120, 279, 280, 281, 1000] {
-            let request = BreadcrumbRevealRequest(path: "/", viewportWidth: width)
-            try expect(request.maximumSegmentWidth >= 0)
-            try expect(request.maximumSegmentWidth <= width)
-            try expect(request.maximumSegmentWidth <= 280)
+            for ideal in [CGFloat(0), 30, 100, 2000] {
+                for ancestors in [false, true] {
+                    let layout = BreadcrumbLayoutMetrics(availableWidth: width, idealCurrentWidth: ideal, hasAncestors: ancestors)
+                    try expect(layout.currentWidth >= 0 && layout.currentWidth <= 280)
+                    try expect(layout.ancestorWidth >= 0)
+                    try expect(layout.currentWidth + layout.ancestorWidth + layout.spacing <= width + 0.001)
+                    if ancestors {
+                        try expect(abs(layout.currentWidth + layout.ancestorWidth + layout.spacing - width) < 0.001)
+                    }
+                }
+            }
         }
-        try expect(BreadcrumbRevealRequest(path: "/", viewportWidth: -1).maximumSegmentWidth == 0)
-        print("PASS breadcrumb reveal identity and viewport-bounded segment widths")
+        print("PASS pinned breadcrumb width allocation, long names, root and narrow viewports")
     }
 
 }

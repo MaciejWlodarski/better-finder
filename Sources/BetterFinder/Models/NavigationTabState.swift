@@ -315,7 +315,10 @@ public final class PaneTabState: ObservableObject, Identifiable {
         self.initialLocationEstablished = !loadImmediately
         self.currentURL = initialURL.standardizedFileURL
         self.columnTrailURLs = [initialURL.standardizedFileURL]
-        if loadImmediately { reloadDirectory() } else { sessionAvailability = .paused }
+        if loadImmediately {
+            // A new pane is a snapshot consumer, not an explicit filesystem refresh.
+            reloadDirectory(invalidateCaches: false)
+        } else { sessionAvailability = .paused }
     }
 
     // Directory-only navigation. The injectable reader/opener keep failure tests

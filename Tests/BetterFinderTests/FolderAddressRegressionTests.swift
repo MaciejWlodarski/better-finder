@@ -12,6 +12,11 @@ struct FolderAddressRegressionTests {
             ("../Sibling", "/tmp/Sibling"), ("folder with spaces", "/tmp/Address Base/folder with spaces"),
             ("file:///Volumes/My%20Share/Folder", "/Volumes/My Share/Folder"),
             ("file://localhost/tmp/Folder", "/tmp/Folder"),
+            ("file:///tmp/a%20b/%C5%BC%C3%B3%C5%82%C4%87", "/tmp/a b/żółć"),
+            ("file:///tmp/%F0%9F%93%81", "/tmp/📁"),
+            ("file:///tmp/%2500literal", "/tmp/%00literal"),
+            ("file:///tmp/%252Fsingle-decode", "/tmp/%2Fsingle-decode"),
+            ("/tmp/literal%00", "/tmp/literal%00"),
             ("/tmp/name#fragment?literal", "/tmp/name#fragment?literal"),
             ("/tmp/ leading and trailing ", "/tmp/ leading and trailing ")
         ]
@@ -21,7 +26,11 @@ struct FolderAddressRegressionTests {
         }
         for invalid in ["", "~another/Documents", "smb://server/share", "https://example.com", "file://server/share",
                         "file://user:secret@localhost/tmp", "file:///tmp?q=1", "file:///tmp#fragment",
-                        "file:///tmp/%00secret", "file:///tmp/%0Aline", "file://localhost:42/tmp", "a\nb", String(repeating: "x", count: 16_385)] {
+                        "file:///tmp/%00secret", "file:///tmp/%0Aline",
+                        "file:///tmp/mixed%20name%00suffix", "file:///tmp/%0aline", "file:///tmp/%0dline",
+                        "file:///tmp/%09tab", "file:///tmp/%7fdelete", "file:///tmp/%C2%85nextline",
+                        "file:///tmp/%c2%85nextline", "file:///tmp/%FFinvalid", "file:///tmp/%C0%80overlong",
+                        "file:///tmp/%", "file:///tmp/%0", "file:///tmp/%GG", "file://localhost:42/tmp", "a\nb", String(repeating: "x", count: 16_385)] {
             do {
                 _ = try FolderAddress.resolve(invalid, relativeTo: base, home: home)
                 throw RegressionFailure(description: "Address unexpectedly accepted: \(invalid.prefix(40))")

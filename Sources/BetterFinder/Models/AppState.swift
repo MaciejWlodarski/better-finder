@@ -448,7 +448,9 @@ public final class AppState: ObservableObject {
         newTab.foldersOnTop = activeTab.foldersOnTop
         newTab.searchScope = activeTab.searchScope
         newTab.fuzzyEnabled = activeTab.fuzzyEnabled
-        newTab.refresh()
+        // Apply inherited display preferences without discarding shared analysis.
+        newTab.reloadDirectory(invalidateCaches: false)
+        FSearchIndex.shared.ensureDirectoryIndexed(newTab.currentURL.path)
         tabs.append(newTab)
         activeTabId = newTab.id
         activePaneSide = .left

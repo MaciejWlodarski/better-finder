@@ -77,10 +77,24 @@ struct TerminalWorkspaceRegressionTests {
         try await wait { !tab.isRunning }
         try check(tab.directory.path == quoted.path, "Standalone cd uses quoted absolute target, not CDPATH or expansion")
         try check(normal.activeCount == 0, "Workers physically released")
+        // Establish the newly created fixture in the index before warming its size.
+        // Later pane reconciliation should compare an unchanged tree.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            FSearchIndex.shared.enqueueDirectoryRefresh(root.path) { continuation.resume() }
+        }
         let cache = FolderSizeCache.shared
         cache.requestSizeIfNeeded(for: child.path)
         try await wait { cache.result(for: child.path) != nil }
+        // No suspension through the following preservation assertions: callbacks
+        // for genuine filesystem changes cannot interleave with these operations.
+        try check(cache.result(for: child.path) != nil, "Pane creation starts with a cached size")
         let pane = PaneTabState(initialURL: root)
+        try check(cache.result(for: child.path) != nil, "New pane must preserve unchanged cached size")
+        let state = AppState.shared
+        state.addNewTab(at: child)
+        let createdTabID = state.activeTab.id
+        try check(cache.result(for: child.path) != nil, "New tab with inherited preferences must preserve cached size")
+        state.closeTab(createdTabID)
         try check(pane.navigate(to: child), "Navigate to cached child")
         try check(cache.result(for: child.path) != nil, "Navigation must not discard unchanged cached size")
         pane.reloadDirectory(invalidateCaches: false)

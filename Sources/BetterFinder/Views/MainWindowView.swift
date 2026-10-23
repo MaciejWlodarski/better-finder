@@ -9,6 +9,19 @@ public struct MainWindowView: View {
     @ViewState private var terminalDragStart: CGFloat?
     @GestureState private var isResizingTerminal = false
 
+    #if BETTERFINDER_TESTING
+    @Environment(\.terminalPreviewRequestedHeight) private var previewRequestedHeight
+    #endif
+
+    private var requestedTerminalHeight: CGFloat {
+        #if BETTERFINDER_TESTING
+        if let previewRequestedHeight, previewRequestedHeight.isFinite {
+            return previewRequestedHeight
+        }
+        #endif
+        return terminalHeight
+    }
+
     public init() {}
 
     public var body: some View {
@@ -41,7 +54,7 @@ public struct MainWindowView: View {
                             terminalDivider(availableHeight: geometry.size.height)
                             EmbeddedTerminalDrawerView(appState: appState, activeTab: activeTab)
                                 .frame(height: TerminalDrawerLayout.height(
-                                    requested: terminalHeight, availableHeight: geometry.size.height))
+                                    requested: requestedTerminalHeight, availableHeight: geometry.size.height))
                         }
                     }
                     .coordinateSpace(name: "terminalSplit")
@@ -81,7 +94,7 @@ public struct MainWindowView: View {
     }
 
     private func terminalDivider(availableHeight: CGFloat) -> some View {
-        let actualHeight = TerminalDrawerLayout.height(requested: terminalHeight, availableHeight: availableHeight)
+        let actualHeight = TerminalDrawerLayout.height(requested: requestedTerminalHeight, availableHeight: availableHeight)
         return TerminalResizeHandle(
             height: actualHeight,
             onIncrease: { terminalHeight = TerminalDrawerLayout.height(requested: actualHeight + TerminalDrawerLayout.keyboardStep, availableHeight: availableHeight) },
@@ -283,3 +296,16 @@ private struct FinderStatusBar: View {
         .background(.bar)
     }
 }
+
+#if BETTERFINDER_TESTING
+// Visual fixture input only; production sizing/clamping remains authoritative.
+private struct TerminalPreviewRequestedHeightKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+extension EnvironmentValues {
+    var terminalPreviewRequestedHeight: CGFloat? {
+        get { self[TerminalPreviewRequestedHeightKey.self] }
+        set { self[TerminalPreviewRequestedHeightKey.self] = newValue }
+    }
+}
+#endif

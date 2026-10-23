@@ -41,9 +41,9 @@ final class TerminalTab: ObservableObject, Identifiable {
     private var token: UUID?
     private var closed = false
     private let lifecycle: TerminalApplicationLifecycle
-    private let reconcile: (String) -> Void
+    private let reconcile: @MainActor (String) -> Void
     init(directory: URL, lifecycle: TerminalApplicationLifecycle = .shared, ordinal: Int = 1,
-         reconcile: @escaping (String) -> Void = { FSearchIndex.shared.enqueueDirectoryRefresh($0) }) {
+         reconcile: @escaping @MainActor (String) -> Void = { AppState.shared.reconcileTerminalCommand(at: $0) }) {
         self.directory = directory
         self.ordinal = ordinal
         self.lifecycle = lifecycle
@@ -68,7 +68,11 @@ final class TerminalTab: ObservableObject, Identifiable {
         let request = UUID(); token = request
         let reconcileAfterCommand = reconcile
         let executable = directoryTarget.map { "builtin cd -- " + Self.shellQuote($0.path) } ?? raw
-        guard let worker = lifecycle.start(command: executable, directory: cwd, completion: { [weak self] result in
+        // Classification resolves relative operands against the tab's cwd without
+        // I/O. Validate the absolute target in the admitted worker, launched from
+        // a stable directory so a removed/renamed cwd cannot prevent cd itself.
+        let launchDirectory = directoryTarget == nil ? cwd : URL(fileURLWithPath: "/", isDirectory: true)
+        guard let worker = lifecycle.start(command: executable, directory: launchDirectory, completion: { [weak self] result in
             // Reconcile even a closed tab's mutations, without touching another tab's UI.
             if directoryTarget == nil { reconcileAfterCommand(cwd.path) }
             guard let self, !self.closed, self.token == request else { return }

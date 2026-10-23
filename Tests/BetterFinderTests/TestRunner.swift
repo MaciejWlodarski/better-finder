@@ -81,6 +81,7 @@ func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath
             try TerminalDrawerLayoutRegressionTests.runAll()
             try await DirectoryReconciliationRegressionTests.runAll()
             try await TerminalWorkspaceRegressionTests().runAll()
+            try await TerminalMetadataRefreshRegressionTests().runAll()
             try await TerminalApplicationLifecycleRegressionTests().runAll()
             print("PASS application-owned terminal quit lifecycle regressions")
             print("Disk analysis/terminal regression suite passed")

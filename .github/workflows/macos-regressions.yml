@@ -1,4 +1,4 @@
-name: macOS build and regressions
+name: macOS build, regressions and broad UI fixtures
 on:
   pull_request:
   push:
@@ -8,6 +8,7 @@ permissions:
   contents: read
 jobs:
   macos:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     strategy:
       fail-fast: false
       matrix:
@@ -16,9 +17,34 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Record bounded toolchain identity
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          sw_vers -productVersion
+          uname -m
+          xcrun --sdk macosx --show-sdk-version
+          xcrun swiftc --version
+          xcodebuild -version
       - name: Build native application
         run: zsh ./build_app.sh
       - name: Run isolated production-path regressions
         run: zsh ./scripts/run_tests.sh
       - name: Run direct-delegate live terminal integration
         run: zsh ./scripts/run_terminal_live_integration.sh
+      - name: Render isolated broad native preview
+        id: native_preview
+        timeout-minutes: 5
+        run: python3 scripts/run_preview_ci.py
+      - name: Upload bounded synthetic native renders
+        if: success() && steps.native_preview.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: broad-native-renders-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .build/previews-ci-artifact/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

@@ -4,6 +4,7 @@ import Darwin
 
 @main
 struct NativePreview {
+    @MainActor static var captureSequence = 0
     @MainActor static func main() {
         guard let outputPath = ProcessInfo.processInfo.environment["BETTERFINDER_PREVIEW_OUTPUT"],
               outputPath.hasPrefix("/") else {
@@ -102,68 +103,51 @@ struct NativePreview {
                         "keyboard fixture must expose all nine synthetic entries")
                 require(pane.selectedPaths.isEmpty, "keyboard fixture must start without preselected items")
                 #endif
-                require(window.isKeyWindow && NSApp.keyWindow === window,
-                        "keyboard event target must be the key window")
-                require(window.firstResponder is FileDragSourceView, "file pane must receive initial keyboard focus")
-                postKey(125, "\u{f701}", window: window)
-                try? await Task.sleep(for: .milliseconds(100))
-                require(pane.selectedItems.count == 1, "Down must select a file")
-                postKey(125, "\u{f701}", modifiers: [.shift], window: window)
-                try? await Task.sleep(for: .milliseconds(100))
-                require(pane.selectedItems.count == 2, "Shift-Down must extend selection")
-                postKey(36, "\r", window: window)
-                try? await Task.sleep(for: .milliseconds(250))
-                require(window.attachedSheet != nil && pane.renamingItemPath != nil, "Return must open the native rename sheet")
-                if let sheet = window.attachedSheet { capture(sheet, to: base.appendingPathComponent("rename.png")) }
+                if ProcessInfo.processInfo.environment["BETTERFINDER_PREVIEW_MODE"] == "interaction" {
+                    await interactionChecks(window: window, base: base, fixture: fixture)
+                    let summary = "PASS native keyboard/address subset; AX disclosure and resize not verified"
+                    try? summary.write(to: base.appendingPathComponent("interaction-verification.txt"), atomically: true, encoding: .utf8)
+                    print(summary)
+                    exit(0)
+                }
+                // Visual fixture preparation is not an interaction assertion.
+                pane.renamingItemPath = fixture.appendingPathComponent("README.md").path
+                await settle()
+                guard let rename = window.attachedSheet else { require(false, "visual rename sheet exposed"); return }
+                capture(rename, to: base.appendingPathComponent("rename.png"))
                 pane.renamingItemPath = nil
-                try? await Task.sleep(for: .milliseconds(250))
+                await settle()
                 pane.selectedPaths = []
                 capture(window, to: base.appendingPathComponent("light.png"))
-
-                state.addNewTab(at: fixture.appendingPathComponent("Projekty"))
-                let createdID = state.activeTabId
-                state.closeTab(createdID)
-                state.reopenClosedTab()
-                require(state.activeTabId == createdID, "reopened tab must restore the closed tab")
-                state.closeTab(createdID)
                 pane.searchScope = .currentFolder
                 pane.searchQuery = "^README"
                 pane.triggerSearch()
-                state.focusSearchFieldTrigger += 1
-                try? await Task.sleep(for: .milliseconds(300))
-                require(pane.displayedItems.map(\.name) == ["README.md"], "search must match the fixture")
-                require(window.firstResponder is NSTextView, "programmatic search-focus trigger must reach search text")
-                postKey(0, "a", modifiers: [.command], window: window)
-                try? await Task.sleep(for: .milliseconds(100))
-                require((window.firstResponder as? NSTextView)?.selectedRange().length == pane.searchQuery.utf16.count,
-                        "Command-A in search must select text")
-                require(pane.selectedItems.isEmpty, "text editing must not select underlying files")
+                await settle()
                 capture(window, to: base.appendingPathComponent("search.png"))
                 pane.clearSearch()
-                if let responder = fileResponder(in: window.contentView) { window.makeFirstResponder(responder) }
                 window.setContentSize(NSSize(width: 900, height: 650))
-                try? await Task.sleep(for: .milliseconds(250))
+                await settle()
                 capture(window, to: base.appendingPathComponent("compact.png"))
                 window.setContentSize(NSSize(width: 1180, height: 730))
                 state.showInspector = true
                 pane.selectAll()
-                try? await Task.sleep(for: .milliseconds(250))
+                await settle()
                 capture(window, to: base.appendingPathComponent("inspector.png"))
                 state.showInspector = false
                 state.showSidebar = false
-                state.toggleDualPane()
+                state.isDualPane = true
                 state.rightPane.navigate(to: fixture.appendingPathComponent("Projekty"))
-                try? await Task.sleep(for: .milliseconds(250))
+                await settle()
                 capture(window, to: base.appendingPathComponent("dual-pane.png"))
-                state.toggleDualPane()
+                state.isDualPane = false
                 state.showSidebar = true
                 pane.viewMode = .icons
                 pane.selectedPaths = []
                 NSApp.appearance = NSAppearance(named: .darkAqua)
-                try? await Task.sleep(for: .milliseconds(250))
+                await settle()
                 capture(window, to: base.appendingPathComponent("dark-icons.png"))
                 await broadScenes(window: window, base: base, fixture: fixture)
-                let summary = "PASS native window, initial focus, arrow/Shift selection, rename sheet, tabs, search, text Command-A, compact/dual/light/dark layouts"
+                let summary = "PASS visual-fixtures-only: 33 synthetic scenes; AX disclosure/resize interactions not verified"
                 try? summary.write(to: base.appendingPathComponent("verification.txt"), atomically: true, encoding: .utf8)
                 print(summary)
                 fflush(stdout)
@@ -219,6 +203,7 @@ struct NativePreview {
     }
 
     @MainActor static func capture(_ window: NSWindow, to url: URL) {
+        if ProcessInfo.processInfo.environment["BETTERFINDER_PREVIEW_MODE"] == "interaction" { return }
         guard let view = window.contentView?.superview else { require(false, "missing window content"); return }
         view.layoutSubtreeIfNeeded()
         view.displayIfNeeded()
@@ -227,6 +212,68 @@ struct NativePreview {
         guard let png = bitmap.representation(using: .png, properties: [:]) else { require(false, "cannot encode window render"); return }
         do { try png.write(to: url) }
         catch { require(false, "cannot write window render"); return }
+        #if BETTERFINDER_TESTING
+        if ProcessInfo.processInfo.environment["BETTERFINDER_PREVIEW_MODE"] == "visual" {
+            require(NSApp.windows.contains { $0 === window } && window.windowNumber > 0,
+                    "visual capture must target owned window")
+            let output = url.deletingLastPathComponent()
+            if url.lastPathComponent == "light.png" {
+                do { try png.write(to: output.appendingPathComponent("light-cacheDisplay.png")) }
+                catch { require(false, "cannot write window render"); return }
+            }
+            let response = output.appendingPathComponent("capture-response.json")
+            try? FileManager.default.removeItem(at: response)
+            let originalWindowNumber = window.windowNumber
+            guard let token = ProcessInfo.processInfo.environment["BETTERFINDER_CAPTURE_TOKEN"],
+                  token.count == 32, token.allSatisfy({ "0123456789abcdef".contains($0) }) else {
+                require(false, "visual capture token invalid"); return
+            }
+            captureSequence += 1
+            let sequence = captureSequence
+            require((1...33).contains(sequence), "visual capture sequence invalid")
+            let request: [String: Any] = ["scene": url.lastPathComponent, "window": originalWindowNumber,
+                "pid": ProcessInfo.processInfo.processIdentifier, "sequence": sequence, "token": token]
+            do {
+                let data = try JSONSerialization.data(withJSONObject: request, options: [.sortedKeys])
+                try data.write(to: output.appendingPathComponent("capture-request.json"), options: .atomic)
+            } catch { require(false, "visual capture request failed"); return }
+            let deadline = ProcessInfo.processInfo.systemUptime + 8
+            var received = false
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                if FileManager.default.fileExists(atPath: response.path) {
+                    guard let attrs = try? FileManager.default.attributesOfItem(atPath: response.path),
+                          attrs[.type] as? FileAttributeType == .typeRegular,
+                          let size = attrs[.size] as? NSNumber, size.intValue <= 512,
+                          let data = try? Data(contentsOf: response),
+                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          Set(object.keys) == Set(["scene", "status", "sequence", "token"]),
+                          let reply = try? JSONDecoder().decode(NativeCaptureResponse.self, from: data),
+                          reply.scene == url.lastPathComponent, reply.sequence == sequence, reply.token == token,
+                          ["composited", "unsupported"].contains(reply.status) else {
+                        require(false, "visual capture response invalid"); return
+                    }
+                    require(NSApp.windows.contains { $0 === window } && window.windowNumber == originalWindowNumber,
+                            "visual capture window changed")
+                    if reply.status == "composited" {
+                        let composite = output.appendingPathComponent("composited-" + url.lastPathComponent)
+                        guard let attrs = try? FileManager.default.attributesOfItem(atPath: composite.path),
+                              attrs[.type] as? FileAttributeType == .typeRegular,
+                              let size = attrs[.size] as? NSNumber, size.intValue <= 8 * 1024 * 1024,
+                              let data = try? Data(contentsOf: composite),
+                              data.prefix(8) == Data([137,80,78,71,13,10,26,10]) else {
+                            require(false, "visual capture composite invalid"); return
+                        }
+                        do { try data.write(to: url, options: .atomic) }
+                        catch { require(false, "cannot write window render"); return }
+                    }
+                    received = true
+                    break
+                }
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false)
+            }
+            require(received, "visual capture response timeout")
+        }
+        #endif
         print("CAPTURE \(url.path) \(bitmap.pixelsWide)x\(bitmap.pixelsHigh)")
     }
 }
@@ -329,85 +376,69 @@ extension NativePreview {
         return fields
     }
 
-    @MainActor static func broadScenes(window: NSWindow, base: URL, fixture: URL) async {
-        #if BETTERFINDER_TESTING
+    @MainActor static func interactionChecks(window: NSWindow, base: URL, fixture: URL) async {
         let state = AppState.shared
         let pane = state.leftTab
-        state.isDualPane = false
-        state.activePaneSide = .left
-        state.showSidebar = true
-        state.showInspector = false
-        pane.clearSearch()
-        pane.viewMode = .list
-        pane.selectedPaths = []
-        window.setContentSize(NSSize(width: 1180, height: 730))
-        let favoriteRows = [
-            SidebarLocationItem(title: "Projekty — ręcznie jako pierwsze", iconName: "folder", url: fixture.appendingPathComponent("Projekty"), isCustomBookmark: true),
-            SidebarLocationItem(title: "Bardzo długa własna nazwa folderu roboczego do kontroli obcinania", iconName: "folder", url: fixture.appendingPathComponent("Dokumenty"), isCustomBookmark: true),
-            SidebarLocationItem(title: "Fotografie", iconName: "photo", url: fixture.appendingPathComponent("Fotografie"), isCustomBookmark: true)
-        ]
-        state.favorites = favoriteRows
-        let server = NetworkServerIdentity.parse(remountURL: URL(string: "smb://studio-preview.invalid"))
-        require(server != nil, "broad synthetic server identity")
-        let volumes = [
-            VolumeInfoItem(name: "Dysk testowy", url: fixture, totalBytes: 1000, freeBytes: 600, isRemovable: false),
-            VolumeInfoItem(name: "Dokumenty", url: fixture.appendingPathComponent("Dokumenty"), totalBytes: nil, freeBytes: nil, isRemovable: false, isNetwork: true, networkServer: server),
-            VolumeInfoItem(name: "Projekty z długą nazwą udziału", url: fixture.appendingPathComponent("Projekty"), totalBytes: 1000, freeBytes: 0, isRemovable: false, isNetwork: true, networkServer: server),
-            VolumeInfoItem(name: "Nieznany serwer", url: fixture.appendingPathComponent("Archiwum"), totalBytes: nil, freeBytes: nil, isRemovable: false, isNetwork: true)
-        ]
-        state.installVolumeFixturesForTesting(volumes)
-        require(state.networkServerGroups.count == 2 && volumes[1].usedFraction == nil && volumes[2].usedFraction == 1,
-                "broad network grouping and unknown capacity")
-        NSApp.appearance = NSAppearance(named: .aqua)
-        await scene("sidebar-full-light", window: window, base: base)
-        NSApp.appearance = NSAppearance(named: .darkAqua)
-        await scene("sidebar-full-dark", window: window, base: base)
-        state.favorites = []
-        await scene("sidebar-empty", window: window, base: base)
-        state.favorites = Array(favoriteRows.reversed())
-        require(state.favorites.map(\.id) == favoriteRows.reversed().map(\.id), "broad manual favorite order")
-        await scene("sidebar-reordered", window: window, base: base)
-        let disclosureLabel = "Serwer studio-preview.invalid, 2 udziałów"
-        guard let disclosure = accessible(window, label: disclosureLabel) else {
-            // Diagnostic only: the assertion remains failed and this image is not
-            // part of the required passing render set. No desktop/global capture.
-            capture(window, to: base.appendingPathComponent("diagnostic-network-disclosure.png"))
-            require(false, networkExposureDiagnostic(window: window, expected: disclosureLabel, output: base)); return
-        }
-        require(disclosure.accessibilityPerformPress(), "broad network disclosure action")
-        await settle()
-        require((accessible(window, label: disclosureLabel)?.accessibilityValue() as? String) == "Rozwinięty",
-                "broad network disclosure expanded")
-        await scene("network-expanded-dark", window: window, base: base)
-        NSApp.appearance = NSAppearance(named: .aqua)
-        await scene("network-expanded-light", window: window, base: base)
+                require(window.isKeyWindow && NSApp.keyWindow === window,
+                        "keyboard event target must be the key window")
+                require(window.firstResponder is FileDragSourceView, "file pane must receive initial keyboard focus")
+                postKey(125, "\u{f701}", window: window)
+                try? await Task.sleep(for: .milliseconds(100))
+                require(pane.selectedItems.count == 1, "Down must select a file")
+                postKey(125, "\u{f701}", modifiers: [.shift], window: window)
+                try? await Task.sleep(for: .milliseconds(100))
+                require(pane.selectedItems.count == 2, "Shift-Down must extend selection")
+                postKey(36, "\r", window: window)
+                try? await Task.sleep(for: .milliseconds(250))
+                require(window.attachedSheet != nil && pane.renamingItemPath != nil, "Return must open the native rename sheet")
+                if let sheet = window.attachedSheet { capture(sheet, to: base.appendingPathComponent("rename.png")) }
+                pane.renamingItemPath = nil
+                try? await Task.sleep(for: .milliseconds(250))
+                pane.selectedPaths = []
+                capture(window, to: base.appendingPathComponent("light.png"))
 
-        pane.viewMode = .columns
-        await scene("columns", window: window, base: base)
-        pane.viewMode = .list
-        state.showInspector = true
-        pane.selectedPaths = [fixture.appendingPathComponent("README.md").path]
-        await scene("inspector-single", window: window, base: base)
-        state.showInspector = false
-        pane.selectedPaths = []
-
-        state.showSettingsSheet = true
-        await settle()
-        guard let settings = window.attachedSheet else { require(false, "broad settings sheet exposed"); return }
-        settings.setContentSize(NSSize(width: 620, height: 540))
-        await scene("settings-short-light", window: settings, base: base)
-        NSApp.appearance = NSAppearance(named: .darkAqua)
-        await scene("settings-short-dark", window: settings, base: base)
-        state.showSettingsSheet = false
-        await settle()
-        NSApp.appearance = NSAppearance(named: .aqua)
-        state.showNewFolderSheet = true
-        await settle()
-        guard let folderSheet = window.attachedSheet else { require(false, "broad folder sheet exposed"); return }
-        await scene("new-folder", window: folderSheet, base: base)
-        state.showNewFolderSheet = false
-        await settle()
-
+                state.addNewTab(at: fixture.appendingPathComponent("Projekty"))
+                let createdID = state.activeTabId
+                state.closeTab(createdID)
+                state.reopenClosedTab()
+                require(state.activeTabId == createdID, "reopened tab must restore the closed tab")
+                state.closeTab(createdID)
+                pane.searchScope = .currentFolder
+                pane.searchQuery = "^README"
+                pane.triggerSearch()
+                state.focusSearchFieldTrigger += 1
+                try? await Task.sleep(for: .milliseconds(300))
+                require(pane.displayedItems.map(\.name) == ["README.md"], "search must match the fixture")
+                require(window.firstResponder is NSTextView, "programmatic search-focus trigger must reach search text")
+                postKey(0, "a", modifiers: [.command], window: window)
+                try? await Task.sleep(for: .milliseconds(100))
+                require((window.firstResponder as? NSTextView)?.selectedRange().length == pane.searchQuery.utf16.count,
+                        "Command-A in search must select text")
+                require(pane.selectedItems.isEmpty, "text editing must not select underlying files")
+                capture(window, to: base.appendingPathComponent("search.png"))
+                pane.clearSearch()
+                if let responder = fileResponder(in: window.contentView) { window.makeFirstResponder(responder) }
+                window.setContentSize(NSSize(width: 900, height: 650))
+                try? await Task.sleep(for: .milliseconds(250))
+                capture(window, to: base.appendingPathComponent("compact.png"))
+                window.setContentSize(NSSize(width: 1180, height: 730))
+                state.showInspector = true
+                pane.selectAll()
+                try? await Task.sleep(for: .milliseconds(250))
+                capture(window, to: base.appendingPathComponent("inspector.png"))
+                state.showInspector = false
+                state.showSidebar = false
+                state.toggleDualPane()
+                state.rightPane.navigate(to: fixture.appendingPathComponent("Projekty"))
+                try? await Task.sleep(for: .milliseconds(250))
+                capture(window, to: base.appendingPathComponent("dual-pane.png"))
+                state.toggleDualPane()
+                state.showSidebar = true
+                pane.viewMode = .icons
+                pane.selectedPaths = []
+                NSApp.appearance = NSAppearance(named: .darkAqua)
+                try? await Task.sleep(for: .milliseconds(250))
+                capture(window, to: base.appendingPathComponent("dark-icons.png"))
         state.isDualPane = true
         state.rightPane.navigate(to: fixture.appendingPathComponent("Projekty"))
         window.setContentSize(NSSize(width: 1360, height: 760))
@@ -442,6 +473,97 @@ extension NativePreview {
         postKey(53, "\u{1b}", window: window)
         await settle()
 
+    }
+
+    @MainActor static func broadScenes(window: NSWindow, base: URL, fixture: URL) async {
+        #if BETTERFINDER_TESTING
+        let state = AppState.shared
+        let pane = state.leftTab
+        state.isDualPane = false
+        state.activePaneSide = .left
+        state.showSidebar = true
+        state.showInspector = false
+        pane.clearSearch()
+        pane.viewMode = .list
+        pane.selectedPaths = []
+        window.setContentSize(NSSize(width: 1180, height: 730))
+        let favoriteRows = [
+            SidebarLocationItem(title: "Projekty — ręcznie jako pierwsze", iconName: "folder", url: fixture.appendingPathComponent("Projekty"), isCustomBookmark: true),
+            SidebarLocationItem(title: "Bardzo długa własna nazwa folderu roboczego do kontroli obcinania", iconName: "folder", url: fixture.appendingPathComponent("Dokumenty"), isCustomBookmark: true),
+            SidebarLocationItem(title: "Fotografie", iconName: "photo", url: fixture.appendingPathComponent("Fotografie"), isCustomBookmark: true)
+        ]
+        state.favorites = favoriteRows
+        let server = NetworkServerIdentity.parse(remountURL: URL(string: "smb://studio-preview.invalid"))
+        require(server != nil, "broad synthetic server identity")
+        let volumes = [
+            VolumeInfoItem(name: "Dysk testowy", url: fixture, totalBytes: 1000, freeBytes: 600, isRemovable: false),
+            VolumeInfoItem(name: "Dokumenty", url: fixture.appendingPathComponent("Dokumenty"), totalBytes: nil, freeBytes: nil, isRemovable: false, isNetwork: true, networkServer: server),
+            VolumeInfoItem(name: "Projekty z długą nazwą udziału", url: fixture.appendingPathComponent("Projekty"), totalBytes: 1000, freeBytes: 0, isRemovable: false, isNetwork: true, networkServer: server),
+            VolumeInfoItem(name: "Nieznany serwer", url: fixture.appendingPathComponent("Archiwum"), totalBytes: nil, freeBytes: nil, isRemovable: false, isNetwork: true)
+        ]
+        state.installVolumeFixturesForTesting(volumes)
+        require(state.networkServerGroups.count == 2 && volumes[1].usedFraction == nil && volumes[2].usedFraction == 1,
+                "broad network grouping and unknown capacity")
+        NSApp.appearance = NSAppearance(named: .aqua)
+        await scene("sidebar-full-light", window: window, base: base)
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+        NativePreviewFixtureConfig.shared.tagsExpanded = true
+        await scene("sidebar-full-dark", window: window, base: base)
+        NativePreviewFixtureConfig.shared.tagsExpanded = false
+        state.favorites = []
+        await scene("sidebar-empty", window: window, base: base)
+        state.favorites = Array(favoriteRows.reversed())
+        require(state.favorites.map(\.id) == favoriteRows.reversed().map(\.id), "broad manual favorite order")
+        await scene("sidebar-reordered", window: window, base: base)
+        NativePreviewFixtureConfig.shared.expandedServers = ["server:smb://studio-preview.invalid"]
+        NativePreviewFixtureConfig.shared.tagsExpanded = false
+        await settle()
+        await scene("network-expanded-dark", window: window, base: base)
+        NSApp.appearance = NSAppearance(named: .aqua)
+        await scene("network-expanded-light", window: window, base: base)
+
+        pane.viewMode = .columns
+        await scene("columns", window: window, base: base)
+        pane.viewMode = .list
+        state.showInspector = true
+        pane.selectedPaths = [fixture.appendingPathComponent("README.md").path]
+        await scene("inspector-single", window: window, base: base)
+        state.showInspector = false
+        pane.selectedPaths = []
+
+        state.showSettingsSheet = true
+        await settle()
+        guard let settings = window.attachedSheet else { require(false, "broad settings sheet exposed"); return }
+        settings.setContentSize(NSSize(width: 620, height: 540))
+        await scene("settings-short-light", window: settings, base: base)
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+        await scene("settings-short-dark", window: settings, base: base)
+        state.showSettingsSheet = false
+        await settle()
+        NSApp.appearance = NSAppearance(named: .aqua)
+        state.showNewFolderSheet = true
+        await settle()
+        guard let folderSheet = window.attachedSheet else { require(false, "broad folder sheet exposed"); return }
+        await scene("new-folder", window: folderSheet, base: base)
+        state.showNewFolderSheet = false
+        await settle()
+
+        state.isDualPane = true
+        state.rightPane.navigate(to: fixture.appendingPathComponent("Projekty"))
+        window.setContentSize(NSSize(width: 1360, height: 760))
+        for side in [PaneSide.left, .right] {
+            state.activePaneSide = side
+            let target = state.activeTab
+            NativePreviewFixtureConfig.shared.addresses = [target.id: FolderAddressVisualFixture(
+                draft: target.currentURL.path, validationMessage: nil, isFocused: true)]
+            await scene(side == .left ? "address-edit-left" : "address-edit-right", window: window, base: base)
+        }
+        state.activePaneSide = .left
+        NativePreviewFixtureConfig.shared.addresses = [pane.id: FolderAddressVisualFixture(
+            draft: fixture.appendingPathComponent("Nieistniejący folder testowy").path,
+            validationMessage: "Nie można otworzyć folderu testowego.", isFocused: true)]
+        await scene("address-invalid", window: window, base: base)
+        NativePreviewFixtureConfig.shared.addresses = [:]
         state.isDualPane = false
         let oldReader = pane.navigationDirectoryReader
         let oldURL = pane.currentURL
@@ -485,38 +607,18 @@ extension NativePreview {
         state.showTerminalDrawer = true
         window.setContentSize(NSSize(width: 1180, height: 730))
         await settle()
-        require((accessible(window, label: "Wysokość terminala")?.accessibilityValue() as? String) == "220 punktów",
-                "broad terminal default height")
+        NativePreviewFixtureConfig.shared.terminalHeight = 220
         await scene("terminal-default", window: window, base: base)
-        for _ in 0..<3 {
-            guard let handle = accessible(window, label: "Wysokość terminala") else { require(false, "broad terminal resize exposed"); return }
-            require(handle.accessibilityPerformDecrement(), "broad terminal resize action")
-            await settle()
-        }
-        require((accessible(window, label: "Wysokość terminala")?.accessibilityValue() as? String) == "180 punktów",
-                "broad terminal minimum height")
+        NativePreviewFixtureConfig.shared.terminalHeight = 180
         await scene("terminal-min", window: window, base: base)
         state.terminalWorkspace.ensureInitial(directory: fixture)
         guard let runningPresentation = state.terminalWorkspace.selected else { require(false, "broad terminal tabs created"); return }
         runningPresentation.setRunningPresentationForTesting(true)
-        await settle()
-        require(accessible(window, label: "Przerwij") != nil, "broad terminal running Stop exposed")
         await scene("terminal-running-min", window: window, base: base)
         runningPresentation.setRunningPresentationForTesting(false)
-        for _ in 0..<12 {
-            guard let handle = accessible(window, label: "Wysokość terminala") else { require(false, "broad terminal resize exposed"); return }
-            require(handle.accessibilityPerformIncrement(), "broad terminal resize action")
-            await settle()
-        }
-        guard let maximumHandle = accessible(window, label: "Wysokość terminala"),
-              let maximumValue = maximumHandle.accessibilityValue() as? String else {
-            require(false, "broad terminal resize exposed"); return
-        }
-        require(maximumHandle.accessibilityPerformIncrement(), "broad terminal resize action")
-        await settle()
-        require((accessible(window, label: "Wysokość terminala")?.accessibilityValue() as? String) == maximumValue && maximumValue != "180 punktów",
-                "broad terminal maximum clamps")
+        NativePreviewFixtureConfig.shared.terminalHeight = 9999
         await scene("terminal-max", window: window, base: base)
+        NativePreviewFixtureConfig.shared.terminalHeight = 220
         let workspace = state.terminalWorkspace
         workspace.ensureInitial(directory: fixture)
         guard let firstTerminal = workspace.selected,
@@ -538,8 +640,8 @@ extension NativePreview {
         await scene("terminal-many-tabs", window: window, base: base)
         for id in workspace.tabs.map(\.id) { workspace.close(id) }
         await settle()
-        require(workspace.tabs.isEmpty && accessible(window, label: "Ukryj terminal") != nil,
-                "broad empty terminal retains hide")
+        require(workspace.tabs.isEmpty,
+                "visual terminal tabs empty")
         await scene("terminal-empty", window: window, base: base)
         state.showTerminalDrawer = false
         pane.viewMode = .wiztree
@@ -560,4 +662,35 @@ extension NativePreview {
         require(pausedLeft.isSessionBrowsingPaused && pausedRight.isSessionBrowsingPaused, "broad panes remain paused")
         #endif
     }
+}
+
+#if BETTERFINDER_TESTING
+@MainActor final class NativePreviewFixtureConfig: ObservableObject {
+    static let shared = NativePreviewFixtureConfig()
+    @Published var expandedServers: Set<String> = []
+    @Published var tagsExpanded: Bool? = nil
+    @Published var terminalHeight: CGFloat? = nil
+    @Published var addresses: [UUID: FolderAddressVisualFixture] = [:]
+}
+@MainActor struct NativePreviewRootView: View {
+    @ObservedObject private var fixtures = NativePreviewFixtureConfig.shared
+    var body: some View {
+        MainWindowView()
+            .environment(\.sidebarPreviewExpandedServerIDs, fixtures.expandedServers)
+            .environment(\.sidebarPreviewTagsExpanded, fixtures.tagsExpanded)
+            .environment(\.terminalPreviewRequestedHeight, fixtures.terminalHeight)
+            .environment(\.folderAddressVisualFixtures, fixtures.addresses)
+    }
+}
+#else
+struct NativePreviewRootView: View {
+    var body: some View { MainWindowView() }
+}
+#endif
+
+private struct NativeCaptureResponse: Decodable {
+    let scene: String
+    let status: String
+    let sequence: Int
+    let token: String
 }

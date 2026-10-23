@@ -30,12 +30,67 @@ struct BreadcrumbLayoutMetrics {
     }
 }
 
+#if BETTERFINDER_TESTING
+/// Screenshot-only presentation. This does not exercise editing, keyboard routing,
+/// validation or native focus; interaction tests must leave the environment empty.
+struct FolderAddressVisualFixture: Sendable {
+    let draft: String
+    var validationMessage: String? = nil
+    var isFocused: Bool = true
+}
+
+private struct FolderAddressVisualFixturesKey: EnvironmentKey {
+    static let defaultValue: [UUID: FolderAddressVisualFixture] = [:]
+}
+
+extension EnvironmentValues {
+    var folderAddressVisualFixtures: [UUID: FolderAddressVisualFixture] {
+        get { self[FolderAddressVisualFixturesKey.self] }
+        set { self[FolderAddressVisualFixturesKey.self] = newValue }
+    }
+}
+#endif
+
 public struct PathBreadcrumbBar: View {
     @ObservedObject var appState: AppState
     @ObservedObject var pane: PaneTabState
     @ViewState private var editablePathText: String = ""
     @ViewState private var pathValidationMessage: String? = nil
     @ViewState private var isPathFieldFocused = false
+
+    #if BETTERFINDER_TESTING
+    @Environment(\.folderAddressVisualFixtures) private var visualFixtures
+    private var visualFixture: FolderAddressVisualFixture? { visualFixtures[pane.id] }
+    #endif
+
+    private var isVisualFixture: Bool {
+        #if BETTERFINDER_TESTING
+        return visualFixture != nil
+        #else
+        return false
+        #endif
+    }
+
+    private var displayedText: Binding<String> {
+        #if BETTERFINDER_TESTING
+        if let visualFixture { return .constant(visualFixture.draft) }
+        #endif
+        return $editablePathText
+    }
+
+    private var displayedValidationMessage: String? {
+        #if BETTERFINDER_TESTING
+        if let visualFixture { return visualFixture.validationMessage }
+        #endif
+        return pathValidationMessage
+    }
+
+    private var displayedFocus: Bool {
+        #if BETTERFINDER_TESTING
+        if let visualFixture { return visualFixture.isFocused }
+        #endif
+        return isPathFieldFocused
+    }
 
     public init(appState: AppState, pane: PaneTabState) {
         self.appState = appState
@@ -70,8 +125,8 @@ public struct PathBreadcrumbBar: View {
                 folderActionsMenu
             }
 
-            if pane.isEditingPathBar, let pathValidationMessage {
-                Label(pathValidationMessage, systemImage: "exclamationmark.circle")
+            if pane.isEditingPathBar || isVisualFixture, let message = displayedValidationMessage {
+                Label(message, systemImage: "exclamationmark.circle")
                     .foregroundStyle(.red)
                     .font(FinderUI.captionFont)
                     .textSelection(.enabled)
@@ -86,6 +141,7 @@ public struct PathBreadcrumbBar: View {
         .overlay(alignment: .bottom) {
             Divider()
         }
+        .allowsHitTesting(!isVisualFixture)
         .onAppear { editablePathText = pane.currentURL.path }
         .onChange(of: pane.isEditingPathBar) { _, editing in
             if !editing { resetEditor() }
@@ -112,10 +168,10 @@ public struct PathBreadcrumbBar: View {
                 .accessibilityHidden(true)
 
             FolderAddressTextField(
-                text: $editablePathText,
-                isEditing: pane.isEditingPathBar,
+                text: displayedText,
+                isEditing: !isVisualFixture && pane.isEditingPathBar,
                 focusRequest: pane.pathEditRequest,
-                mayFocus: { pane.isEditingPathBar && appState.activeTab.id == pane.id },
+                mayFocus: { !isVisualFixture && pane.isEditingPathBar && appState.activeTab.id == pane.id },
                 beginEditing: {
                     activatePane()
                     pane.isEditingPathBar = true
@@ -129,7 +185,7 @@ public struct PathBreadcrumbBar: View {
             .frame(minWidth: 40, maxWidth: .infinity, minHeight: 24)
             .help("Kliknij, aby edytować lub skopiować ścieżkę (⌘L). Return otwiera folder, Escape anuluje. Obsługuje ~ i adresy file:///.")
 
-            if pane.isEditingPathBar {
+            if pane.isEditingPathBar || isVisualFixture {
                 pathActionButton(icon: "arrow.right", label: "Otwórz wpisany folder", help: "Otwórz folder (Return)", action: submitPath)
                     .accessibilityIdentifier("folder.address.go")
                 pathActionButton(icon: "xmark", label: "Anuluj edycję ścieżki", help: "Anuluj (Escape)", action: cancelEditing)
@@ -141,7 +197,7 @@ public struct PathBreadcrumbBar: View {
         .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: FinderUI.cornerRadius))
         .overlay {
             RoundedRectangle(cornerRadius: FinderUI.cornerRadius)
-                .strokeBorder(pathValidationMessage != nil ? Color.red : (isPathFieldFocused ? Color.accentColor : Color.secondary.opacity(0.25)), lineWidth: 1)
+                .strokeBorder(displayedValidationMessage != nil ? Color.red : (displayedFocus ? Color.accentColor : Color.secondary.opacity(0.25)), lineWidth: 1)
         }
     }
 

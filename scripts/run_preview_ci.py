@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Bounded, synthetic-only execution of the existing native preview harness.
 
-This is not desktop capture, Accessibility automation, or a permission grant.
+Only the retained synthetic app window may be captured; no full-screen capture,
+global Accessibility automation, or permission grant.
 Run only on an ephemeral GitHub-hosted macOS runner after code gates pass.
 """
 import os
 import json
 import re
 import stat
+import secrets
 import re
 import ctypes
 import errno
@@ -223,8 +225,8 @@ RETENTION_READY = False
 CENSUS = None
 END = 0.0
 SOURCE_PINS = {
-    'scripts/preview_app.sh': 'e2508373f2385a04cd29026a38926197d1b245efa19c18e9bfc5bd2eee3761df',
-    'scripts/preview_app.swift': '02dc2af9a833946bb1aad3ed87bece88335835c1c4755dcb6ff4dc7a8fe1dfeb',
+    'scripts/preview_app.sh': '5d2c32aabf0ad60fa5bd7504a83f1c190b32a3c8a9c9a499fa0acc4c45fff998',
+    'scripts/preview_app.swift': '5501addceba350f05cdfe2d4f0f2464415d1661fd06d007e98ff0b54e983bd89',
 }
 
 
@@ -269,11 +271,26 @@ def prepare_ownership():
     CENSUS = (library, function)
 
 
+def target_valid(argv, env):
+    if argv in (['/bin/zsh', 'scripts/preview_app.sh'], ['/usr/bin/true']): return True
+    return (len(argv) == 6 and argv[:4] == ['/usr/sbin/screencapture', '-x', '-o', '-l']
+            and re.fullmatch(r'[1-9][0-9]{0,9}', argv[4]) is not None
+            and int(argv[4]) <= 2147483647
+            and argv[5] in [str(Path(env.get('BETTERFINDER_PREVIEW_OUTPUT', '')) / ('composited-' + name)) for name in FILES]
+            and os.path.isabs(env.get('BETTERFINDER_PREVIEW_OUTPUT', '')))
+
+
 START_SHIM = r'''
-import os, sys, signal, select, time
+import os, sys, signal, select, time, re
 try:
     fd = int(sys.argv[1]); end = float(sys.argv[2]); argv = sys.argv[3:]
-    if fd < 3 or argv not in (['/bin/zsh', 'scripts/preview_app.sh'], ['/usr/bin/true']): os._exit(120)
+    fixed = argv in (['/bin/zsh', 'scripts/preview_app.sh'], ['/usr/bin/true'])
+    names = SCENE_NAMES
+    capture = (len(argv) == 6 and argv[:4] == ['/usr/sbin/screencapture', '-x', '-o', '-l']
+        and re.fullmatch(r'[1-9][0-9]{0,9}', argv[4]) is not None and int(argv[4]) <= 2147483647
+        and os.path.isabs(os.environ.get('BETTERFINDER_PREVIEW_OUTPUT', ''))
+        and argv[5] in [os.path.join(os.environ['BETTERFINDER_PREVIEW_OUTPUT'], 'composited-' + name) for name in names])
+    if fd < 3 or not (fixed or capture): os._exit(120)
     os.set_inheritable(fd, False); os.set_blocking(fd, False)
     while True:
         remaining = end - time.monotonic()
@@ -296,6 +313,7 @@ except BaseException:
     os._exit(123)
 '''
 
+START_SHIM = START_SHIM.replace('SCENE_NAMES', repr(FILES))
 
 class PreviewResources:
     def __init__(self):
@@ -362,6 +380,7 @@ class OwnedPreview:
         self.exit_seen = self.reaped = self.verified = self.uncertain = False
         self.attempted = self.cleanup_started = False
         self.code = None
+        self.deadline = None
         resources.owners.append(self)  # Before any allocation or partial launch.
 
     def close_fd(self, name):
@@ -379,11 +398,13 @@ class OwnedPreview:
             except BaseException: errors = True
         checked(not errors, 'gate-close-unverified')
 
-    def launch(self, argv, env, log, hold=False):
+    def launch(self, argv, env, log, hold=False, deadline=None):
         checked(RETENTION_READY and signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL and threading.active_count() == 1, 'retention-contract')
-        checked(argv in (['/bin/zsh', 'scripts/preview_app.sh'], ['/usr/bin/true']), 'target-identity')
+        checked(target_valid(argv, env), 'target-identity')
         checked(os.path.isabs(sys.executable) and signal.getsignal(signal.SIGPIPE) == signal.SIG_IGN, 'interpreter-contract')
         created = time.monotonic(); release_end = min(created + 1, END - 6); shim_end = min(created + 2, END - 6)
+        if deadline is not None:
+            release_end = min(release_end, deadline); shim_end = min(shim_end, deadline)
         checked(not CANCELLED and created < release_end, 'launch-budget')
         self.gate_read, self.gate_write = os.pipe()
         os.set_inheritable(self.gate_read, False); os.set_inheritable(self.gate_write, False)
@@ -448,6 +469,7 @@ class OwnedPreview:
         checked(not CANCELLED and time.monotonic() < deadline, 'run-timeout-or-cancel')
 
     def cleanup(self):
+        cleanup_end = min(END, self.deadline) if self.deadline is not None else END
         # Every call closes still-owned descriptors, but never signals after reap.
         try: self.close_gates()
         except BaseException: self.uncertain = True
@@ -467,10 +489,10 @@ class OwnedPreview:
                         except BaseException: resolved = False
                         if not resolved: self.uncertain = True
                     else: self.uncertain = True
-                until = min(time.monotonic() + grace, END)
+                until = min(time.monotonic() + grace, cleanup_end)
                 while time.monotonic() < until: time.sleep(.005)
             proof = False
-            until = min(time.monotonic() + 3, END - 1)
+            until = min(time.monotonic() + 3, cleanup_end - (.1 if self.deadline is not None else 1))
             while time.monotonic() < until and not self.uncertain:
                 try: exited = self.observe()
                 except BaseException: self.uncertain = True; break
@@ -483,8 +505,8 @@ class OwnedPreview:
             # Reap only after all signaling/proof attempts; never infer group
             # completion merely from this wait. Uncertainty remains sticky.
             try:
-                checked(time.monotonic() < END, 'cleanup-deadline')
-                self.code = self.process.wait(timeout=min(1, END - time.monotonic()))
+                checked(time.monotonic() < cleanup_end, 'cleanup-deadline')
+                self.code = self.process.wait(timeout=min(1, cleanup_end - time.monotonic()))
                 self.reaped = True
             except BaseException: self.uncertain = True
         elif not self.verified:
@@ -496,6 +518,100 @@ class OwnedPreview:
         safe = self.verified and not self.uncertain and (self.process is None or self.reaped)
         if safe and self in self.resources.owners: self.resources.owners.remove(self)
         checked(safe, 'group-cleanup-unverified')
+
+
+class CaptureService:
+    """Pinned Swift lifetime assurance on ephemeral runner, not atomic OS ownership."""
+    def __init__(self, resources, preview, output, env, log, token):
+        self.resources, self.preview, self.output = resources, preview, output
+        self.env, self.log, self.token = env, log, token
+        self.sequence = 0
+        self.pid = None
+        self.seen = set()
+        self.composited = []
+        self.disabled = False
+        self.spent = 0.0
+
+    def app_alive(self):
+        # Targeted bound PID only. No enumeration or signaling. The retained
+        # shell may outlive the Swift app while completing its own trap/marker.
+        if self.pid is None or self.preview.observe(): return False
+        try: return os.getpgid(self.pid) == self.preview.process.pid
+        except OSError: return False
+
+    def service(self):
+        request = self.output / 'capture-request.json'
+        if not request.exists() and not request.is_symlink(): return
+        checked(not CANCELLED and time.monotonic() < END - 6, 'capture-budget')
+        def pairs(values):
+            result = {}
+            for key, value in values:
+                checked(key not in result, 'capture-request-schema')
+                result[key] = value
+            return result
+        data = json.loads(bounded_regular(request, 1024), object_pairs_hook=pairs)
+        checked(type(data) is dict and set(data) == {'scene','window','pid','sequence','token'}, 'capture-request-schema')
+        scene, window, pid = data['scene'], data['window'], data['pid']
+        checked(type(scene) is str and scene in FILES and scene not in self.seen, 'capture-scene')
+        checked(type(window) is int and 0 < window <= 2147483647, 'capture-window')
+        checked(type(pid) is int and 1 < pid <= 2147483647, 'capture-app-pid')
+        checked(type(data['sequence']) is int and data['sequence'] == self.sequence + 1, 'capture-sequence')
+        checked(type(data['token']) is str and data['token'] == self.token, 'capture-token')
+        checked(not self.preview.observe(), 'capture-preview-exited')
+        checked(os.getpgid(pid) == self.preview.process.pid, 'capture-app-group')
+        checked(self.pid is None or self.pid == pid, 'capture-app-identity')
+        self.pid = pid; self.sequence += 1; self.seen.add(scene)
+        request.unlink()
+        destination = self.output / ('composited-' + scene)
+        checked(not destination.exists() and not destination.is_symlink(), 'capture-output-exists')
+        status = 'unsupported'
+        if not self.disabled and 10 - self.spent >= 2:
+            begin = time.monotonic()
+            end = min(begin + 2, END - 6)
+            checked(end - begin >= 2, 'capture-budget')
+            owner = OwnedPreview(self.resources)
+            owner.deadline = end
+            completed = False
+            try:
+                owner.launch(['/usr/sbin/screencapture','-x','-o','-l',str(window),str(destination)],
+                             self.env, self.log, deadline=end - .5)
+                while time.monotonic() < end - .5 and not CANCELLED:
+                    if self.preview.observe(): break
+                    if owner.observe(): completed = True; break
+                    time.sleep(.01)
+            finally:
+                owner.cleanup()  # Unverified cleanup raises, never unsupported.
+                self.spent += time.monotonic() - begin
+            checked(not CANCELLED and time.monotonic() < end, 'capture-budget-or-cancel')
+            if (completed and owner.code == 0 and self.app_alive()
+                    and destination.exists() and not destination.is_symlink()):
+                # Content is still synthetic; only fixed PNG format/size accepted.
+                try:
+                    png = bounded_regular(destination, MAX_BYTES)
+                    checked(len(png) >= 24 and png[:8] == b'\x89PNG\r\n\x1a\n' and png[12:16] == b'IHDR', 'capture-png')
+                    width, height = struct.unpack('>II', png[16:24])
+                    checked(1 <= width <= 3000 and 1 <= height <= 2200, 'capture-dimensions')
+                    status = 'composited'
+                except PreviewFailure:
+                    status = 'unsupported'
+        if status != 'composited':
+            self.disabled = True
+            if destination.exists() or destination.is_symlink(): destination.unlink()
+        else:
+            self.composited.append(scene)
+        # App exit observed through service always discards pixels. No claim of
+        # atomic crash-proof ID ownership between these checks and native capture.
+        if not self.app_alive():
+            status = 'unsupported'; self.disabled = True
+            if scene in self.composited: self.composited.remove(scene)
+            if destination.exists() or destination.is_symlink(): destination.unlink()
+        checked(not CANCELLED and time.monotonic() < END - 6, 'capture-budget')
+        response = self.output / 'capture-response.json'
+        checked(not response.exists() and not response.is_symlink(), 'capture-response-replay')
+        temporary = self.output / 'capture-response.pending'
+        with temporary.open('xb') as stream:
+            stream.write(json.dumps({'scene':scene,'sequence':self.sequence,'token':self.token,'status':status}, sort_keys=True).encode('ascii'))
+        temporary.rename(response)
 
 
 def gate_control(resources, env, log):
@@ -519,13 +635,21 @@ def interrupted(signum, frame):
     CANCELLED = True
 
 
+def requested_mode():
+    args = sys.argv[1:]
+    if not args: return 'visual'
+    checked(args in (['--mode','visual'], ['--mode','interaction']), 'mode-invalid')
+    return args[1]
+
+
 def main():
+    mode = requested_mode()
     global END, CANCELLED
     END = time.monotonic() + 240
     CANCELLED = False
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
         raise PreviewFailure("Use only an ephemeral GitHub-hosted macOS runner")
-    if DEST.exists() or DIAG_DEST.exists():
+    if mode == 'visual' and (DEST.exists() or DIAG_DEST.exists()):
         raise PreviewFailure("Artifact directory already exists; use a fresh checkout")
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
@@ -541,6 +665,9 @@ def main():
         env.update(HOME=str(home), CFFIXED_USER_HOME=str(home), TMPDIR=str(scratch) + "/",
                    BETTERFINDER_PREVIEW_CI="1", BETTERFINDER_PREVIEW_OUTPUT=str(output),
                    BETTERFINDER_TEST_ROOT=str(output / "Pracownia"))
+        token = secrets.token_hex(16)
+        env.update(BETTERFINDER_PREVIEW_MODE=mode, BETTERFINDER_CAPTURE_TOKEN=token)
+        service = None
         process = None
         try:
             # Do not publish compiler/runtime logs or environment values.
@@ -549,12 +676,22 @@ def main():
                 gate_control(resources, env, log)
                 process = OwnedPreview(resources)
                 process.launch(['/bin/zsh', 'scripts/preview_app.sh'], env, log)
-                process.wait_exit(END - 6)
+                if mode == 'visual':
+                    service = CaptureService(resources, process, output, env, log, token)
+                    while not process.observe():
+                        checked(not CANCELLED and time.monotonic() < END - 6, 'run-timeout-or-cancel')
+                        service.service()
+                        time.sleep(.01)
+                    checked(not CANCELLED and time.monotonic() < END - 6, 'run-timeout-or-cancel')
+                else:
+                    process.wait_exit(END - 6)
                 process.cleanup()
                 code = process.code
                 if code:
                     marker = output / "verification.txt"
                     allowed = {
+                        'visual rename sheet exposed',
+                        'visual terminal tabs empty',
                         'broad Trash must not navigate',
                         'broad address Escape preserves both panes',
                         'broad address editor focused',
@@ -616,7 +753,7 @@ def main():
                     })
                     if marker.is_file() and not marker.is_symlink() and marker.stat().st_size <= 2048:
                         message = bounded_regular(marker, 2048).decode("utf8").removeprefix("FAIL: ").strip()
-                        if message in DIAG_FAILURES:
+                        if mode == 'visual' and message in DIAG_FAILURES:
                             try:
                                 payload = diagnostic_payload(output, message)
                                 resources.stage(payload, diagnostic=True)
@@ -632,37 +769,44 @@ def main():
                     raise PreviewFailure("Native preview failed (exit %d); last stage: %s; fixed log evidence: %s; no artifact published" % (code, last_stage(output), log_evidence(log_path)))
         finally:
             stop(process)
-        verification = output / "verification.txt"
-        if not verification.is_file() or verification.stat().st_size > 2048 or not verification.read_text().startswith("PASS native window,"):
-            raise PreviewFailure("Missing native preview PASS marker")
-        total = 0
-        for name in FILES:
-            file = output / name
-            if file.is_symlink() or not file.is_file():
-                raise PreviewFailure("Missing expected native render: " + name)
-            size = file.stat().st_size
-            total += size
-            if size < 24 or total > MAX_BYTES:
-                raise PreviewFailure("Native renders exceed the 8 MiB artifact bound")
-            with file.open("rb") as stream:
-                header = stream.read(24)
-            if header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
-                raise PreviewFailure("Invalid native PNG: " + name)
-            width, height = struct.unpack(">II", header[16:24])
-            if not (1 <= width <= 3000 and 1 <= height <= 2200):
-                raise PreviewFailure("Unexpected render dimensions: " + name)
-        payload = {name: (output / name).read_bytes() for name in FILES}
-        # Deliberately fixed verification text: never copy logs or environment paths.
-        payload["verification.txt"] = (
-            "PASS: native app window and in-process keyboard assertions using application-level synthetic-fixture isolation.\n"
-            "33 native AppKit view renders from synthetic fixtures.\n"
-            "Running terminal scene is test-only presentation; no command executes and Stop behavior is not proven.\n"
-            "Test startup uses synthetic pane roots and an isolated preference suite; mounted-volume discovery and automatic indexing are disabled.\n"
-            "Not an OS sandbox or proof that all macOS global/preference accesses are blocked; an ephemeral hosted runner is required.\n"
-            "In-process native text-key and accessibility actions only; no desktop capture, global keyboard injection or OS permission automation.\n"
-            "Not proof of global menu shortcuts, mouse drag, VoiceOver, rename submission, persistence, real network discovery, external drag/drop, Quick Look or thumbnail correctness.\n").encode("utf8")
-        resources.stage(payload)
-    print("PASS: 33 isolated native view renders; PNG payload %d bytes; total artifact including verification is bounded to 8 MiB." % total)
+        if mode == 'interaction':
+            marker = bounded_regular(output / 'interaction-verification.txt', 512)
+            checked(marker == b'PASS native keyboard/address subset; AX disclosure and resize not verified', 'interaction-marker')
+            # No visual staging or destination mutation in this independent phase.
+        else:
+            verification = bounded_regular(output / 'verification.txt', 512)
+            checked(verification == b'PASS visual-fixtures-only: 33 synthetic scenes; AX disclosure/resize interactions not verified', 'visual-marker')
+            checked(service is not None and service.seen == set(FILES) and service.sequence == 33, 'capture-scene-completeness')
+            payload = {}
+            total = 0
+            for name in FILES + ('light-cacheDisplay.png',):
+                data = bounded_regular(output / name, MAX_BYTES)
+                total += len(data)
+                checked(len(data) >= 24 and total <= MAX_BYTES, 'render-total-bound')
+                checked(data[:8] == b'\x89PNG\r\n\x1a\n' and data[12:16] == b'IHDR', 'render-png')
+                width, height = struct.unpack('>II', data[16:24])
+                checked(1 <= width <= 3000 and 1 <= height <= 2200, 'render-dimensions')
+                payload[name] = data
+            # Fixed coverage statements; no inferred interaction or toolbar pass.
+            payload['verification.txt'] = (
+                'PASS visual-fixtures-only: 33 synthetic scenes plus one cacheDisplay comparison.\n'
+                'AX disclosure/resize and keyboard/address interactions are NOT verified by this visual phase.\n'
+                'Own synthetic NSWindow compositor capture only; no full-screen capture or permission grants.\n'
+                'Bitmap fallback means toolbar-unverified; cacheDisplay alone is not evidence of an application defect.\n'
+                'Trusted pinned Swift retains each window until acknowledgement; not atomic ownership against abrupt crash/window-ID reuse.\n'
+                'Isolated synthetic HOME/preferences; no real network, terminal command, user files or devices.\n'
+                'Composited scenes: ' + str(len(service.composited)) + '/33.\n'
+                'Separate interaction phase runs after this artifact upload and cannot change this coverage.\n'
+            ).encode('ascii')
+            payload['capture-coverage.json'] = (json.dumps({'schema':1,'mode':'visual-fixtures-only',
+                'composited':service.composited,'bitmap_toolbar_unverified':[name for name in FILES if name not in service.composited],
+                'comparison':'light-cacheDisplay.png','interaction_pass':False}, sort_keys=True) + '\n').encode('ascii')
+            checked(sum(map(len,payload.values())) <= 8*1024*1024, 'artifact-total-bound')
+            resources.stage(payload)
+    if mode == 'interaction':
+        print('PASS: isolated native keyboard/address subset; AX disclosure/resize not verified; no visual artifact staged.')
+    else:
+        print('PASS: 33 isolated visual fixture scenes plus paired bitmap; interaction coverage separate; artifact bounded to 8 MiB.')
 
 
 def cli():

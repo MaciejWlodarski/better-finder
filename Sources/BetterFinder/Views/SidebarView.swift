@@ -11,6 +11,7 @@ public struct SidebarView: View {
     @ViewState private var dropTargetedPath: String? = nil
     @ViewState private var isPinDropTargeted = false
     @ViewState private var isFavoriteEndTargeted = false
+    @ViewState private var areTagsExpanded = false
     @ViewState private var expandedServers: Set<String> = []
     @ViewState private var draggedFavoriteID: String? = nil
     @ViewState private var favoriteDragNonce: UUID? = nil
@@ -18,6 +19,11 @@ public struct SidebarView: View {
     @ViewState private var favoriteTitle = ""
     @ViewState private var favoriteOpenNotice: String?
     private let favoriteDragType = UTType(importedAs: "com.betterfinder.favorite-order")
+
+    #if BETTERFINDER_TESTING
+    @Environment(\.sidebarPreviewExpandedServerIDs) private var previewExpandedServerIDs
+    @Environment(\.sidebarPreviewTagsExpanded) private var previewTagsExpanded
+    #endif
 
     public init(appState: AppState, activeTab: PaneTabState) {
         self.appState = appState
@@ -27,45 +33,11 @@ public struct SidebarView: View {
     public var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: FinderUI.sidebarSectionGap) {
+                VStack(alignment: .leading, spacing: 0) {
                     favoritesSection
-
-                    VStack(alignment: .leading, spacing: FinderUI.sidebarRowGap) {
-                        sidebarSectionHeader("Tagi")
-                        ForEach(FinderTagColor.allCases) { tagColor in
-                            tagRow(tagColor)
-                        }
-                    }
-
-                    VStack(alignment: .leading, spacing: FinderUI.sidebarRowGap) {
-                        sidebarSectionHeader("Miejsca")
-                        if let notice = appState.volumeInventory.notice {
-                            Text(notice)
-                                .font(FinderUI.detailFont)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, FinderUI.rowSpacing)
-                        }
-                        if appState.volumeInventory.canShowEmpty {
-                            Text("Brak dostępnych woluminów")
-                                .font(FinderUI.detailFont)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, FinderUI.rowSpacing)
-                        } else {
-                            ForEach(appState.localMountedVolumes) { volume in
-                                volumeRow(volume)
-                            }
-                            ForEach(appState.networkServerGroups) { server in
-                                if server.isServerKnown {
-                                    networkServerRow(server)
-                                } else {
-                                    ForEach(server.volumes) { volume in
-                                        volumeRow(volume)
-                                            .help("Udział sieciowy. Nie udało się ustalić serwera.")
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    favoriteSectionSpacing
+                    placesSection
+                    tagsSection.padding(.top, FinderUI.sidebarSectionGap)
                 }
                 .padding(.horizontal, FinderUI.sidebarInset)
                 .padding(.top, FinderUI.chromeInset)
@@ -94,6 +66,96 @@ public struct SidebarView: View {
         } message: {
             Text("Zmienia tylko nazwę na pasku bocznym, nie nazwę folderu na dysku.")
         }
+    }
+
+    private var placesSection: some View {
+        VStack(alignment: .leading, spacing: FinderUI.sidebarRowGap) {
+            sidebarSectionHeader("Miejsca")
+            if let notice = appState.volumeInventory.notice {
+                Text(notice)
+                    .font(FinderUI.detailFont)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, FinderUI.rowSpacing)
+            }
+            if appState.volumeInventory.canShowEmpty {
+                Text("Brak dostępnych woluminów")
+                    .font(FinderUI.detailFont)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, FinderUI.rowSpacing)
+            } else {
+                ForEach(appState.localMountedVolumes) { volume in
+                    volumeRow(volume)
+                }
+                ForEach(appState.networkServerGroups) { server in
+                    if server.isServerKnown {
+                        networkServerRow(server)
+                    } else {
+                        ForEach(server.volumes) { volume in
+                            volumeRow(volume)
+                                .help("Udział sieciowy. Nie udało się ustalić serwera.")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var tagsAreExpanded: Bool {
+        #if BETTERFINDER_TESTING
+        if let previewTagsExpanded { return previewTagsExpanded }
+        #endif
+        return areTagsExpanded
+    }
+
+    private var tagsSection: some View {
+        VStack(alignment: .leading, spacing: FinderUI.sidebarRowGap) {
+            Button { areTagsExpanded.toggle() } label: {
+                HStack {
+                    Text("Tagi").font(FinderUI.captionFont.weight(.semibold))
+                    Spacer(minLength: 0)
+                    Image(systemName: tagsAreExpanded ? "chevron.down" : "chevron.right")
+                        .font(FinderUI.captionFont.weight(.semibold))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, FinderUI.sidebarRowInset)
+                .frame(minHeight: FinderUI.sidebarRowHeight)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Tagi")
+            .accessibilityValue(tagsAreExpanded ? "Rozwinięte" : "Zwinięte")
+            .accessibilityHint("Pokaż lub ukryj siedem kolorów tagów")
+            if tagsAreExpanded {
+                ForEach(FinderTagColor.allCases) { tagColor in tagRow(tagColor) }
+            }
+        }
+    }
+
+    // The append target occupies the existing section gap, not an extra row.
+    private var favoriteSectionSpacing: some View {
+        ZStack {
+            Color.clear
+            if !appState.favorites.isEmpty {
+                Rectangle()
+                    .fill(isFavoriteEndTargeted ? Color.accentColor : Color.clear)
+                    .frame(height: 2)
+                    .padding(.vertical, 5)
+                    .contentShape(Rectangle())
+                    .accessibilityHidden(true)
+                    .onDrop(of: [favoriteDragType], isTargeted: $isFavoriteEndTargeted) { providers in
+                        reorderFavorite(providers: providers, beforeID: nil)
+                    }
+            }
+        }
+        .frame(height: FinderUI.sidebarSectionGap)
+        .accessibilityHidden(true)
+    }
+
+    private func isServerExpanded(_ serverID: String) -> Bool {
+        #if BETTERFINDER_TESTING
+        if previewExpandedServerIDs.contains(serverID) { return true }
+        #endif
+        return expandedServers.contains(serverID)
     }
 
     private var favoritesSection: some View {
@@ -132,17 +194,6 @@ public struct SidebarView: View {
                     .padding(.horizontal, FinderUI.sidebarRowInset)
             }
             ForEach(appState.favorites) { item in sidebarLocationRow(item) }
-            if !appState.favorites.isEmpty {
-                Rectangle()
-                    .fill(isFavoriteEndTargeted ? Color.accentColor : Color.clear)
-                    .frame(height: 2)
-                    .padding(.vertical, 5)
-                    .contentShape(Rectangle())
-                    .accessibilityHidden(true)
-                    .onDrop(of: [favoriteDragType], isTargeted: $isFavoriteEndTargeted) { providers in
-                        reorderFavorite(providers: providers, beforeID: nil)
-                    }
-            }
             if appState.favorites.isEmpty && appState.pinnedFolderNotice == nil {
                 Button(action: chooseFavoriteFolder) {
                     Label("Dodaj folder…", systemImage: "folder.badge.plus")
@@ -365,7 +416,7 @@ public struct SidebarView: View {
     }
 
     private func networkServerRow(_ server: NetworkVolumeGroup) -> some View {
-        let expanded = expandedServers.contains(server.id)
+        let expanded = isServerExpanded(server.id)
         return VStack(alignment: .leading, spacing: FinderUI.sidebarRowGap) {
             Button {
                 if expanded { expandedServers.remove(server.id) }
@@ -594,3 +645,24 @@ public struct SidebarView: View {
         .padding(.vertical, FinderUI.chromeInset)
     }
 }
+
+#if BETTERFINDER_TESTING
+// Explicit presentation fixtures only. These keys do not simulate interaction,
+// mutate persistence, discover volumes, or exist in the production binary.
+private struct SidebarPreviewExpandedServerIDsKey: EnvironmentKey {
+    static let defaultValue: Set<String> = []
+}
+private struct SidebarPreviewTagsExpandedKey: EnvironmentKey {
+    static let defaultValue: Bool? = nil
+}
+extension EnvironmentValues {
+    var sidebarPreviewExpandedServerIDs: Set<String> {
+        get { self[SidebarPreviewExpandedServerIDsKey.self] }
+        set { self[SidebarPreviewExpandedServerIDsKey.self] = newValue }
+    }
+    var sidebarPreviewTagsExpanded: Bool? {
+        get { self[SidebarPreviewTagsExpandedKey.self] }
+        set { self[SidebarPreviewTagsExpandedKey.self] = newValue }
+    }
+}
+#endif

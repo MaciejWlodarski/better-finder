@@ -35,12 +35,12 @@ jobs:
         run: zsh ./scripts/run_tests.sh
       - name: Run direct-delegate live terminal integration
         run: zsh ./scripts/run_terminal_live_integration.sh
-      - name: Render isolated broad native preview
+      - name: Render isolated visual-only synthetic fixtures
         id: native_preview
         timeout-minutes: 5
         env:
           BF_PREVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 scripts/run_preview_ci.py
+        run: python3 scripts/run_preview_ci.py --mode visual
       - name: Upload bounded synthetic native renders
         if: success() && steps.native_preview.outcome == 'success'
         uses: actions/upload-artifact@v4
@@ -50,6 +50,10 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+      - name: Verify isolated keyboard and address interaction subset
+        if: success() && steps.native_preview.outcome == 'success'
+        timeout-minutes: 5
+        run: python3 scripts/run_preview_ci.py --mode interaction
       - name: Upload bounded synthetic failure diagnostic
         if: failure() && steps.native_preview.outcome == 'failure' && steps.native_preview.outputs.diagnostic_ready == 'true'
         uses: actions/upload-artifact@v4

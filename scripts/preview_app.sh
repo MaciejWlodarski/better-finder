@@ -21,7 +21,7 @@ plutil -replace CFBundleExecutable -string NativePreview "${PREVIEW_APP}/Content
 plutil -replace CFBundleIdentifier -string com.betterfinder.preview "${PREVIEW_APP}/Contents/Info.plist"
 rm -f -- "${PREVIEW_OUTPUT}/verification.txt"
 # Keep the real App/Scene and command definitions; the harness supplies main().
-sed '/^@main$/d' Sources/BetterFinder/BetterFinderApp.swift > "${PREVIEW_TMP_DIR}/App.swift"
+sed -e '/^@main$/d' -e 's/MainWindowView()/NativePreviewRootView()/g' Sources/BetterFinder/BetterFinderApp.swift > "${PREVIEW_TMP_DIR}/App.swift"
 preview_stage compile-harness
 xcrun swiftc -parse-as-library "${PREVIEW_FLAGS[@]}" \
     -module-cache-path "${PWD}/.build/preview-module-cache" \
@@ -41,4 +41,8 @@ else
         --env "BETTERFINDER_PREVIEW_OUTPUT=${PREVIEW_OUTPUT}" "${PREVIEW_APP}"
     cat "${PREVIEW_TMP_DIR}/preview.log" "${PREVIEW_TMP_DIR}/preview.err"
 fi
-[[ -f "${PREVIEW_OUTPUT}/verification.txt" ]] && [[ "$(<"${PREVIEW_OUTPUT}/verification.txt")" == PASS* ]]
+if [[ "${BETTERFINDER_PREVIEW_MODE:-visual}" == interaction ]]; then
+    [[ -f "${PREVIEW_OUTPUT}/interaction-verification.txt" ]] && [[ "$(<"${PREVIEW_OUTPUT}/interaction-verification.txt")" == "PASS native keyboard/address subset; AX disclosure and resize not verified" ]]
+else
+    [[ -f "${PREVIEW_OUTPUT}/verification.txt" ]] && [[ "$(<"${PREVIEW_OUTPUT}/verification.txt")" == "PASS visual-fixtures-only: 33 synthetic scenes; AX disclosure/resize interactions not verified" ]]
+fi

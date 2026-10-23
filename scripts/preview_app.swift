@@ -248,7 +248,7 @@ extension NativePreview {
             if let window = object as? NSWindow, let content = window.contentView,
                queue.count < 2048 { queue.append(content) }
             if let view = object as? NSView {
-                queue.append(contentsOf: view.subviews.prefix(max(0, 2048 - queue.count)))
+                for child in view.subviews.prefix(max(0, 2048 - queue.count)) { queue.append(child) }
             }
             if let item = object as? any NSAccessibilityProtocol {
                 if item.accessibilityLabel() == label { return item }
@@ -279,7 +279,7 @@ extension NativePreview {
                 let children = view.subviews
                 let remaining = max(0, 2048 - queue.count)
                 truncated = truncated || children.count > remaining
-                queue.append(contentsOf: children.prefix(remaining))
+                for child in children.prefix(remaining) { queue.append(child) }
             }
             if let item = object as? any NSAccessibilityProtocol {
                 let label = item.accessibilityLabel() ?? ""
@@ -288,7 +288,7 @@ extension NativePreview {
                 let children = item.accessibilityChildren() ?? []
                 let remaining = max(0, 2048 - queue.count)
                 truncated = truncated || children.count > remaining
-                queue.append(contentsOf: children.prefix(remaining))
+                for child in children.prefix(remaining) { queue.append(child) }
             }
         }
         if !fixturePresent { return "broad network exposure: fixture missing" }

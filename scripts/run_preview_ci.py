@@ -5,6 +5,7 @@ This is not desktop capture, Accessibility automation, or a permission grant.
 Run only on an ephemeral GitHub-hosted macOS runner after code gates pass.
 """
 import os
+import re
 import ctypes
 import errno
 import hashlib
@@ -71,6 +72,39 @@ def log_evidence(path):
         text = (head + b"\n" + tail).decode("utf-8", errors="replace").lower()
     except (OSError, ValueError):
         return "unavailable"
+    # Only compiler error headers for this repository's fixed synthetic harness.
+    # Never emit source excerpts, arbitrary file names, quoted values or paths.
+    compiler = []
+    for match in re.finditer(r"(?:^|\n)(?:[^\n]*[/\\])?preview_app\.swift:([0-9]{1,5}):([0-9]{1,5}): error: ([^\n]{1,1000})", text):
+        line, column = int(match.group(1)), int(match.group(2))
+        if not (1 <= line <= 10000 and 1 <= column <= 10000):
+            continue
+        message = match.group(3)
+        public_symbols = {"string", "string?", "any", "anyobject", "nsview", "nswindow",
+                          "nsaccessibilityprotocol", "accessibilitylabel", "accessibilitychildren",
+                          "objectidentifier", "appstate", "networkservergroups", "contentview",
+                          "subviews", "mainactor", "nativepreview", "int", "bool"}
+        public_symbols.update({"arrayslice<nsview>", "[any]", "[nsview]", "arrayslice<any>"})
+        symbols = [part.group(1) or part.group(2) or ""
+                   for part in re.finditer(r"'([^']*)'|\"([^\"]*)\"", message)]
+        symbols = [symbol for symbol in symbols if symbol in public_symbols][:4]
+        categories = (
+            ("cannot-convert", ("cannot convert", "requires the types", "requires that")),
+            ("no-exact-matches", ("no exact matches",)),
+            ("missing-member", ("has no member",)),
+            ("missing-symbol", ("cannot find",)),
+            ("not-callable", ("cannot call value",)),
+            ("optional-unwrapping", ("must be unwrapped",)),
+            ("ambiguous-expression", ("ambiguous",)),
+            ("typecheck-complexity", ("unable to type-check",)),
+            ("actor-isolation", ("actor-isolated", "main actor",)),
+        )
+        category = next((tag for tag, needles in categories if any(needle in message for needle in needles)), "other")
+        compiler.append("preview.swift:%d:%d:%s:symbols=%s" % (line, column, category, ",".join(symbols) or "none"))
+        if len(compiler) == 8:
+            break
+    if compiler:
+        return "compiler-errors: " + " | ".join(compiler)
     signatures = (
         ("test-preferences-fatal", ("could not create isolated test preferences",)),
         ("test-root-fatal", ("betterfinder_test_root must identify an isolated test directory",)),
@@ -108,7 +142,7 @@ CENSUS = None
 END = 0.0
 SOURCE_PINS = {
     'scripts/preview_app.sh': 'e2508373f2385a04cd29026a38926197d1b245efa19c18e9bfc5bd2eee3761df',
-    'scripts/preview_app.swift': 'cf811394f0d838488bc83e1a6e9a23b36d7af5d9ac6c7db12872da28e04bd67c',
+    'scripts/preview_app.swift': '207cffe520857d445d8943990faeb94494f6ae7827f6b179a2ad579626822f61',
 }
 
 

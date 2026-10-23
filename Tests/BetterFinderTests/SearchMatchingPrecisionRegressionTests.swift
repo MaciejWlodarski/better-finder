@@ -63,7 +63,13 @@ struct SearchMatchingPrecisionRegressionTests {
             for scope in [SearchScopeMode.currentFolder, .recursiveFolder, .wholeIndex] {
                 let result = index.search(rawQuery: test.term, scope: scope, scopeDirectory: root.path,
                                           includeHidden: true, fuzzyEnabled: true)
-                try expect(result.items.map(\.name) == (test.fuzzy ? [test.name] : []))
+                let expectedNames = test.fuzzy ? [test.name] : []
+                guard result.items.map(\.name) == expectedNames else {
+                    let crawled = BulkCrawler.readDirectoryFast(at: root.path).map {
+                        "name=\($0.name.debugDescription), bytes=\($0.lowerNameUTF8), mask=\($0.charMask)"
+                    }
+                    throw RegressionFailure(description: "Matching case name=\(test.name.debugDescription), term=\(test.term.debugDescription), scope=\(scope), expected=\(expectedNames), actual=\(result.items.map(\.name)), queryBytes=\(Array(test.term.lowercased().utf8)), crawled=\(crawled), diagnostic=\(String(describing: result.diagnostic))")
+                }
                 if let score = test.score { try expect(result.items.first?.searchScore == score) }
                 let strict = index.search(rawQuery: test.term, scope: scope, scopeDirectory: root.path,
                                           includeHidden: true, fuzzyEnabled: false)

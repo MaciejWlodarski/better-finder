@@ -192,7 +192,6 @@ struct BetterFinderApp: App {
                 Divider()
 
                 Button("Przebuduj indeks plików") {
-                    appState.isIndexing = true
                     FSearchIndex.shared.startIndexing()
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])

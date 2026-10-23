@@ -1039,6 +1039,8 @@ public struct FSearchSettingsSheetView: View {
     @ViewState private var conflictPolicy: FileConflictPolicy = FileOperationsManager.shared.defaultConflictPolicy
     @ViewState private var newRootPath: String = ""
     @ViewState private var rootPathError: String?
+    @ViewState private var repairIndexSettings = false
+    @ViewState private var indexSettingsError: String?
 
     public init(appState: AppState) {
         self.appState = appState
@@ -1077,6 +1079,13 @@ public struct FSearchSettingsSheetView: View {
             }
             Divider()
 
+            if let notice = FSearchIndex.shared.indexingPreferencesNotice {
+                Text(notice).font(FinderUI.detailFont).foregroundStyle(.orange)
+                Toggle("Napraw: zastąp ustawienia poniższymi i zachowaj kopię oryginału", isOn: $repairIndexSettings)
+            }
+            if let indexSettingsError {
+                Text(indexSettingsError).font(FinderUI.detailFont).foregroundStyle(.red)
+            }
             // Indexed Roots
             VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
                 Text("Indeksowane katalogi")
@@ -1190,13 +1199,16 @@ public struct FSearchSettingsSheetView: View {
                             .map { $0.trimmingCharacters(in: .whitespaces) }
                             .filter { !$0.isEmpty }
                     )
-                    FSearchIndex.shared.skippedDirectoryNames = parsedSkip
-                    FSearchIndex.shared.skipHeavyDevDirs = skipHeavyDirs
-                    FSearchIndex.shared.usePersistentMMapCache = useMMapCache
-                    fileOps.defaultConflictPolicy = conflictPolicy
-                    appState.isIndexing = true
-                    FSearchIndex.shared.startIndexing(roots: roots)
-                    appState.showSettingsSheet = false
+                    do {
+                        try FSearchIndex.shared.saveConfigurationAndRebuild(IndexingConfiguration(
+                            roots: roots, skippedDirectoryNames: parsedSkip,
+                            skipHeavyDevDirs: skipHeavyDirs, usePersistentMMapCache: useMMapCache),
+                            explicitlyRepair: repairIndexSettings)
+                        fileOps.defaultConflictPolicy = conflictPolicy
+                        appState.showSettingsSheet = false
+                    } catch {
+                        indexSettingsError = "Nie zapisano ustawień indeksu. Sprawdź wartości lub jawnie potwierdź naprawę."
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
             }

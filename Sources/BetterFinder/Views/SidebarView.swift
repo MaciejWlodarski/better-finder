@@ -445,7 +445,6 @@ public struct SidebarView: View {
                     appState.showSettingsSheet = true
                 }
                 sidebarActionButton(icon: "arrow.clockwise", label: "Przebuduj indeks wyszukiwania") {
-                    appState.isIndexing = true
                     FSearchIndex.shared.startIndexing()
                 }
                 .disabled(appState.isIndexing)

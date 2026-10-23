@@ -223,12 +223,18 @@ public final class AppState: ObservableObject {
         appSessionObserver = objectWillChange.sink { [weak self] _ in self?.scheduleSessionSave() }
     }
 
+    private var indexLifecycle = IndexingLifecycleState()
     private func setupIndexCallbacks() {
+        FSearchIndex.shared.onIndexingLifecycle = { event in
+            Task { @MainActor in
+                self.indexLifecycle.apply(event)
+                self.isIndexing = self.indexLifecycle.isIndexing
+            }
+        }
         FSearchIndex.shared.onIndexUpdated = { count, durationMs in
             Task { @MainActor in
                 self.indexedFileCount = count
                 self.indexBuildDurationMs = durationMs
-                self.isIndexing = false
                 for tab in self.tabs + [self.rightPane] where !tab.searchQuery.isEmpty {
                     tab.triggerSearch()
                 }

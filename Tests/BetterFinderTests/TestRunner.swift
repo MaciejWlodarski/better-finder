@@ -72,6 +72,7 @@ func expect(_ condition: @autoclosure () -> Bool, file: StaticString = #filePath
             try comparisonSnapshots.testComparisonEntryBudgetOverflowDisablesCopy()
             print("PASS comparison pair snapshots and retained-entry boundaries")
             try await DiskAnalysisRegressionTests().runAll()
+            try TerminalPresentationRegressionTests().runAll()
             print("Disk analysis/terminal regression suite passed")
             let previewChecks = try await InspectorPreviewRegressionTests.runAll()
             print("\(previewChecks) inspector preview checks passed")

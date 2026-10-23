@@ -140,25 +140,17 @@ final class TerminalCommandSession: @unchecked Sendable {
     private func posixError(_ code: Int32) -> NSError { NSError(domain: NSPOSIXErrorDomain, code: Int(code)) }
 }
 
-public struct TerminalOutputLine: Identifiable {
-    public let id = UUID()
-    public let text: String
-    public let isCommand: Bool
-    public let isError: Bool
-}
-
 public struct EmbeddedTerminalDrawerView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var activeTab: PaneTabState
 
     @ViewState private var commandInput: String = ""
-    @ViewState private var outputLines: [TerminalOutputLine] = [
-        TerminalOutputLine(
-            text: "BetterFinder Terminal (Zsh) — zsynchronizowany z aktywną kartą. Wpisz polecenie (np. ls -la, git status, cd ..)",
-            isCommand: false,
-            isError: false
-        )
-    ]
+    @ViewState private var transcript: TerminalTranscript = {
+        var buffer = TerminalTranscript()
+        buffer.append(text: "BetterFinder Terminal (Zsh). Samodzielne cd zmienia folder karty; polecenia złożone zmieniają folder tylko w swoim procesie.")
+        return buffer
+    }()
+    private var outputLines: [TerminalOutputLine] { transcript.lines }
     @ViewState private var commandHistory: [String] = []
     @ViewState private var isRunning: Bool = false
     @ViewState private var session: TerminalCommandSession?
@@ -189,7 +181,7 @@ public struct EmbeddedTerminalDrawerView: View {
                     .accessibilityLabel("Bieżący folder: \(activeTab.currentURL.path)")
 
                 terminalIconButton("Wyczyść wyjście terminala", icon: "trash") {
-                    outputLines.removeAll()
+                    transcript.removeAll()
                 }
                 .disabled(outputLines.isEmpty)
 
@@ -253,7 +245,7 @@ public struct EmbeddedTerminalDrawerView: View {
                     .padding(.vertical, FinderUI.rowSpacing)
                 }
                 .background(Color(nsColor: .textBackgroundColor))
-                .onChange(of: outputLines.count) { _, _ in
+                .onChange(of: outputLines.last?.id) { _, _ in
                     if let last = outputLines.last {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
@@ -280,8 +272,8 @@ public struct EmbeddedTerminalDrawerView: View {
                     .accessibilityLabel("Polecenie terminala")
                     .help("Naciśnij Return, aby uruchomić polecenie w bieżącym folderze. Polecenia interaktywne wymagają zewnętrznego terminala.")
                     .onSubmit {
-                        let cmd = commandInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !isRunning, !cmd.isEmpty else { return }
+                        let cmd = commandInput
+                        guard !isRunning, !cmd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
                         commandInput = ""
                         executeCommand(cmd)
                     }
@@ -324,41 +316,30 @@ public struct EmbeddedTerminalDrawerView: View {
     private func executeCommand(_ rawCmd: String) {
         guard !isRunning else { return }
         let dirURL = activeTab.currentURL
-        outputLines.append(TerminalOutputLine(
-            text: "[\(dirURL.lastPathComponent)] % \(rawCmd)",
-            isCommand: true,
-            isError: false
-        ))
-        commandHistory.append(rawCmd)
-        commandHistory = Array(commandHistory.suffix(100))
-        outputLines = Array(outputLines.suffix(2_000))
+        transcript.append(parts: ["[", dirURL.lastPathComponent, "] % ", rawCmd], isCommand: true)
+        // Display bounds must never rewrite executable command or history text.
+        // Oversized commands still execute intact, but are not retained in history.
+        if rawCmd.utf8.prefix(16_385).count <= 16_384 {
+            commandHistory.append(rawCmd)
+            commandHistory = Array(commandHistory.suffix(100))
+        }
 
         if rawCmd == "clear" {
-            outputLines.removeAll()
+            transcript.removeAll()
             return
         }
 
-        // Built-in `cd` handling synchronized with BetterFinder active tab!
-        if rawCmd == "cd" || rawCmd.hasPrefix("cd ") {
-            let arg = rawCmd == "cd" ? "~" : String(rawCmd.dropFirst(3)).trimmingCharacters(in: .whitespaces)
-            let targetPath: String
-            if arg.hasPrefix("~") {
-                targetPath = (arg as NSString).expandingTildeInPath
-            } else if arg.hasPrefix("/") {
-                targetPath = arg
-            } else {
-                targetPath = dirURL.appendingPathComponent(arg).standardizedFileURL.path
-            }
-            let targetURL = URL(fileURLWithPath: targetPath, isDirectory: true)
+        if let targetURL = TerminalDirectoryCommand.target(for: rawCmd, directory: dirURL) {
+            let targetPath = targetURL.path
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: targetPath, isDirectory: &isDir), isDir.boolValue {
                 if activeTab.navigate(to: targetURL) {
-                    outputLines.append(TerminalOutputLine(text: "→ \(targetURL.path)", isCommand: false, isError: false))
+                    transcript.append(text: "→ \(targetURL.path)", isCommand: false, isError: false)
                 } else {
-                    outputLines.append(TerminalOutputLine(text: activeTab.navigationDiagnostic ?? "cd: nie można odczytać folderu", isCommand: false, isError: true))
+                    transcript.append(text: activeTab.navigationDiagnostic ?? "cd: nie można odczytać folderu", isCommand: false, isError: true)
                 }
             } else {
-                outputLines.append(TerminalOutputLine(text: "cd: brak takiego katalogu: \(arg)", isCommand: false, isError: true))
+                transcript.append(text: "cd: brak takiego katalogu: \(targetPath)", isCommand: false, isError: true)
             }
             return
         }
@@ -372,16 +353,13 @@ public struct EmbeddedTerminalDrawerView: View {
                 Task { @MainActor in
                     guard self.session === current else { return }
                     // stdout/stderr are intentionally merged in their observed arrival order.
-                    for line in result.output.split(separator: "\n", omittingEmptySubsequences: false).suffix(2_000) {
-                        self.outputLines.append(TerminalOutputLine(text: String(line), isCommand: false, isError: false))
-                    }
+                    self.transcript.appendOutput(result.output)
                     if result.wasTruncated {
-                        self.outputLines.append(TerminalOutputLine(text: "[Wyjście ograniczone do 1 MiB; dalsze dane odczytano i pominięto.]", isCommand: false, isError: false))
+                        self.transcript.append(text: "[Wyjście ograniczone do 1 MiB; dalsze dane odczytano i pominięto.]", isCommand: false, isError: false)
                     }
                     if result.wasCancelled || result.status != 0 {
-                        self.outputLines.append(TerminalOutputLine(text: result.wasCancelled ? "[Polecenie przerwane]" : "[Polecenie zakończone błędem]", isCommand: false, isError: true))
+                        self.transcript.append(text: result.wasCancelled ? "[Polecenie przerwane]" : "[Polecenie zakończone błędem: \(result.status)]", isCommand: false, isError: true)
                     }
-                    self.outputLines = Array(self.outputLines.suffix(2_000))
                     self.isRunning = false
                     self.session = nil
                     FSearchIndex.shared.enqueueDirectoryRefresh(dirURL.path)
@@ -390,7 +368,7 @@ public struct EmbeddedTerminalDrawerView: View {
             } catch {
                 Task { @MainActor in
                     guard self.session === current else { return }
-                    self.outputLines.append(TerminalOutputLine(text: "Błąd wykonania: \(error.localizedDescription)", isCommand: false, isError: true))
+                    self.transcript.append(text: "Błąd wykonania: \(error.localizedDescription)", isCommand: false, isError: true)
                     self.isRunning = false
                     self.session = nil
                 }

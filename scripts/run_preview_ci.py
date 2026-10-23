@@ -226,7 +226,7 @@ CENSUS = None
 END = 0.0
 SOURCE_PINS = {
     'scripts/preview_app.sh': '5d2c32aabf0ad60fa5bd7504a83f1c190b32a3c8a9c9a499fa0acc4c45fff998',
-    'scripts/preview_app.swift': '5501addceba350f05cdfe2d4f0f2464415d1661fd06d007e98ff0b54e983bd89',
+    'scripts/preview_app.swift': '7ad5281e77b79ccdd061c57f1394057d33a738f0777e91c428532a7a44307f4a',
 }
 
 

@@ -269,7 +269,7 @@ struct NativePreview {
                     received = true
                     break
                 }
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false)
+                CFRunLoopRunInMode(.defaultMode, 0.01, false)
             }
             require(received, "visual capture response timeout")
         }

@@ -88,6 +88,14 @@ final class AnalysisRequestToken: @unchecked Sendable {
     @MainActor func canPublishAnalysis(active: AnalysisRequestToken?, appState: AppState, mode: WizTreeSubMode) -> Bool {
         active === self && !isCancelled && context?.matches(appState: appState, mode: mode) == true
     }
+    func canUseAnalysisResult(active: AnalysisRequestToken?, resultReady: Bool,
+                              isComplete: Bool, requiresComplete: Bool) -> Bool {
+        active === self && !isCancelled && resultReady && (!requiresComplete || isComplete)
+    }
+    func canPublishVerification(active: AnalysisRequestToken?, scan: AnalysisRequestToken,
+                                activeScan: AnalysisRequestToken?) -> Bool {
+        active === self && !isCancelled && scan === activeScan && !scan.isCancelled
+    }
     func cancel() { lock.lock(); cancelled = true; lock.unlock() }
     var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
     func canPublish(active: AnalysisRequestToken?, rootPath: String) -> Bool {
@@ -441,7 +449,7 @@ public enum SquarifiedTreemapLayout {
     }
 }
 
-public enum WizTreeSubMode: String, CaseIterable, Identifiable {
+public enum WizTreeSubMode: String, CaseIterable, Identifiable, Sendable {
     case treemap = "WizTree Treemap & Drzewo"
     case largestFiles = "Największe pliki"
     case duplicates = "Duplikaty (SHA-256)"
@@ -483,7 +491,11 @@ public struct WizTreeAnalyzerView: View {
     @ViewState private var categoryStats: [(FileKindCategory, Int64, Int)] = []
     @ViewState private var duplicateGroups: [DuplicateFileGroup] = []
     @ViewState private var scanToken: AnalysisRequestToken?
-    @ViewState private var scanTask: Task<Void, Never>?
+    @ViewState private var scanTask: AnalysisWorkRequest?
+    @ViewState private var verificationTask: AnalysisWorkRequest?
+    @ViewState private var verificationToken: AnalysisRequestToken?
+    @ViewState private var scanWorkState: AnalysisWorkRequest.State = .finished
+    @ViewState private var verificationWorkState: AnalysisWorkRequest.State = .finished
     @ViewState private var scanIsComplete = false
     @ViewState private var scanDiagnostic: String?
     @ViewState private var duplicateActionError: String?
@@ -516,7 +528,8 @@ public struct WizTreeAnalyzerView: View {
         FinderPaneActionRouting.perform(appState: appState, paneSide: paneSide, action: action)
     }
 
-    private func selectAnalyzedItem(_ item: FileItem) {
+    private func selectAnalyzedItem(_ item: FileItem, generation: AnalysisRequestToken?) {
+        guard canUseRenderedResult(generation, requiresComplete: false) else { return }
         performPaneAction {
             pane.setAnalysisSelection([item], rootPath: pane.currentURL.path)
         }
@@ -563,7 +576,7 @@ public struct WizTreeAnalyzerView: View {
                     ProgressView()
                         .controlSize(.regular)
                         .accessibilityLabel("Skanowanie folderu")
-                    Text(subMode == .duplicates ? "Skanowanie i weryfikacja plików…" : "Skanowanie folderu…")
+                    Text(scanWorkState == .queued ? "Skan oczekuje na wolne miejsce…" : (subMode == .duplicates ? "Skanowanie i weryfikacja plików…" : "Skanowanie folderu…"))
                         .font(FinderUI.titleFont)
                     Text(pane.currentURL.path)
                         .font(FinderUI.detailFont)
@@ -574,6 +587,12 @@ public struct WizTreeAnalyzerView: View {
                 .multilineTextAlignment(.center)
                 .padding(FinderUI.sheetPadding)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if scanWorkState == .deferred || scanWorkState == .cancelled || scanWorkState == .cancelling {
+                analysisEmptyState(
+                    title: scanWorkState == .deferred ? "Analiza odroczona" : "Analiza anulowana",
+                    message: "Brak aktualnego wyniku. Użyj odświeżania, aby rozpocząć nowy skan.",
+                    systemImage: "pause.circle"
+                )
             } else {
                 switch subMode {
                 case .treemap:
@@ -610,6 +629,8 @@ public struct WizTreeAnalyzerView: View {
         .onChange(of: livePaneID) { _, _ in
             scanToken?.cancel()
             scanTask?.cancel()
+            verificationTask?.cancel()
+            verificationToken = nil
             if livePaneID == pane.id { runActiveScan(for: pane.currentURL) }
         }
         .onChange(of: pane.id) { _, _ in runActiveScan(for: pane.currentURL) }
@@ -619,6 +640,8 @@ public struct WizTreeAnalyzerView: View {
         .onDisappear {
             scanToken?.cancel()
             scanTask?.cancel()
+            verificationTask?.cancel()
+            verificationToken = nil
             pane.clearAnalysisSelection()
         }
     }
@@ -645,6 +668,13 @@ public struct WizTreeAnalyzerView: View {
                     analysisModePicker
                         .pickerStyle(.menu)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if isScanning {
+                HStack {
+                    Text(scanWorkState == .queued ? "Skan w kolejce…" : "Skanowanie…")
+                        .font(FinderUI.captionFont)
+                    Button("Anuluj skan") { cancelScan() }.controlSize(.small)
                 }
             }
             ViewThatFits(in: .horizontal) {
@@ -843,6 +873,7 @@ public struct WizTreeAnalyzerView: View {
     }
 
     private func rankedBranchRow(_ node: WizTreeNode, index: Int, availableWidth: CGFloat) -> some View {
+        let generation = scanToken
         let fraction = totalScannedBytes > 0 ? Double(node.size) / Double(totalScannedBytes) : 0
         let isSelected = pane.selectedPaths.contains(node.path)
 
@@ -899,7 +930,7 @@ public struct WizTreeAnalyzerView: View {
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .accessibilityAction {
-            selectAnalyzedItem(node.toFileItem())
+            selectAnalyzedItem(node.toFileItem(), generation: generation)
         }
         .simultaneousGesture(
             TapGesture(count: 2).onEnded {
@@ -908,7 +939,7 @@ public struct WizTreeAnalyzerView: View {
         )
         .simultaneousGesture(
             TapGesture(count: 1).onEnded {
-                selectAnalyzedItem(node.toFileItem())
+                selectAnalyzedItem(node.toFileItem(), generation: generation)
             }
         )
     }
@@ -956,6 +987,7 @@ public struct WizTreeAnalyzerView: View {
 
     @ViewBuilder
     private func treemapBlockView(_ block: TreemapPlacedBlock) -> some View {
+        let generation = scanToken
         let isHovered = (hoveredBlock?.id == block.id)
         let isSelected = pane.selectedPaths.contains(block.node.path)
         let baseColor = block.node.kindCategory.treemapColor
@@ -1039,7 +1071,7 @@ public struct WizTreeAnalyzerView: View {
             .accessibilityLabel("\(block.node.name), \(FormatHelpers.formatBytes(block.node.size))")
             .accessibilityAddTraits(isSelected ? .isSelected : [])
             .accessibilityAction {
-                selectAnalyzedItem(block.node.toFileItem())
+                selectAnalyzedItem(block.node.toFileItem(), generation: generation)
             }
             .onHover { hovering in
                 if hovering {
@@ -1055,7 +1087,7 @@ public struct WizTreeAnalyzerView: View {
             )
             .simultaneousGesture(
                 TapGesture(count: 1).onEnded {
-                    selectAnalyzedItem(block.node.toFileItem())
+                    selectAnalyzedItem(block.node.toFileItem(), generation: generation)
                 }
             )
             .contextMenu {
@@ -1088,7 +1120,7 @@ public struct WizTreeAnalyzerView: View {
                 }
                 Divider()
                 Button(role: .destructive) {
-                    performPaneAction { trashAnalyzedItem(block.node.toFileItem()) }
+                    performPaneAction { trashAnalyzedItem(block.node.toFileItem(), generation: generation) }
                 } label: {
                     Label("Przenieś do Kosza", systemImage: "trash")
                 }
@@ -1111,6 +1143,7 @@ public struct WizTreeAnalyzerView: View {
     }
 
     private func largestFileRow(_ item: FileItem, index: Int, availableWidth: CGFloat) -> some View {
+        let generation = scanToken
         let percent = totalScannedBytes > 0 ? Double(item.size) * 100.0 / Double(totalScannedBytes) : 0
         let isSelected = pane.selectedPaths.contains(item.path)
 
@@ -1151,7 +1184,7 @@ public struct WizTreeAnalyzerView: View {
                 .monospacedDigit()
                 .frame(width: 85, alignment: .trailing)
             Button(role: .destructive) {
-                performPaneAction { trashAnalyzedItem(item) }
+                performPaneAction { trashAnalyzedItem(item, generation: generation) }
             } label: {
                 Image(systemName: "trash")
                     .foregroundStyle(isSelected ? selectionForegroundColor : Color.red)
@@ -1170,9 +1203,9 @@ public struct WizTreeAnalyzerView: View {
         .accessibilityLabel(item.name)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .accessibilityAction(named: Text("Zaznacz")) {
-            selectAnalyzedItem(item)
+            selectAnalyzedItem(item, generation: generation)
         }
-        .onTapGesture { selectAnalyzedItem(item) }
+        .onTapGesture { selectAnalyzedItem(item, generation: generation) }
     }
 
     // MARK: - Duplicate Files View (SHA-256)
@@ -1201,25 +1234,33 @@ public struct WizTreeAnalyzerView: View {
     }
 
     private var duplicateSummary: some View {
-        let totalWasted = duplicateGroups.reduce(Int64(0)) { $0 + $1.wastedBytes }
+        let generation = scanToken
+        let groups = duplicateGroups
+        let totalWasted = groups.reduce(Int64(0)) { $0 + $1.wastedBytes }
         return VStack(alignment: .leading, spacing: FinderUI.rowSpacing) {
             Text("Grupy duplikatów: \(duplicateGroups.count) · Nadmiarowe dane logiczne: \(FormatHelpers.formatBytes(totalWasted))")
                 .font(FinderUI.detailFont.weight(.semibold))
             Button("Przenieś nadmiarowe kopie do Kosza", role: .destructive) {
-                performPaneAction { trashDuplicates(duplicateGroups) }
+                performPaneAction { trashDuplicates(groups, generation: generation) }
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(isValidatingDuplicates)
+            .disabled(isValidatingDuplicates || !scanIsComplete)
             .help("Zachowaj pierwszy plik z każdej grupy i zweryfikuj pozostałe przed przeniesieniem do Kosza")
 
+            if !scanIsComplete {
+                Text("Usuwanie duplikatów jest wyłączone dla niepełnego skanu. Odśwież analizę i usuń przyczynę pominięć.")
+                    .font(FinderUI.captionFont)
+                    .foregroundStyle(.orange)
+            }
             if isValidatingDuplicates {
                 HStack(spacing: FinderUI.rowSpacing) {
                     ProgressView().controlSize(.small)
-                    Text("Weryfikowanie plików przed przeniesieniem…")
+                    Text(verificationWorkState == .queued ? "Weryfikacja w kolejce…" : "Weryfikowanie plików przed przeniesieniem…")
                         .font(FinderUI.captionFont)
                 }
                 .accessibilityElement(children: .combine)
+                Button("Anuluj weryfikację") { cancelVerification() }.controlSize(.small)
             }
             Text("W każdej grupie zostanie zachowany wskazany oryginał. Rozmiar logiczny nie oznacza gwarantowanego odzyskanego miejsca: dowiązania twarde, klony APFS i kompresja mogą współdzielić dane.")
                 .font(FinderUI.captionFont)
@@ -1252,6 +1293,7 @@ public struct WizTreeAnalyzerView: View {
     }
 
     private func duplicateFileRow(_ file: FileItem, in group: DuplicateFileGroup) -> some View {
+        let generation = scanToken
         let isKeeper = file.path == group.files.first?.path
         let isSelected = pane.selectedPaths.contains(file.path)
         return VStack(alignment: .leading, spacing: FinderUI.compactSpacing) {
@@ -1267,9 +1309,9 @@ public struct WizTreeAnalyzerView: View {
                     .foregroundStyle(isSelected ? selectionForegroundColor : Color.secondary)
             } else {
                 Button("Przenieś do Kosza", role: .destructive) {
-                    performPaneAction { trashDuplicates([group], onlyPath: file.path) }
+                    performPaneAction { trashDuplicates([group], generation: generation, onlyPath: file.path) }
                 }
-                .disabled(isValidatingDuplicates)
+                .disabled(isValidatingDuplicates || !scanIsComplete)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .accessibilityLabel("Przenieś do Kosza: \(file.name)")
@@ -1283,18 +1325,25 @@ public struct WizTreeAnalyzerView: View {
         .accessibilityLabel(file.name)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .accessibilityAction(named: Text("Zaznacz")) {
-            selectAnalyzedItem(file)
+            selectAnalyzedItem(file, generation: generation)
         }
-        .onTapGesture { selectAnalyzedItem(file) }
+        .onTapGesture { selectAnalyzedItem(file, generation: generation) }
     }
 
     // MARK: - Generation-bound, bounded scans
 
     private func runActiveScan(for rootURL: URL) {
+        // Invalidate publication immediately, but let submit replace an admitted
+        // pending request in place so repeated refreshes keep their FIFO slot.
         scanToken?.cancel()
-        scanTask?.cancel()
+        verificationToken?.cancel()
+        verificationToken = nil
         let context = AnalysisPublicationContext(pane: pane, side: paneSide, mode: subMode)
-        guard context.matches(appState: appState, mode: subMode), rootURL.path == context.rootPath else { return }
+        guard context.matches(appState: appState, mode: subMode), rootURL.path == context.rootPath else {
+            scanTask?.cancel()
+            verificationTask?.cancel()
+            return
+        }
         let token = AnalysisRequestToken(rootPath: rootURL.path, context: context)
         scanToken = token
         isValidatingDuplicates = false
@@ -1312,71 +1361,55 @@ public struct WizTreeAnalyzerView: View {
         pane.beginAnalysisProjection(rootPath: rootURL.path, generation: token.id)
         let showHidden = pane.showHiddenFiles
         let mode = subMode
-        scanTask = Task.detached(priority: .userInitiated) {
-            let started = DispatchTime.now().uptimeNanoseconds
-            let scan = BulkCrawler.crawlTreeResult(roots: [rootURL.path], skipHeavyDevDirs: false,
-                maxEntries: 60_000, includeHidden: showHidden, isCancelled: { token.isCancelled })
-            guard !token.isCancelled else { return }
-            var groups: [DuplicateFileGroup] = []
-            var failedHashes = 0
-            if mode == .duplicates {
-                let result = DuplicateFileSafety.groups(from: scan.entries, token: token)
-                groups = result.groups
-                failedHashes = result.failed
-            }
-            let files = scan.entries.filter { !$0.isDirectory && !$0.isSymlink }.map { $0.toFileItem(loadTags: false) }
-            var categoryMap: [FileKindCategory: (Int64, Int)] = [:]
-            for item in files {
-                let previous = categoryMap[item.kindCategory] ?? (0, 0)
-                categoryMap[item.kindCategory] = (previous.0 + item.size, previous.1 + 1)
-            }
-            let rootPrefix = rootURL.path == "/" ? "/" : rootURL.path + "/"
-            var filesByBranch: [String: [FileItem]] = [:]
-            for item in files {
-                let relative = item.path.dropFirst(rootPrefix.count)
-                let first = String(relative.split(separator: "/", maxSplits: 1).first ?? "")
-                filesByBranch[first, default: []].append(item)
-            }
-            var branches: [WizTreeNode] = []
-            for entry in scan.entries where entry.parentPath == rootURL.path && !entry.isSymlink {
-                let branchFiles = filesByBranch[entry.name] ?? []
-                let item = entry.toFileItem(loadTags: false)
-                let children = branchFiles.sorted { $0.size > $1.size }.prefix(32).map { leaf in
-                    WizTreeNode(name: leaf.name, path: leaf.path, url: leaf.url, isDirectory: false,
-                        size: leaf.size, fileCount: 1, kindCategory: leaf.kindCategory,
-                        modificationDate: leaf.modificationDate, children: [])
+        let input = AnalysisScanInput(rootURL: rootURL, showHidden: showHidden, mode: mode)
+        scanTask = AnalysisWorkAdapters.startScan(input, consumer: .analysis(paneSide), token: token, service: .shared,
+            stateChanged: { state in
+                guard self.scanToken === token, context.matches(appState: self.appState, mode: self.subMode) else { return }
+                self.scanWorkState = state
+                if state == .deferred {
+                    token.cancel() // No result exists for this generation; it must authorize no action.
+                    self.isScanning = false
+                    self.scanDiagnostic = "Odroczono: zajęte miejsca analizy. Użyj odświeżania, aby ponowić."
+                } else if state == .cancelled {
+                    self.isScanning = false
+                    self.scanIsComplete = false
+                    self.scanDiagnostic = "Anulowano analizę. Użyj odświeżania, aby ponowić."
+                    self.pane.clearAnalysisSelection()
                 }
-                branches.append(WizTreeNode(name: entry.name, path: entry.fullPath, url: item.url,
-                    isDirectory: entry.isDirectory, size: entry.isDirectory ? branchFiles.reduce(0) { $0 + $1.size } : item.size,
-                    fileCount: entry.isDirectory ? branchFiles.count : 1, kindCategory: item.kindCategory,
-                    modificationDate: item.modificationDate, children: entry.isDirectory ? children : []))
-            }
-            let complete = scan.isComplete && failedHashes == 0
-            var messages: [String] = []
-            if scan.reachedEntryLimit { messages.append("Wyniki częściowe: osiągnięto limit 60 000 wpisów.") }
-            if scan.skippedDirectoryCount > 0 { messages.append("Pominięte katalogi: \(scan.skippedDirectoryCount).") }
-            if scan.unreadableDirectoryCount > 0 { messages.append("Nieodczytane katalogi: \(scan.unreadableDirectoryCount).") }
-            if failedHashes > 0 { messages.append("Pliki zmienione lub nieodczytane: \(failedHashes).") }
-            if !complete && messages.isEmpty { messages.append("Skan niepełny; suma jest dolnym oszacowaniem.") }
-            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
-            await MainActor.run { [branches, groups, categoryMap, messages] in
-                guard token.canPublishAnalysis(active: self.scanToken, appState: self.appState, mode: self.subMode) else { return }
-                self.topBranches = branches.sorted { $0.size > $1.size }
-                self.largestFiles = Array(files.sorted { $0.size > $1.size }.prefix(150))
-                self.duplicateGroups = groups
-                self.categoryStats = categoryMap.map { ($0.key, $0.value.0, $0.value.1) }.sorted { $0.1 > $1.1 }
-                self.totalScannedBytes = files.reduce(0) { $0 + $1.size }
-                self.totalScannedFiles = files.count
-                self.scanDurationMs = elapsed
-                self.scanIsComplete = complete
-                self.scanDiagnostic = messages.isEmpty ? nil : messages.joined(separator: " ")
+            }, completion: { result in
+                guard let result, token.canPublishAnalysis(active: self.scanToken, appState: self.appState, mode: self.subMode) else { return }
+                self.topBranches = result.branches
+                self.largestFiles = Array(result.files.sorted { $0.size > $1.size }.prefix(150))
+                self.duplicateGroups = result.groups
+                self.categoryStats = result.categories
+                self.totalScannedBytes = result.files.reduce(0) { $0 + $1.size }
+                self.totalScannedFiles = result.files.count
+                self.scanDurationMs = result.elapsed
+                self.scanIsComplete = result.complete
+                self.scanDiagnostic = result.diagnostic
                 self.isScanning = false
-                // Publish the entire ordered visible projection independently of selection.
                 let visible = WizTreeSelectionProjection.items(mode: mode, branches: self.topBranches,
-                    largestFiles: self.largestFiles, duplicateGroups: self.duplicateGroups)
+                    largestFiles: self.largestFiles, duplicateGroups: duplicateGroups)
                 self.pane.publishAnalysisItems(visible, rootPath: token.rootPath, generation: token.id)
-            }
-        }
+            })
+    }
+
+    private func cancelScan() {
+        scanToken?.cancel()
+        scanTask?.cancel()
+        verificationTask?.cancel()
+        verificationToken = nil
+        isScanning = false
+        scanIsComplete = false
+        scanDiagnostic = "Anulowano skan. Trwający odczyt systemowy może jeszcze kończyć pracę."
+        pane.clearAnalysisSelection()
+    }
+
+    private func cancelVerification() {
+        verificationTask?.cancel()
+        verificationToken = nil
+        isValidatingDuplicates = false
+        duplicateActionError = "Anulowano weryfikację. Trwający odczyt systemowy może jeszcze kończyć pracę."
     }
 
     private func publishTreemapProjection(_ blocks: [TreemapPlacedBlock], token: AnalysisRequestToken?) {
@@ -1389,43 +1422,62 @@ public struct WizTreeAnalyzerView: View {
         pane.publishAnalysisItems(visible, rootPath: token.rootPath, generation: token.id)
     }
 
-    private func trashAnalyzedItem(_ item: FileItem) {
+    private func canUseRenderedResult(_ generation: AnalysisRequestToken?, requiresComplete: Bool) -> Bool {
+        guard let generation else { return false }
+        return generation.canUseAnalysisResult(active: scanToken,
+            resultReady: !isScanning && scanWorkState == .finished,
+            isComplete: scanIsComplete, requiresComplete: requiresComplete)
+            && generation.canPublishAnalysis(active: scanToken, appState: appState, mode: subMode)
+    }
+
+    // Explicit generic per-item Trash remains allowed from a completed partial
+    // scan; automatic duplicate cleanup below requires a complete scan.
+    private func trashAnalyzedItem(_ item: FileItem, generation: AnalysisRequestToken?) {
         let root = pane.currentURL.path
-        guard let token = scanToken, token.canPublishAnalysis(active: scanToken, appState: appState, mode: subMode), !isScanning,
+        guard canUseRenderedResult(generation, requiresComplete: false),
               item.path.hasPrefix(root == "/" ? "/" : root + "/") else { return }
         FileOperationsManager.shared.moveToTrash([item])
         runActiveScan(for: pane.currentURL)
     }
 
-    private func trashDuplicates(_ groups: [DuplicateFileGroup], onlyPath: String? = nil) {
-        guard let token = scanToken, token.canPublishAnalysis(active: scanToken, appState: appState, mode: subMode),
-              !isScanning, !isValidatingDuplicates else { return }
+    private func trashDuplicates(_ groups: [DuplicateFileGroup], generation: AnalysisRequestToken?, onlyPath: String? = nil) {
+        guard let token = generation, canUseRenderedResult(generation, requiresComplete: true),
+              !isValidatingDuplicates else { return }
         isValidatingDuplicates = true
         duplicateActionError = nil
-        Task.detached(priority: .userInitiated) {
-            do {
-                // Validate all content before starting; final per-file checks run in the mutation path.
-                for group in groups { try DuplicateFileSafety.validate(group, isCancelled: { token.isCancelled }) }
-                await MainActor.run {
-                    guard token.canPublishAnalysis(active: self.scanToken, appState: self.appState, mode: self.subMode) else { return }
-                    defer { self.isValidatingDuplicates = false }
+        let verification = AnalysisRequestToken(rootPath: token.rootPath)
+        verificationToken = verification
+        verificationTask = AnalysisWorkAdapters.startVerification(groups, consumer: .analysis(paneSide), token: verification, service: .shared,
+            stateChanged: { state in
+                guard self.verificationToken === verification,
+                      token.canPublishAnalysis(active: self.scanToken, appState: self.appState, mode: self.subMode) else { return }
+                self.verificationWorkState = state
+                if state == .deferred {
+                    self.isValidatingDuplicates = false
+                    self.duplicateActionError = "Odroczono weryfikację: analiza jest zajęta. Ponów operację."
+                } else if state == .cancelled {
+                    self.isValidatingDuplicates = false
+                    self.duplicateActionError = "Anulowano weryfikację."
+                    self.verificationToken = nil
+                }
+            }, completion: { result in
+                guard verification.canPublishVerification(active: self.verificationToken, scan: token, activeScan: self.scanToken),
+                      token.canPublishAnalysis(active: self.scanToken, appState: self.appState, mode: self.subMode) else { return }
+                self.verificationToken = nil
+                self.isValidatingDuplicates = false
+                switch result {
+                case .verified:
                     for group in groups {
                         let candidates = group.files.dropFirst().filter { onlyPath == nil || $0.path == onlyPath }
                         FileOperationsManager.shared.moveToTrash(Array(candidates), validating: { item in
-                            guard !token.isCancelled else { throw DuplicateSafetyError.cancelled }
+                            guard !token.isCancelled, !verification.isCancelled else { throw DuplicateSafetyError.cancelled }
                             try DuplicateFileSafety.validateBeforeTrash(item, in: group)
                         })
                     }
                     self.runActiveScan(for: self.pane.currentURL)
+                case .failed(let message):
+                    self.duplicateActionError = message
                 }
-            } catch {
-                await MainActor.run {
-                    guard token.canPublishAnalysis(active: self.scanToken, appState: self.appState, mode: self.subMode) else { return }
-                    self.isValidatingDuplicates = false
-                    self.duplicateActionError = error.localizedDescription
-                    self.runActiveScan(for: self.pane.currentURL)
-                }
-            }
-        }
+            })
     }
 }

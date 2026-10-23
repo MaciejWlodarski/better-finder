@@ -677,7 +677,8 @@ private struct FolderComparisonContentView: View {
 
     @ViewState private var entries: [FolderCompareEntry] = []
     @ViewState private var hideIdentical: Bool = true
-    @ViewState private var compareTask: Task<Void, Never>?
+    @ViewState private var compareTask: AnalysisWorkRequest?
+    @ViewState private var compareWorkState: AnalysisWorkRequest.State = .finished
     @ViewState private var compareToken: AnalysisRequestToken?
     @ViewState private var isComparing = false
     @ViewState private var compareDiagnostic: String?
@@ -751,7 +752,7 @@ private struct FolderComparisonContentView: View {
 
             Divider()
 
-            Text(compareDiagnostic ?? (isComparing ? "Porównywanie treści plików…" : "Porównanie treści i czasu plików, bez rekurencji. Wspólne podfoldery i konflikty typów wymagają osobnego porównania. Kopiowanie nie usuwa pozycji docelowych."))
+            Text(compareDiagnostic ?? (isComparing ? (compareWorkState == .queued ? "Porównanie w kolejce…" : "Porównywanie treści plików…") : "Porównanie treści i czasu plików, bez rekurencji. Wspólne podfoldery i konflikty typów wymagają osobnego porównania. Kopiowanie nie usuwa pozycji docelowych."))
                 .font(FinderUI.detailFont)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -802,6 +803,20 @@ private struct FolderComparisonContentView: View {
             }
 
             HStack {
+                if isComparing {
+                    Button("Anuluj porównanie") {
+                        compareToken?.cancel()
+                        compareTask?.cancel()
+                        isComparing = false
+                        comparedContext = nil
+                        compareDiagnostic = "Anulowano. Trwający odczyt systemowy może jeszcze kończyć pracę."
+                    }
+                } else if compareDiagnostic != nil {
+                    Button("Ponów porównanie") { computeDiff() }
+                }
+                Spacer()
+            }
+            HStack {
                 Text("Kopiuj różnice:")
                     .font(FinderUI.detailFont)
                 Button("Lewy → Prawy") { copyDifferences(leftToRight: true) }
@@ -851,8 +866,8 @@ private struct FolderComparisonContentView: View {
 
     private func computeDiff() {
         cancelOwnedConflict()
+        // Coalesce in place rather than removing/rejoining the FIFO on refresh.
         compareToken?.cancel()
-        compareTask?.cancel()
         let context = comparisonContext
         let left = leftPane.currentURL
         let right = rightPane.currentURL
@@ -863,17 +878,28 @@ private struct FolderComparisonContentView: View {
         compareDiagnostic = nil
         comparedContext = nil
         isComparing = true
-        compareTask = Task.detached(priority: .userInitiated) {
-            let result = FolderComparison.compare(left: left, right: right, includeHidden: includeHidden, token: token)
-            await MainActor.run {
+        let input = AnalysisComparisonInput(left: left, right: right, includeHidden: includeHidden)
+        compareTask = AnalysisWorkAdapters.startComparison(input, token: token, service: .shared,
+            stateChanged: { state in
+                guard self.compareToken === token, context == self.comparisonContext else { return }
+                self.compareWorkState = state
+                if state == .deferred {
+                    token.cancel()
+                    self.isComparing = false
+                    self.compareDiagnostic = "Odroczono: analiza jest zajęta. Ponów porównanie. Kopiowanie wyłączone."
+                } else if state == .cancelled {
+                    self.isComparing = false
+                    self.comparedContext = nil
+                    self.compareDiagnostic = "Anulowano porównanie. Kopiowanie wyłączone."
+                }
+            }, completion: { result in
                 guard token.canPublish(active: self.compareToken, rootPath: self.leftPane.currentURL.path),
                       context == self.comparisonContext else { return }
                 self.entries = result.entries
                 self.compareDiagnostic = result.diagnostic
                 self.comparedContext = context
                 self.isComparing = false
-            }
-        }
+            })
     }
 
     private func copyDifferences(leftToRight: Bool) {

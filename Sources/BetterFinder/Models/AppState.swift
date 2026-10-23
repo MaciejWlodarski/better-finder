@@ -9,14 +9,15 @@ public enum PaneSide: String, Sendable {
 }
 
 public struct SidebarLocationItem: Identifiable, Hashable {
-    public var id: String { url.path }
+    public var id: String { bookmarkPath ?? url.path }
+    public var bookmarkPath: String? = nil
     public let title: String
     public let iconName: String
     public let url: URL
     public let isCustomBookmark: Bool
 }
 
-public struct VolumeInfoItem: Identifiable {
+public struct VolumeInfoItem: Identifiable, Sendable {
     public var id: String { url.path }
     public let name: String
     public let url: URL
@@ -159,7 +160,14 @@ public final class AppState: ObservableObject {
     @Published public var savedSmartFolders: [SavedSmartFolderItem] = []
     private var savedSearchArchive: SavedSearchArchive? = SavedSearchArchive()
     private var savedSearchLaunchSerials: [UUID: UInt64] = [:]
-    @Published public var mountedVolumes: [VolumeInfoItem] = []
+    @Published public private(set) var volumeInventory = VolumeInventoryState()
+    public var mountedVolumes: [VolumeInfoItem] { volumeInventory.items }
+    private var volumeService: VolumeRefreshService?
+    private lazy var pinnedFolderStore = PinnedFolderStore(
+        read: { Self.preferences.object(forKey: PinnedFolderStore.key) },
+        write: { Self.preferences.set($0, forKey: PinnedFolderStore.key) })
+    @Published public private(set) var pinnedFolderNotice: String?
+
 
     public var activeTab: PaneTabState {
         if isDualPane && activePaneSide == .right {
@@ -215,7 +223,9 @@ public final class AppState: ObservableObject {
         setupSidebarLocations()
         loadPersistedBookmarksAndSmartFolders()
         #if !BETTERFINDER_TESTING
-        refreshMountedVolumes()
+        let volumes = VolumeRefreshService.production()
+        volumeService = volumes
+        volumes.start { [weak self] result in self?.volumeInventory.apply(result) }
         #endif
         setupIndexCallbacks()
         sessionObservationReady = true
@@ -303,14 +313,7 @@ public final class AppState: ObservableObject {
 
     private func loadPersistedBookmarksAndSmartFolders() {
         let defaults = Self.preferences
-        if let paths = defaults.stringArray(forKey: "bf.customBookmarks") {
-            customBookmarks = paths.compactMap { path in
-                var isDir: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return nil }
-                let url = URL(fileURLWithPath: path, isDirectory: true)
-                return SidebarLocationItem(title: url.lastPathComponent, iconName: "bookmark.fill", url: url, isCustomBookmark: true)
-            }
-        }
+        updatePinnedFolderRows()
         if let data = defaults.data(forKey: "bf.savedSmartFolders") {
             savedSearchArchive = try? SavedSearchArchive(data: data)
             savedSmartFolders = savedSearchArchive?.items ?? []
@@ -337,22 +340,32 @@ public final class AppState: ObservableObject {
     var hasPersistedSessionForTesting: Bool { Self.preferences.object(forKey: FinderSessionStore.dataKey) != nil }
     #endif
 
+    private func updatePinnedFolderRows() {
+        customBookmarks = pinnedFolderStore.displayedPaths.map { path in
+            let url = URL(fileURLWithPath: path, isDirectory: true)
+            return SidebarLocationItem(bookmarkPath: path, title: url.lastPathComponent, iconName: "bookmark.fill",
+                url: url, isCustomBookmark: true)
+        }
+        pinnedFolderNotice = pinnedFolderStore.notice
+    }
+
     public func addBookmark(for url: URL) {
+        guard pinnedFolderStore.notice == nil else { updatePinnedFolderRows(); return }
+        guard url.isFileURL, PinnedFolderStore.validPath(url.path) else { return }
+        // Only a new, explicitly requested target is probed; restored pins never are.
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { return }
-        guard !customBookmarks.contains(where: { $0.url.path == url.path }) else { return }
-        customBookmarks.append(SidebarLocationItem(
-            title: url.lastPathComponent,
-            iconName: "bookmark.fill",
-            url: url,
-            isCustomBookmark: true
-        ))
-        Self.preferences.set(customBookmarks.map { $0.url.path }, forKey: "bf.customBookmarks")
+        if !pinnedFolderStore.add(url.path) {
+            FileOperationsManager.shared.lastStatusMessage = "Nie potwierdzono zapisu przypiętego folderu."
+        }
+        updatePinnedFolderRows()
     }
 
     public func removeBookmark(_ item: SidebarLocationItem) {
-        customBookmarks.removeAll { $0.id == item.id }
-        Self.preferences.set(customBookmarks.map { $0.url.path }, forKey: "bf.customBookmarks")
+        if !pinnedFolderStore.remove(item.id) {
+            FileOperationsManager.shared.lastStatusMessage = "Nie potwierdzono zapisu zmiany przypiętych folderów."
+        }
+        updatePinnedFolderRows()
     }
 
     public func isCurrentSearchSaved(in pane: PaneTabState) -> Bool {
@@ -410,44 +423,14 @@ public final class AppState: ObservableObject {
 
     // MARK: - Volumes & Eject (`⏏`)
 
-    public func refreshMountedVolumes() {
-        let keys: [URLResourceKey] = [
-            .volumeNameKey,
-            .volumeTotalCapacityKey,
-            .volumeAvailableCapacityForImportantUsageKey,
-            .volumeIsRemovableKey,
-            .volumeIsEjectableKey,
-            .volumeIsInternalKey
-        ]
-        guard let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) else {
-            return
-        }
-        var vols: [VolumeInfoItem] = []
-        for url in urls {
-            if let vals = try? url.resourceValues(forKeys: Set(keys)) {
-                let name = vals.volumeName ?? url.lastPathComponent
-                let total = Int64(vals.volumeTotalCapacity ?? 0)
-                let avail = vals.volumeAvailableCapacityForImportantUsage ?? 0
-                let isRemovable = (vals.volumeIsRemovable == true) ||
-                                  (vals.volumeIsEjectable == true) ||
-                                  (vals.volumeIsInternal == false && url.path != "/")
-                vols.append(VolumeInfoItem(
-                    name: name,
-                    url: url,
-                    totalBytes: total,
-                    freeBytes: avail,
-                    isRemovable: isRemovable
-                ))
-            }
-        }
-        self.mountedVolumes = vols
-    }
+    public func refreshMountedVolumes() { volumeService?.requestRefresh() }
 
     public func ejectVolume(_ vol: VolumeInfoItem) {
         do {
-            try NSWorkspace.shared.unmountAndEjectDevice(at: vol.url)
+            try VolumeEjectAction.perform(vol.url,
+                eject: { try NSWorkspace.shared.unmountAndEjectDevice(at: $0) },
+                refresh: refreshMountedVolumes)
             FileOperationsManager.shared.lastStatusMessage = "Wysunięto wolumin \(vol.name)"
-            refreshMountedVolumes()
         } catch {
             FileOperationsManager.shared.lastStatusMessage = "Nie można wysunąć \(vol.name): \(error.localizedDescription)"
         }
